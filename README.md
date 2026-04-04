@@ -12,7 +12,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-2.1-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" />
-  <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
+  <img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20GPT--4-a855f7?style=for-the-badge" />
   <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" />
   <img src="https://img.shields.io/badge/platform-Linux-f97316?style=for-the-badge&logo=linux&logoColor=white" />
@@ -32,7 +32,7 @@ It chains recon tools, vulnerability scanners, and an AI validator into a single
 producing a clean, analyst-grade report with confirmed findings only.
 
 ```
-./hawkeye -d hackerone-target.com
+./hawkeye --target hackerone-target.com
 ```
 
 That's it. HawkEye handles the rest.
@@ -51,7 +51,7 @@ That's it. HawkEye handles the rest.
   │  PHASE 1 — RECON                                                │
   │                                                                 │
   │  subfinder · assetfinder · crt.sh · C99.nl · waybackurls       │
-  │  katana · gau                                                   │
+  │  katana                                                         │
   │                                                                 │
   │  → subdomains · live URLs · JS files · parameters              │
   └─────────────────────────────┬───────────────────────────────────┘
@@ -66,7 +66,7 @@ That's it. HawkEye handles the rest.
   │  ffuf          → hidden paths · admin panels · vhost fuzzing   │
   │  dalfox        → reflected & DOM XSS with PoC                  │
   │  arjun         → undocumented GET/POST parameters              │
-  │  nmap          → open ports · service fingerprinting           │
+  │  nmap          → open ports                                     │
   │  SQLi scanner  → injection via parameter analysis              │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
@@ -79,7 +79,7 @@ That's it. HawkEye handles the rest.
   │                                                                 │
   │  Detects: AWS/GitHub/Stripe/Firebase keys · JWT tokens         │
   │           hardcoded passwords · internal API routes            │
-  │           DOM XSS sinks · postMessage issues · SSRF vectors    │
+  │           DOM XSS sinks · postMessage issues                   │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
                                 ▼
@@ -109,19 +109,19 @@ That's it. HawkEye handles the rest.
 
 | Module | Engine | Finds |
 |---|---|---|
-| Subdomain Recon | subfinder · assetfinder · crt.sh · C99 | Live subdomains |
-| URL Discovery | waybackurls · katana · gau | Endpoints, parameters |
-| Live Detection | httpx | HTTP status, ports, tech |
-| Vulnerability Scan | nuclei (full templates) | CVEs, misconfigs, exposures |
+| Subdomain Recon | subfinder · assetfinder · crt.sh · C99 | Subdomains |
+| URL Discovery | waybackurls · katana | Endpoints, parameters, JS files |
+| Live Detection | httpx | Live hosts, HTTP status, tech stack |
+| Vulnerability Scan | nuclei (full templates) | CVEs, misconfigs, exposures, takeovers |
 | CORS Testing | Built-in Go engine | Origin reflection, null origin, subdomain spoof, HTTP downgrade |
 | Directory Fuzzing | ffuf | Hidden paths, admin panels, sensitive files |
-| Vhost Discovery | ffuf (Host header) | Internal virtual hosts |
-| XSS | dalfox | Reflected & DOM XSS with working PoC |
+| Vhost Discovery | ffuf (Host header) | Hidden virtual hosts |
+| XSS | dalfox | Reflected & DOM XSS with PoC |
 | SQLi | nuclei + param filter | SQL injection vectors |
-| Hidden Params | arjun | Undocumented GET/POST params |
-| Port Scan | nmap | Open ports, service versions |
-| JS Analysis | Regex + LLM | API keys, secrets, endpoints, tokens |
-| AI Validation | DeepSeek / Claude / GPT-4 | False positive filtering + PoC |
+| Hidden Params | arjun | Undocumented GET/POST parameters |
+| Port Scan | nmap | Open ports |
+| JS Analysis | Regex + LLM | API keys, secrets, endpoints, S3 buckets, tokens |
+| AI Validation | DeepSeek / Claude / GPT-4 | False positive filtering + PoC generation |
 
 ---
 
@@ -143,7 +143,7 @@ echo "DEEPSEEK_API_KEY=your-key-here" >> .env
 go build -o hawkeye ./cmd/main.go
 
 # 5. Scan
-./hawkeye -d target.com
+./hawkeye --target target.com
 ```
 
 ---
@@ -154,16 +154,17 @@ go build -o hawkeye ./cmd/main.go
 ./hawkeye [flags]
 
 Required:
-  -d, --domain      string   Target domain (e.g. example.com)
+  -t, --target      string   Target domain (e.g. example.com)
 
 Options:
-  -v, --verbose              Show detailed progress
-      --skip-recon           Skip recon phase (use if subdomains already known)
-      --js-only              Run JS analysis only (no scanning)
-      --deep                 Deep scan — more threads, more templates
-      --config     string    Config file path (default: config.yaml)
-      --output     string    Report output directory (default: ./reports)
-      --check-tools          Check installed tools and exit
+  -v, --verbose              Show detailed scan progress
+  -c, --config     string    Config file path (default: config.yaml)
+  -o, --output     string    Report output directory (default: ./reports)
+      --skip-recon           Skip recon phase (subdomains already known)
+      --skip-scan            Skip vulnerability scanning phase
+      --js-only              Run JS analysis only (skips recon and scanning)
+      --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter
+      --ai-model    string   Override AI model name
   -h, --help                 Show help
 ```
 
@@ -171,22 +172,25 @@ Options:
 
 ```bash
 # Standard full scan
-./hawkeye -d target.com
+./hawkeye --target target.com
 
-# Full scan with live output
-./hawkeye -d target.com --verbose
+# Full scan with live progress output
+./hawkeye --target target.com --verbose
 
-# JS secrets/endpoints only (fast)
-./hawkeye -d target.com --js-only
+# JS secrets and endpoints only (fast, no scanning)
+./hawkeye --target target.com --js-only
 
-# Deep scan (more coverage, slower)
-./hawkeye -d target.com --deep --verbose
+# Skip subdomain enumeration
+./hawkeye --target target.com --skip-recon
 
-# Skip subdomain enumeration (scan known scope only)
-./hawkeye -d target.com --skip-recon
+# Skip scanning, run AI analysis on recon output only
+./hawkeye --target target.com --skip-scan
 
-# Verify tools are installed
-./hawkeye --check-tools
+# Use a specific AI provider for this run
+./hawkeye --target target.com --ai-provider claude --ai-model claude-sonnet-4-20250514
+
+# Use short flags
+./hawkeye -t target.com -v
 ```
 
 ---
@@ -196,8 +200,8 @@ Options:
 ### System Requirements
 
 - **OS**: Linux (Ubuntu 20.04+, Debian 11+, Kali, Parrot)
-- **Go**: 1.21 or later
-- **RAM**: 512MB minimum, 2GB recommended for deep scans
+- **Go**: 1.24 or later
+- **RAM**: 512MB minimum, 2GB recommended for large targets
 
 ### Automatic (recommended)
 
@@ -205,7 +209,7 @@ Options:
 chmod +x install.sh && ./install.sh
 ```
 
-The installer handles Go tools, system packages, nuclei templates, and SecLists.
+The installer handles Go tools, system packages, and nuclei templates.
 
 ### Manual
 
@@ -221,10 +225,13 @@ go install github.com/ffuf/ffuf/v2@latest
 go install github.com/hahwul/dalfox/v2@latest
 
 # System tools
-sudo apt install -y nmap seclists
+sudo apt install -y nmap
 
 # Optional — hidden parameter discovery
 pip3 install arjun
+
+# Wordlist for ffuf (strongly recommended)
+sudo apt install seclists
 
 # Nuclei templates
 nuclei -update-templates
@@ -254,7 +261,7 @@ ai:
 | Provider | Model | Input / Output (per 1M tokens) | Recommended For |
 |---|---|---|---|
 | **DeepSeek** | deepseek-chat | $0.28 / $1.10 | Default — best cost/quality ratio |
-| **Claude** | claude-sonnet-4 | $3 / $15 | Highest accuracy |
+| **Claude** | claude-sonnet-4-20250514 | $3 / $15 | Highest accuracy |
 | **OpenAI** | gpt-4o-mini | $0.15 / $0.60 | Fast and cheap |
 | **OpenRouter** | any model | varies | Multi-model access |
 
@@ -264,7 +271,7 @@ For maximum path discovery coverage, install SecLists:
 
 ```bash
 sudo apt install seclists
-# Wordlist auto-detected at: /usr/share/seclists/Discovery/Web-Content/common.txt
+# Auto-detected at: /usr/share/seclists/Discovery/Web-Content/common.txt
 ```
 
 Or specify a custom path in `config.yaml`:
@@ -277,7 +284,7 @@ scanning:
 ```
 
 Without SecLists, HawkEye falls back to a built-in list of ~130 high-value paths  
-(.env, .git, admin panels, actuators, swagger, etc.) — still useful, but limited.
+(.env, .git, admin panels, Spring actuators, swagger, etc.) — functional but limited coverage.
 
 ### Blind XSS
 
@@ -317,19 +324,20 @@ Subdomain List
 
 ---
 
-## CORS Severity Guide
+## CORS Severity Reference
 
-HawkEye's built-in CORS engine distinguishes between actually exploitable misconfigs  
-and header combinations that browsers block:
+HawkEye's built-in CORS engine tests multiple attack vectors and assigns severity  
+based on actual exploitability — not just header presence:
 
 | Pattern | Severity | Exploitable? |
 |---|---|---|
-| Origin reflected + `credentials: true` | **Critical** | Yes — browser allows it |
-| Null origin + `credentials: true` | **High** | Yes — via sandboxed iframe |
-| Subdomain spoof + `credentials: true` | **High** | Yes — register matching domain |
-| `*` + `credentials: true` | **Medium** | No — browsers block per spec |
-| Origin reflected, no credentials | **High** | Yes — public data readable |
-| HTTP origin on HTTPS + credentials | **High** | Yes — requires MITM |
+| Origin reflected + `credentials: true` | **Critical** | Yes — any attacker site can steal authenticated data |
+| Null origin + `credentials: true` | **High** | Yes — exploitable via sandboxed iframe |
+| Subdomain spoof + `credentials: true` | **High** | Yes — attacker registers a matching domain |
+| HTTP origin on HTTPS + `credentials: true` | **High** | Yes — requires network MITM position |
+| Origin reflected, no credentials | **High** | Yes — public/unauthenticated data readable cross-origin |
+| Subdomain spoof, no credentials | **Medium** | Partial — weak origin validation, no credentials |
+| `*` + `credentials: true` | **Medium** | No — browsers reject this combination per CORS spec |
 
 ---
 
@@ -343,5 +351,5 @@ and header combinations that browsers block:
 ---
 
 <p align="center">
-  Built by <a href="https://github.com/Btr4k">@Btr4k</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.1
+  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.1
 </p>
