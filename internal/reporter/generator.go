@@ -62,7 +62,25 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Total Findings**: %d (validated by AI)  \n\n", len(analysis.ValidatedFindings)))
 
 	// Executive Summary with Risk Score
-	riskScore := analysis.Stats.Critical*10 + analysis.Stats.High*5 + analysis.Stats.Medium*2 + analysis.Stats.Low*1
+	// Weight JS-analysis-only findings at 50% to prevent inflated scores
+	// from informational observations (endpoint patterns, public keys, etc.)
+	riskScore := 0
+	for _, vf := range analysis.ValidatedFindings {
+		weight := 1.0
+		if vf.Type == "js-analysis" {
+			weight = 0.5
+		}
+		switch strings.ToLower(vf.Severity) {
+		case "critical":
+			riskScore += int(10 * weight)
+		case "high":
+			riskScore += int(5 * weight)
+		case "medium":
+			riskScore += int(2 * weight)
+		case "low":
+			riskScore += int(1 * weight)
+		}
+	}
 	riskLevel := "🟢 Low Risk"
 	if riskScore >= 30 {
 		riskLevel = "🔴 Critical Risk"

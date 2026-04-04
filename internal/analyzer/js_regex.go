@@ -38,7 +38,7 @@ var jsPatterns = []regexPattern{
 	{
 		Name:     "Google API Key",
 		Pattern:  regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
-		Severity: "high",
+		Severity: "low",
 		Type:     "google_api_key",
 	},
 	{
@@ -92,7 +92,7 @@ var jsPatterns = []regexPattern{
 	{
 		Name:     "Firebase Config",
 		Pattern:  regexp.MustCompile(`(?i)firebase[a-zA-Z]*\.initializeApp\s*\(`),
-		Severity: "high",
+		Severity: "low",
 		Type:     "firebase_config",
 	},
 
@@ -245,6 +245,31 @@ var jsPatterns = []regexPattern{
 	},
 }
 
+// ExtractCoreSecret strips surrounding context (e.g. apiKey:"AIza...") from a
+// matched string and returns the bare token/key for deduplication purposes.
+// This prevents the same key matched by two patterns from appearing twice.
+var coreSecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(AKIA[0-9A-Z]{16})`),                          // AWS
+	regexp.MustCompile(`(AIza[0-9A-Za-z_-]{35})`),                     // Google
+	regexp.MustCompile(`(ya29\.[0-9A-Za-z_-]+)`),                      // Google OAuth
+	regexp.MustCompile(`(sk_live_[0-9a-zA-Z]{24,})`),                  // Stripe secret
+	regexp.MustCompile(`(pk_live_[0-9a-zA-Z]{24,})`),                  // Stripe pub
+	regexp.MustCompile(`(ghp_[0-9a-zA-Z]{36})`),                       // GitHub
+	regexp.MustCompile(`(xox[bpsar]-[0-9a-zA-Z-]{10,})`),              // Slack
+	regexp.MustCompile(`(SK[0-9a-fA-F]{32})`),                         // Twilio
+	regexp.MustCompile(`(SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43})`), // SendGrid
+	regexp.MustCompile(`(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+)`),    // JWT
+}
+
+func ExtractCoreSecret(value string) string {
+	for _, p := range coreSecretPatterns {
+		if m := p.FindString(value); m != "" {
+			return m
+		}
+	}
+	return value
+}
+
 // ScanJSWithRegex performs fast regex-based scanning on JS file contents.
 // Returns findings that complement the AI analysis.
 func ScanJSWithRegex(jsFiles []struct {
@@ -255,6 +280,7 @@ func ScanJSWithRegex(jsFiles []struct {
 }) []scanner.Finding {
 	var findings []scanner.Finding
 	seen := make(map[string]bool) // Dedup: type+value
+	seenSecrets := make(map[string]bool) // Cross-pattern dedup: core secret value
 
 	for _, js := range jsFiles {
 		for _, pattern := range jsPatterns {
@@ -266,23 +292,60 @@ func ScanJSWithRegex(jsFiles []struct {
 					value = value[:200] + "..."
 				}
 
-				// Deduplicate by type + value
+				// Deduplicate by type + value (same pattern, same value)
 				dedupeKey := pattern.Type + "|" + value
 				if seen[dedupeKey] {
 					continue
 				}
 				seen[dedupeKey] = true
 
+				// Cross-pattern dedup: if the core secret (e.g. the API key itself)
+				// was already reported by another pattern, skip this duplicate.
+				// E.g. Google API Key pattern matches "AIza..." and Generic Secret
+				// matches 'apiKey:"AIza..."' — both contain the same key.
+				coreSecret := ExtractCoreSecret(value)
+				if seenSecrets[coreSecret] {
+					continue
+				}
+				seenSecrets[coreSecret] = true
+
 				// Skip common false positives
 				if shouldSkipMatch(pattern.Type, match) {
 					continue
+				}
+
+				// Context-aware severity adjustment:
+				// Google API keys found in Firebase config context are public by design
+				severity := pattern.Severity
+				if pattern.Type == "google_api_key" {
+					// Check surrounding context for Firebase indicators
+					idx := strings.Index(js.Content, match)
+					if idx >= 0 {
+						start := idx - 200
+						if start < 0 {
+							start = 0
+						}
+						end := idx + len(match) + 200
+						if end > len(js.Content) {
+							end = len(js.Content)
+						}
+						context := strings.ToLower(js.Content[start:end])
+						if strings.Contains(context, "firebase") ||
+							strings.Contains(context, "firebaseconfig") ||
+							strings.Contains(context, "initializeapp") ||
+							strings.Contains(context, "authdomain") ||
+							strings.Contains(context, "storagebucket") ||
+							strings.Contains(context, "messagingsenderid") {
+							severity = "info"
+						}
+					}
 				}
 
 				findings = append(findings, scanner.Finding{
 					ID:          fmt.Sprintf("js-regex-%s", pattern.Type),
 					Title:       fmt.Sprintf("JS: %s", pattern.Name),
 					Description: fmt.Sprintf("Regex scanner found %s in %s", pattern.Name, js.URL),
-					Severity:    pattern.Severity,
+					Severity:    severity,
 					Type:        "js-analysis",
 					URL:         js.URL,
 					Evidence:    value,
@@ -346,6 +409,15 @@ func shouldSkipMatch(patternType, match string) bool {
 	case "eval_usage":
 		// Skip common safe eval patterns
 		if strings.Contains(lower, "json.parse") {
+			return true
+		}
+	case "generic_secret":
+		// Skip if the value is a Google API key (already caught by google_api_key pattern)
+		if strings.Contains(match, "AIza") {
+			return false // Let the cross-pattern dedup handle it
+		}
+		// Skip CSRF tokens — these are expected in client-side code
+		if strings.Contains(lower, "csrf") {
 			return true
 		}
 	}

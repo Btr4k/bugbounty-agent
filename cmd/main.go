@@ -440,17 +440,33 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			log.Warnf("JS AI analysis failed: %v", err)
 		}
 
-		// Merge regex + AI findings (dedup by evidence)
+		// Merge regex + AI findings (dedup by core secret value, not raw evidence string)
 		allJSFindings := regexFindings
 		seenEvidence := make(map[string]bool)
 		for _, rf := range regexFindings {
 			seenEvidence[rf.Evidence] = true
+			// Also register the core secret (e.g. the API key itself, stripped of context)
+			seenEvidence[analyzer.ExtractCoreSecret(rf.Evidence)] = true
 		}
 		for _, af := range aiFindings {
-			if !seenEvidence[af.Evidence] {
-				allJSFindings = append(allJSFindings, af)
-				seenEvidence[af.Evidence] = true
+			core := analyzer.ExtractCoreSecret(af.Evidence)
+			if seenEvidence[af.Evidence] || seenEvidence[core] {
+				continue
 			}
+			// Substring check: skip if the AI evidence is contained in any regex evidence or vice versa
+			isDuplicate := false
+			for _, rf := range regexFindings {
+				if strings.Contains(rf.Evidence, af.Evidence) || strings.Contains(af.Evidence, rf.Evidence) {
+					isDuplicate = true
+					break
+				}
+			}
+			if isDuplicate {
+				continue
+			}
+			allJSFindings = append(allJSFindings, af)
+			seenEvidence[af.Evidence] = true
+			seenEvidence[core] = true
 		}
 
 		jsDuration := time.Since(phaseStart)

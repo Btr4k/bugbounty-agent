@@ -512,59 +512,40 @@ func (a *ClaudeAnalyzer) analyzeJSBatch(ctx context.Context, jsFiles []struct {
 	// Enhanced JS analysis prompt for deep security review
 	prompt.WriteString(`You are an elite bug bounty hunter analyzing JavaScript files for HIGH-VALUE security findings.
 
-CRITICAL — Report ALL of these if found:
+ONLY report findings where you can COPY-PASTE the EXACT literal value from the code snippet.
 
-[API KEYS & TOKENS]
-- AWS: AKIA[0-9A-Z]{16}, ASIA[0-9A-Z]{16}, aws_secret_access_key
-- Google: AIza[0-9A-Za-z_-]{35}, GOCSPX-*, ya29.*, maps API keys
-- Stripe: sk_live_*, pk_live_*, sk_test_*, rk_live_*
-- Firebase: firebaseConfig objects, apiKey in firebase init
-- GitHub: ghp_*, gho_*, ghu_*, ghs_*, github_pat_*
-- Slack: xoxb-*, xoxp-*, xoxs-*, xoxa-*
-- Twilio: SK[0-9a-fA-F]{32}, AC[0-9a-fA-F]{32}
-- SendGrid: SG.[a-zA-Z0-9_-]{22}.[a-zA-Z0-9_-]{43}
-- JWT: eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*
-- Bearer/OAuth tokens, session tokens, refresh tokens
-- Any string matching: *_KEY, *_SECRET, *_TOKEN, *_PASSWORD patterns
+[REPORT IF FOUND — exact values only]
+- API keys/tokens: AWS (AKIA..., ASIA...), Google (AIza...), Stripe (sk_live_...), GitHub (ghp_...), Slack (xoxb-...), Twilio (SK...), SendGrid (SG....)
+- JWT tokens: eyJ...
+- Bearer/OAuth tokens with actual token strings
+- Hardcoded passwords: password = "actual_value"
+- Database connection strings: mongodb://user:pass@host
+- Private keys: -----BEGIN PRIVATE KEY-----
+- URLs with embedded credentials: https://user:pass@host
+- Internal/admin API endpoints: actual path strings like "/api/admin/users"
+- Hardcoded backend IPs: "10.0.1.5", "192.168.1.100"
+- S3 bucket URLs: https://bucket.s3.amazonaws.com
+- CORS wildcard: Access-Control-Allow-Origin: *
+- DOM XSS sinks with user input flowing into innerHTML/eval
 
-[HIDDEN ENDPOINTS & APIS]
-- Internal/admin APIs: /api/admin, /api/internal, /api/v1/debug, /graphql
-- Undocumented endpoints, staging/dev URLs
-- WebSocket endpoints (ws://, wss://)
-- API base URLs with version paths
-- Hardcoded backend server IPs/hostnames
+[NEVER REPORT — these are NOT vulnerabilities]
+- JavaScript variable names like saveUrl, acceptUrl, baseUrl, dataId, etc. — these are code identifiers, not findings
+- Dynamic URL construction like slug+'?offset='+offset — this is normal code, not an endpoint disclosure
+- Standard jQuery patterns: form.attr('action'), $.ajax(), .data('url'), .hasClass()
+- CSRF token handling: $('meta[name=csrf-token]').attr('content') — this is correct security practice
+- Framework/library code: validate.js, slick, owl-carousel, Bootstrap settings
+- Plugin options: mobile:false, live:true, debug:true in minified vendor code
+- Conditional checks: if(t.debug), settings.debug&&, auth checks like hasClass('ctrl-guest')
+- Form submission logic: allowSubmit = true, form validation patterns
+- Pagination parameters: offset, limit, page — these are standard UI patterns
+- Any finding where the "value" is just a variable name or code pattern, not an actual secret/key/credential
 
-[CREDENTIALS & SECRETS]
-- Hardcoded passwords, usernames, database connection strings
-- URLs with embedded credentials (https://user:pass@host)
-- Private keys (RSA, SSH, PGP)
-- Encryption keys, salt values, IV vectors
-
-[SENSITIVE DATA EXPOSURE]
-- PII: emails, phone numbers, physical addresses in code/comments
-- Internal domain names, employee names
-- Debug/verbose error messages
-- Source maps pointing to internal paths
-- Comments with TODO/FIXME/HACK/BUG containing sensitive info
-
-[SECURITY MISCONFIGURATIONS]
-- CORS: Access-Control-Allow-Origin: * or overly permissive
-- Disabled security checks (verify: false, secure: false)
-- Debug mode enabled (debug: true, NODE_ENV: development)
-- Hardcoded redirect URLs (open redirect potential)
-- postMessage without origin validation
-- innerHTML/document.write with user input (DOM XSS sinks)
-- eval(), Function(), setTimeout/setInterval with string args
-
-STRICT RULES — READ CAREFULLY:
-- Report the EXACT literal string/value from the code — copy-paste it verbatim
-- NEVER infer or guess a finding if you cannot quote the exact value from the snippet
-- For "debug: true" — only report if you see an ACTUAL assignment like debug:true or debug=true. Do NOT report if you see if(t.debug), settings.debug&&, or similar conditional checks
-- For "NODE_ENV", "verify", "secure" — only report if the EXACT key=value pair is in the snippet
-- Minified vendor/library files (jQuery, lodash, Bootstrap, validate.js, slick, owl-carousel, etc.) often contain options like mobile:false, live:true, secure:false, debug:true — these are plugin configuration options, NOT security issues. Ignore them completely
-- Do NOT report jQuery plugin options, WordPress config placeholders, or CSS framework settings as findings
-- For endpoints, report the full URL path as it appears in the code
-- Severity: critical=keys/credentials, high=real endpoints/secrets, medium=misconfig with actual value, low=info-leak
+SEVERITY RULES:
+- critical: Real API keys with billing access (AWS secret key, Stripe secret key, hardcoded passwords)
+- high: Tokens that grant access (JWT, Bearer, OAuth, GitHub tokens, active API keys)
+- medium: Real internal endpoints with actual URL paths, CORS misconfig with actual header values
+- low: Public API keys (Google Maps, Firebase apiKey — these are designed to be public), info exposure
+- DO NOT inflate severity. A variable name is never medium/high. An endpoint pattern is never high.
 
 Files:
 `)
@@ -587,14 +568,15 @@ Files:
   "findings": [
     {
       "type": "aws_key|api_key|secret|jwt|credential|endpoint|pii|config",
-      "value": "exact value found — not a description",
+      "value": "EXACT LITERAL STRING copied from code — not a variable name, not a description",
       "file_url": "https://example.com/app.js",
       "severity": "critical|high|medium|low",
       "description": "what was found and why it matters"
     }
   ]
 }
-Empty if nothing: {"findings": []}`)
+If nothing real found, return: {"findings": []}
+Remember: if you cannot quote the exact secret/key/URL from the code, DO NOT report it.`)
 
 
 	response, err := a.client.CompleteWithRetry(ctx, securitySystemPrompt, prompt.String(), 2)
@@ -619,10 +601,16 @@ Empty if nothing: {"findings": []}`)
 		return nil, fmt.Errorf("failed to parse JS analysis JSON: %w", err)
 	}
 
-	// Convert to scanner.Finding
+	// Convert to scanner.Finding with strict post-processing filter
 	var findings []scanner.Finding
 	for _, jf := range parsed.Findings {
 		if jf.Value == "" {
+			continue
+		}
+
+		// Post-processing: reject speculative findings the AI may produce
+		// despite the prompt instructions (defense in depth)
+		if isSpeculativeFinding(jf) {
 			continue
 		}
 
@@ -644,6 +632,54 @@ Empty if nothing: {"findings": []}`)
 	}
 
 	return findings, nil
+}
+
+// isSpeculativeFinding rejects AI findings that are just variable names,
+// standard code patterns, or other non-vulnerability artifacts.
+// This is a defense-in-depth check — the prompt already instructs the AI
+// to not report these, but LLMs don't always follow instructions.
+func isSpeculativeFinding(jf JSFinding) bool {
+	val := strings.TrimSpace(jf.Value)
+	lower := strings.ToLower(val)
+
+	// Too short to be a real secret (skip for certain types that can be short)
+	if len(val) < 6 && jf.Type != "config" {
+		return true
+	}
+
+	// Single identifier (no spaces, no special chars except _ and -) = variable name, not a finding
+	isSingleIdent := true
+	for _, c := range val {
+		if c == ' ' || c == ':' || c == '=' || c == '/' || c == '.' || c == '"' || c == '\'' || c == '@' {
+			isSingleIdent = false
+			break
+		}
+	}
+	if isSingleIdent && len(val) < 30 {
+		return true
+	}
+
+	// Known non-vulnerability patterns (variable names, jQuery patterns, etc.)
+	rejectPatterns := []string{
+		"saveurl", "accepturl", "baseurl", "dataid", "datarelation",
+		"form.attr", "$.ajax", ".data(", ".hasclass(", ".attr(",
+		"allowsubmit", "csrf", "csrftoken",
+		"offset", "limit", "is_form",
+		"messages-menu", "header-messages",
+		"ctrl-guest",
+	}
+	for _, pattern := range rejectPatterns {
+		if strings.Contains(lower, pattern) && len(val) < 60 {
+			return true
+		}
+	}
+
+	// If type is "endpoint" but value has no URL-like chars (no / or .), it's not a real endpoint
+	if jf.Type == "endpoint" && !strings.Contains(val, "/") && !strings.Contains(val, "http") {
+		return true
+	}
+
+	return false
 }
 
 // Note: Claude API client implementation is in claude_api.go
