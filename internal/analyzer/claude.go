@@ -102,17 +102,42 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		return analysis, nil
 	}
 
-	a.log.Debugf("AI Analysis: processing %d findings in batches of 5", len(scanResults.Findings))
+	// JS analysis findings are pre-validated by the JS AI + regex pipeline.
+	// Auto-accept them to avoid double-validation that incorrectly rejects real findings.
+	var toValidate []scanner.Finding
+	for _, f := range scanResults.Findings {
+		if f.Type == "js-analysis" {
+			analysis.ValidatedFindings = append(analysis.ValidatedFindings, ValidatedFinding{
+				Finding:    f,
+				IsValid:    true,
+				Confidence: 0.85,
+				AIAnalysis: "Pre-validated by JS analysis pipeline (regex + AI)",
+			})
+		} else {
+			toValidate = append(toValidate, f)
+		}
+	}
 
-	// Process findings in batches for efficiency
+	if len(toValidate) == 0 {
+		a.calculateStatistics(analysis)
+		analysis.TopFindings = a.getTopFindings(analysis.ValidatedFindings, 10)
+		analysis.Summary = a.generateLocalSummary(analysis)
+		analysis.Recommendations = a.generateLocalRecommendations(analysis)
+		return analysis, nil
+	}
+
+	a.log.Debugf("AI Analysis: processing %d findings in batches of 5 (JS findings auto-accepted: %d)",
+		len(toValidate), len(scanResults.Findings)-len(toValidate))
+
+	// Process non-JS findings in batches for efficiency
 	batchSize := 5
-	for i := 0; i < len(scanResults.Findings); i += batchSize {
+	for i := 0; i < len(toValidate); i += batchSize {
 		end := i + batchSize
-		if end > len(scanResults.Findings) {
-			end = len(scanResults.Findings)
+		if end > len(toValidate) {
+			end = len(toValidate)
 		}
 
-		batch := scanResults.Findings[i:end]
+		batch := toValidate[i:end]
 		validated, rejected, err := a.analyzeBatch(ctx, batch)
 		if err != nil {
 			a.log.Warnf("Failed to analyze batch %d-%d: %v", i, end, err)
