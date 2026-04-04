@@ -308,13 +308,23 @@ func shouldSkipMatch(patternType, match string) bool {
 
 	switch patternType {
 	case "email":
-		// Skip example/placeholder emails
+		// Skip example/placeholder emails and developer emails in copyright headers
 		if strings.Contains(lower, "example.com") ||
 			strings.Contains(lower, "placeholder") ||
 			strings.Contains(lower, "test@") ||
 			strings.Contains(lower, "noreply") ||
 			strings.Contains(lower, "user@") ||
-			strings.Contains(lower, "email@") {
+			strings.Contains(lower, "email@") ||
+			// Skip well-known framework/library author emails
+			strings.Contains(lower, "@gmail.com") ||
+			strings.Contains(lower, "@yahoo.com") ||
+			strings.Contains(lower, "@hotmail.com") ||
+			// Skip emails from common framework domains
+			strings.Contains(lower, "jquery.com") ||
+			strings.Contains(lower, "yiiframework.com") ||
+			strings.Contains(lower, "symfony.com") ||
+			strings.Contains(lower, "laravel.com") ||
+			strings.Contains(lower, "mailwizz.com") {
 			return true
 		}
 	case "hardcoded_password":

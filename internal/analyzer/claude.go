@@ -561,7 +561,8 @@ STRICT RULES — READ CAREFULLY:
 - NEVER infer or guess a finding if you cannot quote the exact value from the snippet
 - For "debug: true" — only report if you see an ACTUAL assignment like debug:true or debug=true. Do NOT report if you see if(t.debug), settings.debug&&, or similar conditional checks
 - For "NODE_ENV", "verify", "secure" — only report if the EXACT key=value pair is in the snippet
-- Minified vendor/library files (jQuery, lodash, Bootstrap, validate.js) often contain these patterns as plugin options — ignore them unless credentials or real secrets are present
+- Minified vendor/library files (jQuery, lodash, Bootstrap, validate.js, slick, owl-carousel, etc.) often contain options like mobile:false, live:true, secure:false, debug:true — these are plugin configuration options, NOT security issues. Ignore them completely
+- Do NOT report jQuery plugin options, WordPress config placeholders, or CSS framework settings as findings
 - For endpoints, report the full URL path as it appears in the code
 - Severity: critical=keys/credentials, high=real endpoints/secrets, medium=misconfig with actual value, low=info-leak
 
