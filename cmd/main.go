@@ -42,15 +42,15 @@ func main() {
 	}
 
 	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "config.yaml", "Config file")
-	rootCmd.Flags().StringVarP(&targetDomain, "target", "t", "", "Target domain (required)")
+	rootCmd.Flags().StringVarP(&targetDomain, "target", "t", "", "Target domain")
+	rootCmd.Flags().StringVarP(&targetDomain, "domain", "d", "", "Target domain (alias for -t/--target)")
 	rootCmd.Flags().StringVarP(&outputDir, "output", "o", "./reports", "Output directory")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 	rootCmd.Flags().StringVar(&aiProvider, "ai-provider", "", "AI provider: claude, deepseek, openai, openrouter, custom")
 	rootCmd.Flags().StringVar(&aiModel, "ai-model", "", "AI model name (e.g. deepseek-chat, gpt-4o-mini, claude-sonnet-4-20250514)")
 	rootCmd.Flags().BoolVar(&skipRecon, "skip-recon", false, "Skip the reconnaissance phase")
 	rootCmd.Flags().BoolVar(&skipScan, "skip-scan", false, "Skip the vulnerability scanning phase")
-	rootCmd.Flags().BoolVar(&jsOnly, "js-only", false, "Run JS file analysis only (skip recon and scanning)")
-	rootCmd.MarkFlagRequired("target")
+	rootCmd.Flags().BoolVar(&jsOnly, "js-only", false, "Run JS file analysis only (skips vulnerability scanning)")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -60,6 +60,11 @@ func main() {
 
 func runAgent(cmd *cobra.Command, args []string) error {
 	printBanner()
+
+	// Validate that at least -t/--target or -d/--domain was provided
+	if targetDomain == "" {
+		return fmt.Errorf("target domain is required: use -t <domain> or -d <domain>")
+	}
 
 	// Initialize logger
 	log := logger.New(verbose)
@@ -146,8 +151,8 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	var reconResults *recon.Results
 	phaseStart := time.Now()
 
-	if skipRecon || jsOnly {
-		dim.Println("  ⏭️  Skipping reconnaissance phase (--skip-recon or --js-only)")
+	if skipRecon {
+		dim.Println("  ⏭️  Skipping reconnaissance phase (--skip-recon)")
 		reconResults = &recon.Results{
 			Subdomains: cfg.Target.Domains,
 			URLs:       make([]string, 0),
@@ -201,7 +206,11 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	var displayFindings []scanner.Finding
 
 	if skipScan || jsOnly {
-		dim.Println("  ⏭️  Skipping vulnerability scanning (--skip-scan or --js-only)")
+		if jsOnly {
+			dim.Println("  ⏭️  Skipping vulnerability scanning (--js-only: recon done, JS analysis next)")
+		} else {
+			dim.Println("  ⏭️  Skipping vulnerability scanning (--skip-scan)")
+		}
 		scanResults = &scanner.Results{
 			Findings: make([]scanner.Finding, 0),
 		}

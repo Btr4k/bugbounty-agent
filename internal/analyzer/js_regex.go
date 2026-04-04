@@ -198,8 +198,10 @@ var jsPatterns = []regexPattern{
 
 	// ═══ Security Misconfigurations ═══
 	{
+		// Only match definite assignments: debug: true  or  debug = true
+		// NOT conditional checks like: if(t.debug), settings.debug&&, t&&t.debug
 		Name:     "Debug Mode Enabled",
-		Pattern:  regexp.MustCompile(`(?i)(debug|DEBUG)\s*[=:]\s*(true|1|"true"|'true')`),
+		Pattern:  regexp.MustCompile(`(?i)[^.\w](debug)\s*[=:]\s*(true|1|"true"|'true')`),
 		Severity: "medium",
 		Type:     "debug_mode",
 	},

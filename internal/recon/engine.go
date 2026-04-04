@@ -629,6 +629,10 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	defer os.Remove(tmpFile.Name())
 
 	for _, target := range targets {
+		// Ensure targets have a scheme — katana requires https:// or http://
+		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+			target = "https://" + target
+		}
 		fmt.Fprintln(tmpFile, target)
 	}
 	tmpFile.Close()
@@ -644,13 +648,13 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 
 	args := []string{
 		"-list", tmpFile.Name(),
-		"-jc",               // JS crawl mode
+		"-jsluice",          // extract JS file URLs and inline JS endpoints (v1.1+)
 		"-silent",
-		"-d", "2",           // depth 2
-		"-ef", "css,png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot",
-		"-em", "js",         // extension match: only JS
+		"-d", "2",           // crawl depth
 		"-c", "10",          // concurrency
 		"-timeout", "10",
+		// No -em filter: Go-side filter handles .js suffix check,
+		// preserving URLs with query strings like app.js?v=123
 	}
 
 	cmd := exec.CommandContext(katanaCtx, "katana", args...)

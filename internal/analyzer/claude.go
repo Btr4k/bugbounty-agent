@@ -556,11 +556,14 @@ CRITICAL — Report ALL of these if found:
 - innerHTML/document.write with user input (DOM XSS sinks)
 - eval(), Function(), setTimeout/setInterval with string args
 
-IMPORTANT RULES:
-- Report the EXACT value found, not just the pattern name
-- Only report REAL findings with actual values — no generic guesses
-- For endpoints, report the full URL path
-- Severity: critical=keys/credentials, high=endpoints/secrets, medium=misconfig, low=info-leak
+STRICT RULES — READ CAREFULLY:
+- Report the EXACT literal string/value from the code — copy-paste it verbatim
+- NEVER infer or guess a finding if you cannot quote the exact value from the snippet
+- For "debug: true" — only report if you see an ACTUAL assignment like debug:true or debug=true. Do NOT report if you see if(t.debug), settings.debug&&, or similar conditional checks
+- For "NODE_ENV", "verify", "secure" — only report if the EXACT key=value pair is in the snippet
+- Minified vendor/library files (jQuery, lodash, Bootstrap, validate.js) often contain these patterns as plugin options — ignore them unless credentials or real secrets are present
+- For endpoints, report the full URL path as it appears in the code
+- Severity: critical=keys/credentials, high=real endpoints/secrets, medium=misconfig with actual value, low=info-leak
 
 Files:
 `)
