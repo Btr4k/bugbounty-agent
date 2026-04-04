@@ -1,215 +1,347 @@
+```
+                                                                        
+  ██╗  ██╗ █████╗ ██╗    ██╗██╗  ██╗███████╗██╗   ██╗███████╗        
+  ██║  ██║██╔══██╗██║    ██║██║ ██╔╝██╔════╝╚██╗ ██╔╝██╔════╝        
+  ███████║███████║██║ █╗ ██║█████╔╝ █████╗   ╚████╔╝ █████╗          
+  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝          
+  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗        
+  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝       
+                                                          v2.1 🦅      
+         A I - P o w e r e d   B u g   B o u n t y   A g e n t        
+```
+
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1-blue?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/language-Go-00ADD8?style=for-the-badge&logo=go" />
-  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20GPT--4-purple?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/version-2.1-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" />
+  <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
+  <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20GPT--4-a855f7?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/platform-Linux-f97316?style=for-the-badge&logo=linux&logoColor=white" />
 </p>
 
-<h1 align="center">🦅 HawkEye v2.1</h1>
-<p align="center"><b>AI-Powered Bug Bounty Automation Tool</b></p>
 <p align="center">
-  Automated recon → vulnerability scanning → AI analysis → professional report
+  <b>Recon → Scan → AI Validation → Report</b><br/>
+  One command. Full attack surface. Zero noise.
 </p>
 
 ---
 
-## Features
+## What is HawkEye?
 
-| Module | Tools | What it finds |
-|--------|-------|---------------|
-| **Recon** | subfinder, assetfinder, crt.sh, waybackurls, katana | Subdomains, endpoints, JS files |
-| **Live Detection** | httpx (ProjectDiscovery) | Live hosts, status codes |
-| **Vulnerability Scan** | nuclei (all templates) | CVEs, misconfigs, exposures |
-| **CORS** | Built-in | Origin reflection, null origin, subdomain spoofing |
-| **XSS** | dalfox | Reflected/DOM XSS with PoC |
-| **SQLi** | nuclei + gf-style filtering | SQL injection via parameter analysis |
-| **Path Discovery** | ffuf | Hidden endpoints, admin panels |
-| **Vhost Fuzzing** | ffuf (Host header) | Hidden virtual hosts |
-| **Hidden Params** | arjun | Undocumented GET/POST parameters |
-| **Port Scan** | nmap | Open ports, services |
-| **JS Analysis** | AI (regex + LLM) | API keys, secrets, internal URLs |
-| **AI Validation** | DeepSeek / Claude / GPT-4 | False positive filtering, PoC generation |
+HawkEye is a full-pipeline bug bounty automation agent written in Go.  
+It chains recon tools, vulnerability scanners, and an AI validator into a single workflow —  
+producing a clean, analyst-grade report with confirmed findings only.
+
+```
+./hawkeye -d hackerone-target.com
+```
+
+That's it. HawkEye handles the rest.
+
+---
+
+## Pipeline
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                         TARGET DOMAIN                            │
+  └─────────────────────────────┬────────────────────────────────────┘
+                                │
+                                ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 1 — RECON                                                │
+  │                                                                 │
+  │  subfinder · assetfinder · crt.sh · C99.nl · waybackurls       │
+  │  katana · gau                                                   │
+  │                                                                 │
+  │  → subdomains · live URLs · JS files · parameters              │
+  └─────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 2 — SCANNING (parallel)                                  │
+  │                                                                 │
+  │  httpx         → live host detection + status codes            │
+  │  nuclei        → CVEs · misconfigs · exposures · takeovers     │
+  │  CORS engine   → origin reflection · null · subdomain spoof    │
+  │  ffuf          → hidden paths · admin panels · vhost fuzzing   │
+  │  dalfox        → reflected & DOM XSS with PoC                  │
+  │  arjun         → undocumented GET/POST parameters              │
+  │  nmap          → open ports · service fingerprinting           │
+  │  SQLi scanner  → injection via parameter analysis              │
+  └─────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 2.5 — JS ANALYSIS                                        │
+  │                                                                 │
+  │  Regex engine  → API keys · secrets · endpoints · S3 buckets   │
+  │  AI (LLM)      → deep analysis of app bundles (12KB/file)      │
+  │                                                                 │
+  │  Detects: AWS/GitHub/Stripe/Firebase keys · JWT tokens         │
+  │           hardcoded passwords · internal API routes            │
+  │           DOM XSS sinks · postMessage issues · SSRF vectors    │
+  └─────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 3 — AI VALIDATION                                        │
+  │                                                                 │
+  │  Every finding is reviewed by the AI:                          │
+  │  · Confirms real vs false positive                             │
+  │  · Assigns CVSS-informed severity                              │
+  │  · Generates PoC for each confirmed finding                    │
+  │  · Writes impact assessment + remediation                      │
+  └─────────────────────────────┬───────────────────────────────────┘
+                                │
+                                ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 4 — REPORT                                               │
+  │                                                                 │
+  │  Markdown report with:                                         │
+  │  · Executive summary · Risk score · Severity breakdown         │
+  │  · Confirmed findings only · Evidence + PoC per finding        │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Modules
+
+| Module | Engine | Finds |
+|---|---|---|
+| Subdomain Recon | subfinder · assetfinder · crt.sh · C99 | Live subdomains |
+| URL Discovery | waybackurls · katana · gau | Endpoints, parameters |
+| Live Detection | httpx | HTTP status, ports, tech |
+| Vulnerability Scan | nuclei (full templates) | CVEs, misconfigs, exposures |
+| CORS Testing | Built-in Go engine | Origin reflection, null origin, subdomain spoof, HTTP downgrade |
+| Directory Fuzzing | ffuf | Hidden paths, admin panels, sensitive files |
+| Vhost Discovery | ffuf (Host header) | Internal virtual hosts |
+| XSS | dalfox | Reflected & DOM XSS with working PoC |
+| SQLi | nuclei + param filter | SQL injection vectors |
+| Hidden Params | arjun | Undocumented GET/POST params |
+| Port Scan | nmap | Open ports, service versions |
+| JS Analysis | Regex + LLM | API keys, secrets, endpoints, tokens |
+| AI Validation | DeepSeek / Claude / GPT-4 | False positive filtering + PoC |
+
+---
 
 ## Quick Start
 
 ```bash
 # 1. Clone
-git clone https://github.com/A-cyb3r/hawkeye.git
-cd hawkeye
+git clone https://github.com/Btr4k/bugbounty-agent.git
+cd bugbounty-agent
 
-# 2. Install dependencies
+# 2. Install all dependencies
 chmod +x install.sh && ./install.sh
 
-# 3. Configure API key
+# 3. Set your AI key
 cp .env.example .env
-nano .env  # Add your AI API key (DeepSeek recommended — cheapest)
+echo "DEEPSEEK_API_KEY=your-key-here" >> .env
 
-# 4. Scan
-./hawkeye --target example.com --verbose
+# 4. Build
+go build -o hawkeye ./cmd/main.go
+
+# 5. Scan
+./hawkeye -d target.com
 ```
+
+---
 
 ## Usage
 
 ```
 ./hawkeye [flags]
 
-Flags:
-  --target    string   Target domain (required)
-  --verbose            Show detailed scan progress
-  --skip-recon         Skip recon phase (faster, use if subdomains known)
-  --config    string   Config file path (default: config.yaml)
-  --output    string   Output directory for reports (default: ./reports)
-  --check-tools        Check installed tools and exit
-  -h, --help           Help
+Required:
+  -d, --domain      string   Target domain (e.g. example.com)
+
+Options:
+  -v, --verbose              Show detailed progress
+      --skip-recon           Skip recon phase (use if subdomains already known)
+      --js-only              Run JS analysis only (no scanning)
+      --deep                 Deep scan — more threads, more templates
+      --config     string    Config file path (default: config.yaml)
+      --output     string    Report output directory (default: ./reports)
+      --check-tools          Check installed tools and exit
+  -h, --help                 Show help
 ```
 
 ### Examples
 
 ```bash
-# Full scan with verbose output
-./hawkeye --target target.com --verbose
+# Standard full scan
+./hawkeye -d target.com
 
-# Skip recon (faster, scan only the main domain)
-./hawkeye --target target.com --skip-recon --verbose
+# Full scan with live output
+./hawkeye -d target.com --verbose
 
-# Custom config
-./hawkeye --target target.com --config my-config.yaml
+# JS secrets/endpoints only (fast)
+./hawkeye -d target.com --js-only
 
-# Check all tools are installed
+# Deep scan (more coverage, slower)
+./hawkeye -d target.com --deep --verbose
+
+# Skip subdomain enumeration (scan known scope only)
+./hawkeye -d target.com --skip-recon
+
+# Verify tools are installed
 ./hawkeye --check-tools
 ```
 
+---
+
 ## Installation
 
-### Requirements
+### System Requirements
 
-- Go 1.21+
-- Linux (Ubuntu 20.04+ / Kali / Debian)
+- **OS**: Linux (Ubuntu 20.04+, Debian 11+, Kali, Parrot)
+- **Go**: 1.21 or later
+- **RAM**: 512MB minimum, 2GB recommended for deep scans
 
 ### Automatic (recommended)
 
 ```bash
-./install.sh
+chmod +x install.sh && ./install.sh
 ```
+
+The installer handles Go tools, system packages, nuclei templates, and SecLists.
 
 ### Manual
 
 ```bash
-# Go tools
+# Core Go tools
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/ffuf/ffuf/v2@latest
-go install github.com/hahwul/dalfox/v2@latest
 go install github.com/tomnomnom/assetfinder@latest
 go install github.com/tomnomnom/waybackurls@latest
+go install github.com/ffuf/ffuf/v2@latest
+go install github.com/hahwul/dalfox/v2@latest
 
-# System
-sudo apt install nmap -y
+# System tools
+sudo apt install -y nmap seclists
 
-# Optional (hidden parameter discovery)
+# Optional — hidden parameter discovery
 pip3 install arjun
 
 # Nuclei templates
 nuclei -update-templates
 
-# Build
+# Build HawkEye
 go build -o hawkeye ./cmd/main.go
 ```
 
+---
+
 ## Configuration
 
-Copy `.env.example` to `.env` and add your API key:
+### AI Provider
 
-```bash
-cp .env.example .env
-```
-
-Edit `config.yaml` for advanced options:
+Edit `config.yaml` or set env vars in `.env`:
 
 ```yaml
 ai:
-  provider: "deepseek"          # deepseek | claude | openai | openrouter
-  api_key: "${DEEPSEEK_API_KEY}" # reads from .env automatically
+  provider: "deepseek"            # deepseek | claude | openai | openrouter
+  api_key: "${DEEPSEEK_API_KEY}"  # loaded from .env automatically
+  model: "deepseek-chat"
+  max_tokens: 2000
+```
 
+### Supported AI Providers
+
+| Provider | Model | Input / Output (per 1M tokens) | Recommended For |
+|---|---|---|---|
+| **DeepSeek** | deepseek-chat | $0.28 / $1.10 | Default — best cost/quality ratio |
+| **Claude** | claude-sonnet-4 | $3 / $15 | Highest accuracy |
+| **OpenAI** | gpt-4o-mini | $0.15 / $0.60 | Fast and cheap |
+| **OpenRouter** | any model | varies | Multi-model access |
+
+### Wordlist (ffuf)
+
+For maximum path discovery coverage, install SecLists:
+
+```bash
+sudo apt install seclists
+# Wordlist auto-detected at: /usr/share/seclists/Discovery/Web-Content/common.txt
+```
+
+Or specify a custom path in `config.yaml`:
+
+```yaml
 scanning:
   tools:
     ffuf:
-      vhost_fuzzing: true       # discover hidden virtual hosts
-    arjun:
-      enabled: true             # hidden parameter discovery
-    dalfox:
-      blind_url: ""             # optional: blind XSS callback
-
-reporting:
-  language: "ar"                # ar | en
-  include_poc: true
+      wordlist_path: "/path/to/your/wordlist.txt"
 ```
 
-## AI Providers
+Without SecLists, HawkEye falls back to a built-in list of ~130 high-value paths  
+(.env, .git, admin panels, actuators, swagger, etc.) — still useful, but limited.
 
-| Provider | Model | Cost/1M tokens | Notes |
-|----------|-------|----------------|-------|
-| **DeepSeek** | deepseek-chat | $0.28 input / $1.10 output | Recommended |
-| **Claude** | claude-sonnet-4 | $3 / $15 | Best accuracy |
-| **OpenAI** | gpt-4o-mini | $0.15 / $0.60 | Good balance |
-| **OpenRouter** | any model | varies | Access all models |
+### Blind XSS
+
+```yaml
+scanning:
+  tools:
+    dalfox:
+      blind_url: "https://your-burp-collaborator.com"
+```
+
+---
 
 ## Output
 
-Reports are saved to `./reports/` as Markdown:
+Reports are saved to `./reports/` in Markdown:
 
 ```
 reports/
-└── bug_bounty_report_2026-04-04_12-27-45.md
+└── bug_bounty_report_2026-04-04_16-41-25.md
 ```
 
-Each report includes:
-- Executive summary with risk score
-- AI-validated findings only (false positives filtered)
-- Evidence and PoC for each vulnerability
-- Severity distribution
-- Subdomains discovered
-
-## Pipeline
+### Report Structure
 
 ```
-Target Domain
-     │
-     ▼
-┌─────────────┐
-│  Phase 1    │  subfinder + assetfinder + crt.sh + wayback + katana
-│  Recon      │  → subdomains, URLs, JS files
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Phase 2    │  httpx → nuclei → CORS → nmap → ffuf → arjun → dalfox → SQLi
-│  Scanning   │  → raw findings (all severities)
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Phase 3    │  AI validates each finding, filters false positives,
-│  AI Review  │  generates Arabic/English analysis + PoC
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐
-│  Phase 4    │  Markdown report with executive summary
-│  Report     │
-└─────────────┘
+Executive Summary
+  └── Risk score · Finding counts · Subdomains discovered
+
+Critical Findings
+  └── Title · URL · Evidence · AI Analysis · PoC
+
+High / Medium / Low Findings
+  └── Same structure
+
+Subdomain List
+  └── All discovered subdomains
 ```
+
+---
+
+## CORS Severity Guide
+
+HawkEye's built-in CORS engine distinguishes between actually exploitable misconfigs  
+and header combinations that browsers block:
+
+| Pattern | Severity | Exploitable? |
+|---|---|---|
+| Origin reflected + `credentials: true` | **Critical** | Yes — browser allows it |
+| Null origin + `credentials: true` | **High** | Yes — via sandboxed iframe |
+| Subdomain spoof + `credentials: true` | **High** | Yes — register matching domain |
+| `*` + `credentials: true` | **Medium** | No — browsers block per spec |
+| Origin reflected, no credentials | **High** | Yes — public data readable |
+| HTTP origin on HTTPS + credentials | **High** | Yes — requires MITM |
+
+---
 
 ## Legal
 
-> **This tool is for authorized security testing only.**
-> Only scan systems you own or have explicit written permission to test.
-> See [SECURITY.md](SECURITY.md) for full policy.
+> **HawkEye is for authorized security testing only.**  
+> Only use this tool against systems you own or have **explicit written permission** to test.  
+> Unauthorized scanning is illegal in most jurisdictions.  
+> See [SECURITY.md](SECURITY.md) for the full responsible disclosure policy.
 
 ---
 
 <p align="center">
-  Developed by <a href="https://twitter.com/A_cyb3r">@A_cyb3r</a> · MIT License
+  Built by <a href="https://github.com/Btr4k">@Btr4k</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.1
 </p>
