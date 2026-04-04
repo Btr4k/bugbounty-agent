@@ -78,7 +78,14 @@ scanning:
       max_urls: 100  # Increased for better XSS coverage
     ffuf:
       enabled: true
-      wordlist_path: ""  # Auto-detects SecLists/dirb/dirbuster, or specify full path
+      # Wordlist search order (first found wins):
+      #   1. This value (if set)
+      #   2. /usr/share/seclists/Discovery/Web-Content/common.txt
+      #   3. /usr/share/wordlists/dirb/common.txt
+      #   4. /opt/SecLists/Discovery/Web-Content/common.txt
+      #   5. Built-in ~130 high-value paths (fallback — limited coverage)
+      # Recommended: apt install seclists  OR  set full path below
+      wordlist_path: ""
       max_targets: 20    # Top N hosts to path-bruteforce (scored by importance)
       vhost_fuzzing: true  # Also fuzz virtual hosts via Host header — finds hidden internal apps
     sqli:

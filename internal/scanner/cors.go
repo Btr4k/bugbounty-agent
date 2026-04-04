@@ -128,12 +128,14 @@ func (e *Engine) testCORS(ctx context.Context, client *http.Client, target strin
 		var findingID, title, description, severity string
 
 		switch {
-		// Critical: Wildcard with credentials
+		// Medium: Wildcard with credentials — invalid combination per CORS spec.
+		// Browsers refuse to honor credentials when ACAO is *, so this is NOT directly
+		// exploitable. It is a misconfiguration but not a critical vulnerability.
 		case acao == "*" && strings.EqualFold(acac, "true"):
 			findingID = "cors-wildcard-credentials"
-			title = "CORS: Wildcard Origin with Credentials"
-			description = "Server returns Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true. This allows any website to make authenticated requests and steal user data."
-			severity = "critical"
+			title = "CORS: Invalid Wildcard+Credentials Header Combination"
+			description = "Server returns Access-Control-Allow-Origin: * alongside Access-Control-Allow-Credentials: true. Per the CORS specification, browsers will block requests using this combination — it is not directly exploitable. However, it indicates a misconfigured CORS policy and should be corrected."
+			severity = "medium"
 
 		// Critical: Arbitrary origin reflected with credentials
 		case acao == test.origin && strings.EqualFold(acac, "true") && test.testName == "arbitrary_origin":

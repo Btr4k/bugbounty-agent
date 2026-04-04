@@ -69,7 +69,7 @@ func (e *Engine) runFfufPaths(ctx context.Context, liveHosts []string) ([]Findin
 	}
 
 	if wordlistPath == "" {
-		e.log.Debugf("ffuf: no wordlist found, building built-in high-value list")
+		e.log.Warnf("ffuf: no wordlist found on system — using built-in ~130 high-value paths (limited coverage). Install SecLists: apt install seclists")
 		tmpWordlist, err := os.CreateTemp("", "ffuf-wordlist-*.txt")
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp wordlist: %w", err)
