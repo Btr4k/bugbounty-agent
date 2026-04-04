@@ -259,12 +259,12 @@ ai:
 
 ### Supported AI Providers
 
-| Provider | Model | Input / Output (per 1M tokens) | Recommended For |
-|---|---|---|---|
-| **DeepSeek** | deepseek-chat | $0.28 / $1.10 | Default — best cost/quality ratio |
-| **Claude** | claude-sonnet-4-20250514 | $3 / $15 | Highest accuracy |
-| **OpenAI** | gpt-4o-mini | $0.15 / $0.60 | Fast and cheap |
-| **OpenRouter** | any model | varies | Multi-model access |
+| Provider | Model | Recommended For |
+|---|---|---|
+| **DeepSeek** | deepseek-chat | Default — best cost/quality ratio |
+| **Claude** | claude-sonnet-4-20250514 | Highest accuracy |
+| **OpenAI** | gpt-4o-mini | Fast and cheap |
+| **OpenRouter** | any model | Multi-model access |
 
 ### Wordlist (ffuf)
 
