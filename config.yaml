@@ -1,0 +1,122 @@
+# Bug Bounty AI Agent Configuration
+
+# ═══════════════════════════════════════════════════════
+# AI Provider Configuration
+# Supported: claude | deepseek | openai | openrouter | custom
+# ═══════════════════════════════════════════════════════
+ai:
+  provider: "deepseek"               # Choose your AI provider
+  api_key: "${DEEPSEEK_API_KEY}"  # API key (or use env vars below)
+  model: "deepseek-chat"                        # Leave empty for provider default
+  max_tokens: 2000
+  base_url: ""                     # Only needed for openrouter/custom
+
+# Provider presets (just change 'provider' and 'api_key'):
+# ┌─────────────┬──────────────────────────┬────────────────────────────┬──────────────┐
+# │ Provider    │ Model (default)          │ Env Variable               │ Cost/1M tok  │
+# ├─────────────┼──────────────────────────┼────────────────────────────┼──────────────┤
+# │ claude      │ claude-sonnet-4-20250514 │ ANTHROPIC_API_KEY          │ $3/$15       │
+# │ deepseek    │ deepseek-chat            │ DEEPSEEK_API_KEY           │ $0.28/$0.42  │
+# │ openai      │ gpt-4o-mini              │ OPENAI_API_KEY             │ $0.15/$0.60  │
+# │ openrouter  │ deepseek/deepseek-chat   │ OPENROUTER_API_KEY         │ varies       │
+# │ custom      │ (must specify)           │ AI_API_KEY                 │ varies       │
+# └─────────────┴──────────────────────────┴────────────────────────────┴──────────────┘
+
+# Legacy Claude config (backward compatibility - used if ai.api_key is empty)
+claude:
+  api_key: "${ANTHROPIC_API_KEY}"
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 2000
+
+# C99.nl API Intelligence
+c99:
+  api_key: "${C99_API_KEY}"
+  enabled: true
+
+# Target Configuration
+target:
+  domains: []
+  excluded_subdomains: []
+  scope: "in-scope-only"
+
+# Reconnaissance Settings
+recon:
+  enabled: true
+  timeout: 300 # seconds
+  max_subdomains: 1000
+  max_wayback_urls: 10000 # prevent OOM for large domains
+  tools:
+    subfinder: true
+    amass: false # Slower but comprehensive
+    assetfinder: true
+    github_dorking: true
+    wayback: true
+    katana: true  # JS file extraction crawler
+
+# Scanning Settings
+scanning:
+  enabled: true
+  threads: 75  # Increased for better performance
+  timeout: 1200  # 20 minutes for high-priority templates
+  rate_limit: 250 # requests per second (faster scanning)
+  tools:
+    nuclei:
+      enabled: true
+      severity: []  # No filter - run all templates, findings keep their real severity
+      templates_path: "/root/nuclei-templates"  # ALL templates for maximum coverage
+    httpx:
+      enabled: true
+      follow_redirects: true
+      status_code: true
+    nmap:
+      enabled: true
+      ports: "21,22,25,53,80,110,143,443,445,993,995,3000,3306,5432,6379,8000,8080,8443,8888,9090,9200,27017"
+      fast_scan: true
+    dalfox:
+      enabled: true
+      blind_url: ""  # Optional: blind XSS callback URL (e.g. https://your-burp-collaborator)
+      max_urls: 100  # Increased for better XSS coverage
+    ffuf:
+      enabled: true
+      wordlist_path: ""  # Auto-detects SecLists/dirb/dirbuster, or specify full path
+      max_targets: 20    # Top N hosts to path-bruteforce (scored by importance)
+      vhost_fuzzing: true  # Also fuzz virtual hosts via Host header — finds hidden internal apps
+    sqli:
+      enabled: true      # SQLi via nuclei templates + gf-style param filtering (replaces sqlmap)
+      # NOTE: sqlmap config kept for backward compatibility — set enabled:true above to activate
+    sqlmap:
+      enabled: true      # Uses nuclei sqli templates internally (NOT blind sqlmap)
+      max_urls: 50       # Max gf-filtered param URLs to test
+    arjun:
+      enabled: true      # Hidden parameter discovery — feeds discovered params into dalfox
+      max_targets: 15    # Top N hosts to discover hidden params on
+    cors:
+      enabled: true      # CORS misconfiguration detection (fast, no external tools needed)
+
+# AI Analysis
+analysis:
+  enabled: true
+  min_confidence: 0.7
+  auto_validate: true
+  false_positive_filter: true
+  js_analysis: true  # AI-powered JS file analysis
+
+# Reporting
+reporting:
+  format: "markdown"
+  language: "ar" # Arabic reports
+  include_poc: true
+  severity_filter: []  # No filter - include ALL severities (critical, high, medium, low, info)
+  output_dir: "./reports"
+
+# Notifications
+notifications:
+  enabled: false
+  slack_webhook: ""
+  discord_webhook: ""
+
+# Logging
+logging:
+  level: "info" # debug, info, warn, error
+  file: "./logs/agent.log"
+  max_size_mb: 100

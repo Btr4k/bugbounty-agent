@@ -1,0 +1,51 @@
+# ============================================================
+# HawkEye .gitignore
+# ============================================================
+
+# ─── SECRETS — NEVER commit these ───────────────────────────
+.env
+.env.local
+.env.production
+.env.staging
+*.key
+*.pem
+secrets.yaml
+secrets.yml
+
+# ─── Reports (may contain sensitive vulnerability data) ──────
+reports/*
+!reports/.gitkeep
+
+# ─── Logs ────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Build artifacts ─────────────────────────────────────────
+hawkeye
+hawkeye-*
+bugbounty-agent
+bugbounty-agent.exe
+dist/
+bin/
+main
+
+# ─── Large wordlists — download separately ───────────────────
+*.txt
+!requirements.txt
+
+# ─── Temp files ──────────────────────────────────────────────
+*.tmp
+*.temp
+/tmp/sqlmap-hawkeye/
+
+# ─── Go ──────────────────────────────────────────────────────
+vendor/
+
+# ─── IDE & OS ────────────────────────────────────────────────
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
