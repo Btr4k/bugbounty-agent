@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -265,13 +266,9 @@ func selectArjunTargets(hosts []string) []string {
 	}
 
 	// Sort by score descending
-	for i := range scored {
-		for j := i + 1; j < len(scored); j++ {
-			if scored[j].score > scored[i].score {
-				scored[i], scored[j] = scored[j], scored[i]
-			}
-		}
-	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
 
 	result := make([]string, 0, maxTargets)
 	for i, s := range scored {

@@ -124,9 +124,15 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		e.log.ToolSkip("Httpx", "disabled in config")
 	}
 
-	// Fallback: if httpx returned no live hosts, use raw subdomains
+	// Fallback: if httpx returned no live hosts, use raw subdomains with https:// prefix
 	if len(liveHosts) == 0 {
-		liveHosts = reconResults.Subdomains
+		for _, sub := range reconResults.Subdomains {
+			if strings.HasPrefix(sub, "http://") || strings.HasPrefix(sub, "https://") {
+				liveHosts = append(liveHosts, sub)
+			} else {
+				liveHosts = append(liveHosts, "https://"+sub)
+			}
+		}
 		e.log.PhaseNote("No live hosts from httpx, falling back to raw subdomains")
 	}
 
@@ -443,6 +449,12 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	}
 
 	templatesBase := e.cfg.Scanning.Tools.Nuclei.TemplatesPath
+	if templatesBase != "" {
+		if _, err := os.Stat(templatesBase); err != nil {
+			e.log.Warnf("Nuclei templates path not found: %s — using default templates", templatesBase)
+			templatesBase = ""
+		}
+	}
 	if templatesBase != "" {
 		targetCount := len(targets)
 		if targetCount > 50 {
@@ -1215,6 +1227,7 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		}
 
 		if err := json.Unmarshal([]byte(line), &dalfoxResult); err != nil {
+			e.log.Debugf("Dalfox: skipping non-JSON line: %s", line)
 			continue
 		}
 
