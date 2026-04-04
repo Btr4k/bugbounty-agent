@@ -32,7 +32,7 @@ It chains recon tools, vulnerability scanners, and an AI validator into a single
 producing a clean, analyst-grade report with confirmed findings only.
 
 ```
-./hawkeye --target hackerone-target.com
+./hawkeye -d hackerone-target.com
 ```
 
 That's it. HawkEye handles the rest.
@@ -143,7 +143,7 @@ echo "DEEPSEEK_API_KEY=your-key-here" >> .env
 go build -o hawkeye ./cmd/main.go
 
 # 5. Scan
-./hawkeye --target target.com
+./hawkeye -d target.com
 ```
 
 ---
@@ -153,8 +153,9 @@ go build -o hawkeye ./cmd/main.go
 ```
 ./hawkeye [flags]
 
-Required:
-  -t, --target      string   Target domain (e.g. example.com)
+Required (either flag works):
+  -d, --domain      string   Target domain (e.g. example.com)
+  -t, --target      string   Target domain (alias for -d/--domain)
 
 Options:
   -v, --verbose              Show detailed scan progress
@@ -162,7 +163,7 @@ Options:
   -o, --output     string    Report output directory (default: ./reports)
       --skip-recon           Skip recon phase (subdomains already known)
       --skip-scan            Skip vulnerability scanning phase
-      --js-only              Run JS analysis only (skips recon and scanning)
+      --js-only              Run JS analysis only (skips vulnerability scanning)
       --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter
       --ai-model    string   Override AI model name
   -h, --help                 Show help
@@ -172,22 +173,22 @@ Options:
 
 ```bash
 # Standard full scan
-./hawkeye --target target.com
+./hawkeye -d target.com
 
 # Full scan with live progress output
-./hawkeye --target target.com --verbose
+./hawkeye -d target.com --verbose
 
 # JS secrets and endpoints only (fast, no scanning)
-./hawkeye --target target.com --js-only
+./hawkeye -d target.com --js-only
 
 # Skip subdomain enumeration
-./hawkeye --target target.com --skip-recon
+./hawkeye -d target.com --skip-recon
 
 # Skip scanning, run AI analysis on recon output only
-./hawkeye --target target.com --skip-scan
+./hawkeye -d target.com --skip-scan
 
 # Use a specific AI provider for this run
-./hawkeye --target target.com --ai-provider claude --ai-model claude-sonnet-4-20250514
+./hawkeye -d target.com --ai-provider claude --ai-model claude-sonnet-4-20250514
 
 # Use short flags
 ./hawkeye -t target.com -v
