@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -691,7 +692,26 @@ func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile 
 	var jsFiles []JSFile
 	mu := &sync.Mutex{}
 
-	// Limit to 30 most important JS files
+	// Prioritize JS files: prefer app bundles over vendor/polyfill files,
+	// and larger files (more code = more secrets/endpoints).
+	// Sort URLs: score down vendor/polyfill/chunk, score up app/main/index/bundle.
+	sort.SliceStable(jsURLs, func(i, j int) bool {
+		score := func(u string) int {
+			lower := strings.ToLower(u)
+			s := 0
+			if strings.Contains(lower, "vendor") || strings.Contains(lower, "polyfill") ||
+				strings.Contains(lower, "chunk") || strings.Contains(lower, "runtime") {
+				s -= 10
+			}
+			if strings.Contains(lower, "app") || strings.Contains(lower, "main") ||
+				strings.Contains(lower, "index") || strings.Contains(lower, "bundle") ||
+				strings.Contains(lower, "config") || strings.Contains(lower, "api") {
+				s += 10
+			}
+			return s
+		}
+		return score(jsURLs[i]) > score(jsURLs[j])
+	})
 	maxFiles := 30
 	if len(jsURLs) > maxFiles {
 		jsURLs = jsURLs[:maxFiles]

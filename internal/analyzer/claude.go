@@ -445,6 +445,7 @@ func (a *ClaudeAnalyzer) formatTopFindings(findings []ValidatedFinding, limit in
 type JSFinding struct {
 	Type        string `json:"type"`
 	Value       string `json:"value"`
+	FileURL     string `json:"file_url"`
 	Severity    string `json:"severity"`
 	Description string `json:"description"`
 }
@@ -565,24 +566,25 @@ Files:
 `)
 
 	for idx, js := range jsFiles {
-		// Increase to 8KB for better coverage of large files
 		content := js.Content
-		if len(content) > 8000 {
-			// Smart truncation: keep beginning (imports/config) and end (exports)
-			head := content[:4000]
+		if len(content) > 12000 {
+			// Smart truncation: keep beginning (config/imports) + middle chunk (routes/API defs) + end (exports)
+			head := content[:5000]
+			mid := content[len(content)/2-1000 : len(content)/2+1000]
 			tail := content[len(content)-4000:]
-			content = head + "\n... [middle truncated] ...\n" + tail
+			content = head + "\n... [truncated] ...\n" + mid + "\n... [truncated] ...\n" + tail
 		}
 
-		prompt.WriteString(fmt.Sprintf("%d. %s\n```js\n%s\n```\n\n", idx+1, js.URL, content))
+		prompt.WriteString(fmt.Sprintf("%d. FILE: %s\n```js\n%s\n```\n\n", idx+1, js.URL, content))
 	}
 
-	prompt.WriteString(`JSON response:
+	prompt.WriteString(`JSON response (file_url must match the FILE: URL above each snippet):
 {
   "findings": [
     {
       "type": "aws_key|api_key|secret|jwt|credential|endpoint|pii|config",
-      "value": "actual value or endpoint URL",
+      "value": "exact value found — not a description",
+      "file_url": "https://example.com/app.js",
       "severity": "critical|high|medium|low",
       "description": "what was found and why it matters"
     }
@@ -626,10 +628,12 @@ Empty if nothing: {"findings": []}`)
 			Description: jf.Description,
 			Severity:    jf.Severity,
 			Type:        "js-analysis",
+			URL:         jf.FileURL,
 			Evidence:    jf.Value,
 			Metadata: map[string]string{
-				"source": "ai-js-analysis",
-				"tool":   fmt.Sprintf("%s-js", a.cfg.AI.Provider),
+				"source":   "ai-js-analysis",
+				"tool":     fmt.Sprintf("%s-js", a.cfg.AI.Provider),
+				"file_url": jf.FileURL,
 			},
 		}
 		findings = append(findings, finding)

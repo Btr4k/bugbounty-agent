@@ -144,10 +144,24 @@ var jsPatterns = []regexPattern{
 
 	// ═══ Internal Endpoints & APIs ═══
 	{
-		Name:     "Internal/Admin API Endpoint",
-		Pattern:  regexp.MustCompile(`(?i)["'](/api/(admin|internal|debug|private|v[0-9]+/(admin|internal|users|config|settings)))[/"']`),
+		Name:     "Admin/Internal API Endpoint",
+		Pattern:  regexp.MustCompile(`(?i)["'](/api/(admin|internal|debug|private|v[0-9]+/(admin|internal|users|config|settings|delete|upload|reset|token|auth)))[/"']`),
 		Severity: "high",
 		Type:     "internal_api",
+	},
+	{
+		// Catches ALL /api/vN/... endpoints — for attack surface mapping
+		Name:    "API Versioned Endpoint",
+		Pattern: regexp.MustCompile(`(?i)["'](/api/v[0-9]+/[a-zA-Z0-9/_-]{3,50})[/"']`),
+		Severity: "medium",
+		Type:    "api_endpoint",
+	},
+	{
+		// Catches /api/something patterns not caught by above
+		Name:    "API Endpoint",
+		Pattern: regexp.MustCompile(`(?i)["'](/api/[a-zA-Z0-9/_-]{3,60})[/"']`),
+		Severity: "low",
+		Type:    "api_endpoint_generic",
 	},
 	{
 		Name:     "GraphQL Endpoint",
@@ -162,10 +176,24 @@ var jsPatterns = []regexPattern{
 		Type:     "websocket_endpoint",
 	},
 	{
+		// Full external API URLs hardcoded in JS
+		Name:    "Hardcoded External API URL",
+		Pattern: regexp.MustCompile(`(?i)["'](https?://[a-zA-Z0-9._-]{4,}/[a-zA-Z0-9/_-]{3,})['"]\s*[,;]`),
+		Severity: "low",
+		Type:    "hardcoded_url",
+	},
+	{
 		Name:     "Hardcoded Internal IP",
 		Pattern:  regexp.MustCompile(`["'](10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})["']`),
 		Severity: "medium",
 		Type:     "internal_ip",
+	},
+	{
+		// S3 bucket names exposed in JS
+		Name:    "S3 Bucket URL",
+		Pattern: regexp.MustCompile(`(?i)["'](https?://[a-zA-Z0-9._-]+\.s3[.-][a-zA-Z0-9._-]*\.amazonaws\.com[^"']*)['"']`),
+		Severity: "high",
+		Type:    "s3_bucket",
 	},
 
 	// ═══ Security Misconfigurations ═══
