@@ -145,16 +145,23 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		}
 	}
 
-	// Also include raw scan findings that weren't validated by AI (non-info)
-	// These are findings that the AI analysis might have missed
+	// Also include raw scan findings that weren't processed at all (non-info).
+	// "Processed" = validated as true positive OR rejected as false positive.
+	// Pre-validated rejections and AI rejections are both excluded here —
+	// they were already evaluated and determined to be false positives.
 	if len(scanResults.Findings) > 0 {
 		var unvalidated []scanner.Finding
-		validatedURLs := make(map[string]bool)
+		// Track every finding that went through the analysis pipeline (validated or rejected).
+		// Key: "url|title" to avoid collisions when one URL has multiple finding types.
+		processedKeys := make(map[string]bool)
 		for _, vf := range analysis.ValidatedFindings {
-			validatedURLs[vf.URL] = true
+			processedKeys[vf.URL+"|"+vf.Title] = true
+		}
+		for _, fp := range analysis.FalsePositives {
+			processedKeys[fp.URL+"|"+fp.Title] = true
 		}
 		for _, sf := range scanResults.Findings {
-			if sf.Severity != "info" && !validatedURLs[sf.URL] {
+			if sf.Severity != "info" && !processedKeys[sf.URL+"|"+sf.Title] {
 				unvalidated = append(unvalidated, sf)
 			}
 		}

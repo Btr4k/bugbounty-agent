@@ -572,22 +572,43 @@ func classifyFfufSeverity(path string, status int) string {
 		}
 	}
 
-	highPaths := []string{
+	// Paths where 200/redirect = high severity finding.
+	// For 403/401: these are access-controlled but potentially bypassable → low.
+	accessControlPaths := []string{
 		"admin", "administrator", "phpmyadmin", "adminer",
-		"debug", "console", "shell", "phpinfo",
 		"graphql", "graphiql", "swagger", "api-docs",
-		"actuator", "jolokia", "trace.axd", "elmah.axd",
-		"server-status", "server-info",
-		"_debug", "_profiler", "_debugbar",
+		"actuator", "jolokia",
 	}
-	for _, p := range highPaths {
+	for _, p := range accessControlPaths {
 		if lower == p || strings.HasPrefix(lower, p+"/") || strings.HasPrefix(lower, p+".") {
 			if status == 200 || status == 301 || status == 302 {
 				return "high"
 			}
 			if status == 401 || status == 403 {
-				return "medium"
+				// Access denied = server is protecting the resource.
+				// Still reportable as low because auth bypass may be possible.
+				return "low"
 			}
+		}
+	}
+
+	// Diagnostic/debug paths: returning 403/401 means they are PROPERLY SECURED.
+	// Access denied on these is expected secure behavior — not a vulnerability.
+	// Only report if actually accessible (200/redirect).
+	diagnosticPaths := []string{
+		"trace.axd", "elmah.axd",
+		"server-status", "server-info",
+		"debug", "console", "shell", "phpinfo",
+		"_debug", "_profiler", "_debugbar",
+	}
+	for _, p := range diagnosticPaths {
+		if lower == p || strings.HasPrefix(lower, p+"/") || strings.HasPrefix(lower, p+".") {
+			if status == 200 || status == 301 || status == 302 {
+				return "high"
+			}
+			// 403/401 → server is blocking the diagnostic endpoint correctly.
+			// This is NOT a vulnerability — return empty to skip finding entirely.
+			return ""
 		}
 	}
 

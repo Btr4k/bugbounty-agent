@@ -126,10 +126,44 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		return analysis, nil
 	}
 
-	a.log.Debugf("AI Analysis: processing %d findings in batches of 5 (JS findings auto-accepted: %d)",
-		len(toValidate), len(scanResults.Findings)-len(toValidate))
+	// ── Pre-Validation: deterministic rules before spending AI tokens ──────────
+	// These rules are based on security fundamentals (e.g. CORS spec, HTTP semantics).
+	// They catch obvious false positives with 100% certainty — no AI needed.
+	var preFiltered []scanner.Finding
+	for _, f := range toValidate {
+		result := PreValidateFinding(f)
+		switch result.Outcome {
+		case PreValidReject:
+			analysis.FalsePositives = append(analysis.FalsePositives, ValidatedFinding{
+				Finding:    f,
+				IsValid:    false,
+				Confidence: 1.0,
+				AIAnalysis: "[Pre-Validation] " + result.Reason,
+			})
+			a.log.Debugf("Pre-validator rejected [%s] %s: %s", f.Severity, f.Title, result.Reason[:min(60, len(result.Reason))])
+		case PreValidDowngrade:
+			f.Severity = result.NewSeverity
+			f.Description = f.Description + "\n\n[Pre-Validation Note] " + result.Reason
+			preFiltered = append(preFiltered, f)
+		default:
+			preFiltered = append(preFiltered, f)
+		}
+	}
+	toValidate = preFiltered
+	// ────────────────────────────────────────────────────────────────────────────
 
-	// Process non-JS findings in batches for efficiency
+	a.log.Debugf("AI Analysis: processing %d findings in batches of 5 (JS auto-accepted: %d, pre-rejected: %d)",
+		len(toValidate), len(scanResults.Findings)-len(toValidate)-len(analysis.FalsePositives), len(analysis.FalsePositives))
+
+	if len(toValidate) == 0 {
+		a.calculateStatistics(analysis)
+		analysis.TopFindings = a.getTopFindings(analysis.ValidatedFindings, 10)
+		analysis.Summary = a.generateLocalSummary(analysis)
+		analysis.Recommendations = a.generateLocalRecommendations(analysis)
+		return analysis, nil
+	}
+
+	// Process remaining findings via AI in batches
 	batchSize := 5
 	for i := 0; i < len(toValidate); i += batchSize {
 		end := i + batchSize
@@ -189,42 +223,92 @@ func (a *ClaudeAnalyzer) analyzeBatch(ctx context.Context, findings []scanner.Fi
 func (a *ClaudeAnalyzer) buildAnalysisPrompt(findings []scanner.Finding) string {
 	var prompt strings.Builder
 
-	// Compact prompt to save tokens
-	prompt.WriteString(`خبير أمن سيبراني. حلل الثغرات وحدد: صحة (True/False Positive)، التأثير، PoC مختصر، الحل.
+	prompt.WriteString(`أنت محكّم أمني متخصص في Bug Bounty. مهمتك: تحديد ما إذا كانت كل نتيجة TRUE POSITIVE قابلة للاستغلال فعلياً، أم FALSE POSITIVE.
 
-النتائج:
+المعيار الوحيد للقبول: هل يمكن كتابة PoC ينجح الآن على الهدف الحقيقي؟
+
+═══ قواعد التحقق الإلزامية حسب النوع ═══
+
+[CORS — cors-misconfiguration]
+✗ رفض إذا: ACAO=* بدون ACAC=true → المتصفح يرفض credentials مع wildcard (CORS spec)، لا يمكن سرقة بيانات المستخدم
+✗ رفض إذا: ACAO=* والـ ACAC فارغ أو false → نفس السبب، فقط بيانات عامة قابلة للقراءة
+✓ قبول إذا: ACAO يعكس origin الخصم AND ACAC=true → خطر حقيقي، يمكن سرقة cookies
+✓ قبول إذا: ACAO=null AND ACAC=true → قابل للاستغلال عبر sandboxed iframe
+
+[Directory/Path — directory-bruteforce]
+✗ رفض إذا: الاستجابة 403 أو 401 → الخادم يحجب الوصول، هذا سلوك أمني صحيح وليس ثغرة
+✗ رفض إذا: trace.axd أو elmah.axd أو server-status مع 403 → محمية بشكل صحيح
+✗ رفض إذا: أي مسار مع 403 بدون دليل على bypass محتمل
+✓ قبول فقط إذا: الاستجابة 200 مع محتوى حساس فعلي (ملف .env، قاعدة بيانات، مفاتيح API)
+✓ قبول مشروط (Low) إذا: لوحة admin مع 403 — يُذكر كاكتشاف مسار فقط
+
+[SSL/TLS — ssl]
+✗ رفض إذا: TLS 1.2 مع ECDHE_*_CBC فقط → forward secrecy موجود، BEAST/POODLE تحتاج TLS 1.0/SSL 3.0
+✗ رفض إذا: wildcard certificate بدون انتهاء صلاحية → ممارسة مقبولة وليست ثغرة
+✓ قبول إذا: SSLv3 أو TLS 1.0 مدعوم → POODLE/BEAST قابل للاستغلال
+✓ قبول إذا: RC4 أو 3DES أو NULL cipher → ضعف تشفير حقيقي
+✓ قبول إذا: شهادة منتهية الصلاحية → Low severity حقيقي
+
+[SQL Injection — sqli]
+✗ رفض إذا: الدليل هو مجرد error message عام بدون استخراج بيانات
+✓ قبول إذا: تم استخراج بيانات فعلية (version, database name, table names) أو time-based delay مؤكد
+
+[XSS — xss]
+✗ رفض إذا: payload لم ينفّذ فعلياً (reflected في HTML بدون تنفيذ)
+✓ قبول إذا: payload نفّذ في المتصفح أو دليل على DOM sink
+
+[General]
+- confidence ≥ 0.85: دليل قاطع على الاستغلال
+- confidence 0.70-0.84: دليل قوي لكن يحتاج تأكيد يدوي
+- confidence < 0.70: شك كبير → is_valid: false
+- لا تخمّن أو تفترض سيناريوهات نظرية — الدليل يجب أن يثبت الاستغلال مباشرة
+
+النتائج للتحقق:
 `)
 
 	for i, finding := range findings {
-		// Truncate long descriptions/evidence to save tokens
 		desc := finding.Description
-		if len(desc) > 150 {
-			desc = desc[:150] + "..."
+		if len(desc) > 200 {
+			desc = desc[:200] + "..."
 		}
 		evidence := finding.Evidence
-		if len(evidence) > 100 {
-			evidence = evidence[:100] + "..."
+		if len(evidence) > 150 {
+			evidence = evidence[:150] + "..."
 		}
 
-		prompt.WriteString(fmt.Sprintf(`%d. [%s] %s | %s
-URL: %s | Desc: %s | Evidence: %s
+		// Include metadata for CORS (acao/acac are critical for correct evaluation)
+		meta := ""
+		if finding.Type == "cors-misconfiguration" {
+			if acao, ok := finding.Metadata["acao"]; ok {
+				meta += fmt.Sprintf(" | ACAO: %s", acao)
+			}
+			if acac, ok := finding.Metadata["acac"]; ok {
+				meta += fmt.Sprintf(" | ACAC: %s", acac)
+			}
+		}
 
-`, i+1, finding.Severity, finding.Title, finding.Type, finding.URL, desc, evidence))
+		prompt.WriteString(fmt.Sprintf(`%d. [%s] %s | type:%s%s
+   URL: %s
+   Evidence: %s
+   Desc: %s
+
+`, i+1, finding.Severity, finding.Title, finding.Type, meta, finding.URL, evidence, desc))
 	}
 
-	prompt.WriteString(`رد JSON فقط:
+	prompt.WriteString(`رد بـ JSON فقط — يجب أن يحتوي "reasoning" على خطوات التفكير قبل الحكم:
 {
   "findings": [
     {
       "index": 0,
-      "is_valid": true/false,
-      "confidence": 0.0-1.0,
-      "analysis": "تحليل مختصر",
-      "impact_assessment": "التأثير",
-      "remediation": "الحل",
-      "proof_of_concept": "PoC مختصر",
-      "cybersecurity_context": "OWASP/CWE/CVE",
-      "bug_bounty_value": "high/medium/low"
+      "reasoning": "1) ما الدليل الفعلي؟ 2) هل ينطبق قاعدة رفض من القواعد أعلاه؟ 3) هل يمكن كتابة PoC ناجح الآن؟",
+      "is_valid": true,
+      "confidence": 0.0,
+      "analysis": "نتيجة الحكم المختصرة",
+      "impact_assessment": "التأثير الفعلي إذا صحيح، أو سبب الرفض إذا false positive",
+      "remediation": "الحل التقني المحدد",
+      "proof_of_concept": "PoC قابل للتنفيذ فوراً (فارغ إذا false positive)",
+      "cybersecurity_context": "OWASP Axxx / CWE-xxx / CVE-xxxx ذو صلة مباشرة",
+      "bug_bounty_value": "high/medium/low/none"
     }
   ]
 }`)
