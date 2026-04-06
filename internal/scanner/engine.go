@@ -398,16 +398,62 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 	wg.Wait()
 
-	// Deduplicate findings (same title + same URL = one finding)
-	seen := make(map[string]bool)
-	deduped := make([]Finding, 0, len(results.Findings))
+	// Deduplicate findings across all tools.
+	//
+	// Two-pass strategy:
+	//   Pass 1 — exact dedup: same title + same URL from the same tool (fast path).
+	//   Pass 2 — cross-tool dedup: different tools that flagged the same URL for the
+	//            same vulnerability class (e.g. nuclei "Codeigniter .env" AND ffuf
+	//            "Environment File Exposed" both pointing at the same /.env URL).
+	//            Keep whichever finding has the higher severity; ties keep the first.
+
+	severityRank := map[string]int{
+		"critical": 4,
+		"high":     3,
+		"medium":   2,
+		"low":      1,
+		"info":     0,
+	}
+
+	// Pass 1: exact dedup (title + URL)
+	exactSeen := make(map[string]bool)
+	pass1 := make([]Finding, 0, len(results.Findings))
 	for _, f := range results.Findings {
 		key := strings.ToLower(f.Title + "|" + f.URL)
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, f)
+		if !exactSeen[key] {
+			exactSeen[key] = true
+			pass1 = append(pass1, f)
 		}
 	}
+
+	// Pass 2: cross-tool dedup by URL — keep highest-severity finding per URL.
+	// Findings from JS analysis are intentionally excluded from this pass because
+	// a single JS file can legitimately contain multiple distinct issue types
+	// (e.g. eval() AND a hardcoded API key are different findings on the same URL).
+	urlBest := make(map[string]Finding) // key: normalised URL
+	var jsFindings []Finding
+	for _, f := range pass1 {
+		if f.Type == "js-analysis" {
+			jsFindings = append(jsFindings, f)
+			continue
+		}
+		key := strings.ToLower(f.URL)
+		existing, exists := urlBest[key]
+		if !exists {
+			urlBest[key] = f
+			continue
+		}
+		// Replace if this finding has strictly higher severity
+		if severityRank[strings.ToLower(f.Severity)] > severityRank[strings.ToLower(existing.Severity)] {
+			urlBest[key] = f
+		}
+	}
+
+	deduped := make([]Finding, 0, len(urlBest)+len(jsFindings))
+	for _, f := range urlBest {
+		deduped = append(deduped, f)
+	}
+	deduped = append(deduped, jsFindings...)
 	results.Findings = deduped
 
 	// Calculate statistics

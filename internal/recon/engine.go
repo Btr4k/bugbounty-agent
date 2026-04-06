@@ -669,7 +669,7 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
 		url := strings.TrimSpace(scanner.Text())
-		if url != "" && strings.HasSuffix(strings.ToLower(strings.Split(url, "?")[0]), ".js") {
+		if url != "" && strings.HasSuffix(strings.ToLower(strings.Split(url, "?")[0]), ".js") && !isNoiseJS(url) {
 			jsURLs = append(jsURLs, url)
 		}
 	}
@@ -684,11 +684,38 @@ func (e *Engine) extractJSFromURLs(urls []string) []string {
 		lower := strings.ToLower(u)
 		// Remove query params for extension check
 		path := strings.Split(lower, "?")[0]
-		if strings.HasSuffix(path, ".js") {
+		if strings.HasSuffix(path, ".js") && !isNoiseJS(u) {
 			jsURLs = append(jsURLs, u)
 		}
 	}
 	return jsURLs
+}
+
+// isNoiseJS returns true for JS URLs that belong to CDN infrastructure,
+// browser challenge scripts, or third-party analytics — files that are
+// not part of the target application and will only produce false positives.
+func isNoiseJS(u string) bool {
+	lower := strings.ToLower(u)
+	noisePatterns := []string{
+		"/cdn-cgi/",           // Cloudflare challenge & analytics scripts
+		"/challenge-platform/", // Cloudflare bot-management JS
+		"challenges.cloudflare.com",
+		"/wp-includes/js/",    // WordPress core (not app code)
+		"/wp-content/plugins/", // WordPress plugins — noisy, rarely interesting
+		"googletagmanager.com",
+		"google-analytics.com",
+		"/gtag/js",
+		"facebook.net/",
+		"connect.facebook.net/",
+		"analytics.js",
+		"gtm.js",
+	}
+	for _, pattern := range noisePatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // downloadJSFiles downloads JS file content for AI analysis

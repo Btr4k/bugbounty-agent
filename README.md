@@ -258,6 +258,35 @@ ai:
 | **OpenAI** | gpt-4o-mini | Fast and cheap |
 | **OpenRouter** | any model | Multi-model access |
 
+### C99.nl API (Subdomain Intelligence)
+
+C99.nl significantly improves subdomain discovery. Without it, HawkEye still works but misses subdomains that only C99's database covers.
+
+**Get a key:** Register at [c99.nl](https://c99.nl) → Dashboard → API Key
+
+Add it to `.env`:
+
+```env
+C99_API_KEY=your-api-key-here
+```
+
+It is automatically picked up via `config.yaml`:
+
+```yaml
+c99:
+  api_key: "${C99_API_KEY}"
+  enabled: true
+```
+
+To disable C99 without removing the key:
+
+```yaml
+c99:
+  enabled: false
+```
+
+---
+
 ### Wordlist (ffuf)
 
 For maximum path discovery coverage, install SecLists:
