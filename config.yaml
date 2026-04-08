@@ -5,9 +5,9 @@
 # Supported: claude | deepseek | openai | openrouter | custom
 # ═══════════════════════════════════════════════════════
 ai:
-  provider: "deepseek"               # Choose your AI provider
-  api_key: "${DEEPSEEK_API_KEY}"  # API key (or use env vars below)
-  model: "deepseek-chat"                        # Leave empty for provider default
+  provider: "auto"                  # auto = detect from .env (claude/deepseek/openai/openrouter)
+  api_key: ""                       # Leave empty — key is read from .env automatically
+  model: ""                         # Leave empty for provider default
   max_tokens: 2000
   base_url: ""                     # Only needed for openrouter/custom
 

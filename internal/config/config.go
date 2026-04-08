@@ -240,37 +240,81 @@ func Load(filename string) (*Config, error) {
 	return &cfg, nil
 }
 
-// ResolveAIConfig fills in AI config defaults based on provider, with backward compat
+// autoDetectProvider scans environment variables and returns the first provider
+// whose API key is set. Priority: claude → deepseek → openai → openrouter.
+// Returns ("", "") if no key is found.
+func autoDetectProvider() (provider, apiKey string) {
+	candidates := []struct {
+		provider string
+		envVar   string
+	}{
+		{"claude", "ANTHROPIC_API_KEY"},
+		{"deepseek", "DEEPSEEK_API_KEY"},
+		{"openai", "OPENAI_API_KEY"},
+		{"openrouter", "OPENROUTER_API_KEY"},
+	}
+	for _, c := range candidates {
+		if key := os.Getenv(c.envVar); key != "" && !strings.HasPrefix(key, "your-") {
+			return c.provider, key
+		}
+	}
+	return "", ""
+}
+
+// ResolveAIConfig fills in AI config defaults based on provider, with backward compat.
+// If provider is "auto" (or empty), it detects the provider from whichever env var is set.
 func (c *Config) ResolveAIConfig() {
-	// Backward compatibility: if ai.api_key is empty, fall back to provider env vars
-	if c.AI.APIKey == "" || c.AI.APIKey == "${AI_API_KEY}" {
-		switch c.AI.Provider {
-		case "claude":
-			c.AI.APIKey = c.Claude.APIKey
-		case "deepseek":
-			if envKey := os.Getenv("DEEPSEEK_API_KEY"); envKey != "" {
-				c.AI.APIKey = envKey
-			}
-		case "openai":
-			if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" {
-				c.AI.APIKey = envKey
-			}
-		case "openrouter":
-			if envKey := os.Getenv("OPENROUTER_API_KEY"); envKey != "" {
-				c.AI.APIKey = envKey
+	// Resolve api_key env var expansion first
+	if c.AI.APIKey == "${AI_API_KEY}" {
+		c.AI.APIKey = ""
+	}
+
+	// Auto-detect provider from env vars when:
+	//   - provider is "auto" or empty
+	//   - OR the configured provider's key is missing
+	needsAutoDetect := c.AI.Provider == "auto" || c.AI.Provider == ""
+	if !needsAutoDetect && c.AI.APIKey == "" {
+		// Provider is set but key is missing — try auto-detect as fallback
+		needsAutoDetect = true
+	}
+
+	if needsAutoDetect {
+		if p, k := autoDetectProvider(); p != "" {
+			c.AI.Provider = p
+			if c.AI.APIKey == "" {
+				c.AI.APIKey = k
 			}
 		}
 	}
 
-	if c.AI.Provider == "" {
+	// Backward compatibility: if api_key still empty, try provider-specific fallbacks
+	if c.AI.APIKey == "" {
+		switch c.AI.Provider {
+		case "claude":
+			c.AI.APIKey = c.Claude.APIKey
+		case "deepseek":
+			c.AI.APIKey = os.Getenv("DEEPSEEK_API_KEY")
+		case "openai":
+			c.AI.APIKey = os.Getenv("OPENAI_API_KEY")
+		case "openrouter":
+			c.AI.APIKey = os.Getenv("OPENROUTER_API_KEY")
+		}
+	}
+
+	// Final fallback provider
+	if c.AI.Provider == "" || c.AI.Provider == "auto" {
 		c.AI.Provider = "deepseek"
 	}
 
-	// Backward compat: if model is empty, use claude model for claude provider
+	// Backward compat: if model is empty, use provider default
 	if c.AI.Model == "" {
 		switch c.AI.Provider {
 		case "claude":
-			c.AI.Model = c.Claude.Model
+			if c.Claude.Model != "" {
+				c.AI.Model = c.Claude.Model
+			} else {
+				c.AI.Model = "claude-sonnet-4-20250514"
+			}
 		case "deepseek":
 			c.AI.Model = "deepseek-chat"
 		case "openai":
