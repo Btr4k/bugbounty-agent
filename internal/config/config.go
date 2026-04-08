@@ -151,13 +151,19 @@ type LoggingConfig struct {
 	MaxSizeMB int    `yaml:"max_size_mb" mapstructure:"max_size_mb"`
 }
 
-// loadEnvFile loads environment variables from .env file if it exists
+// loadEnvFile loads environment variables from .env file if it exists.
+// Rules: system env vars take precedence over .env; within .env, last value wins.
 func loadEnvFile() {
 	file, err := os.Open(".env")
 	if err != nil {
 		return // .env file is optional
 	}
 	defer file.Close()
+
+	// Collect all values first (last duplicate wins within .env)
+	values := make(map[string]string)
+	order := []string{}
+	seen := make(map[string]bool)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -169,9 +175,18 @@ func loadEnvFile() {
 		if len(parts) == 2 {
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
-			if os.Getenv(key) == "" { // Don't override existing env vars
-				os.Setenv(key, value)
+			if !seen[key] {
+				order = append(order, key)
+				seen[key] = true
 			}
+			values[key] = value // last value wins
+		}
+	}
+
+	// Set env vars — skip if already set by system environment
+	for _, key := range order {
+		if os.Getenv(key) == "" {
+			os.Setenv(key, values[key])
 		}
 	}
 }
