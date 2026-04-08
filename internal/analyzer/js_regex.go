@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/A-cyb3r/hawkeye/internal/scanner"
+	"github.com/Btr4k/bugbounty-agent/internal/scanner"
 )
 
 // ═══════════════════════════════════════════════════════════

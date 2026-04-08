@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/A-cyb3r/hawkeye/internal/config"
-	"github.com/A-cyb3r/hawkeye/internal/logger"
-	"github.com/A-cyb3r/hawkeye/internal/scanner"
+	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/logger"
+	"github.com/Btr4k/bugbounty-agent/internal/scanner"
 )
 
 // System prompt for security analysis (shared across all providers)

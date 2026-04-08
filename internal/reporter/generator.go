@@ -10,11 +10,11 @@ import (
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 
-	"github.com/A-cyb3r/hawkeye/internal/analyzer"
-	"github.com/A-cyb3r/hawkeye/internal/config"
-	"github.com/A-cyb3r/hawkeye/internal/logger"
-	"github.com/A-cyb3r/hawkeye/internal/recon"
-	"github.com/A-cyb3r/hawkeye/internal/scanner"
+	"github.com/Btr4k/bugbounty-agent/internal/analyzer"
+	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/logger"
+	"github.com/Btr4k/bugbounty-agent/internal/recon"
+	"github.com/Btr4k/bugbounty-agent/internal/scanner"
 )
 
 type Generator struct {

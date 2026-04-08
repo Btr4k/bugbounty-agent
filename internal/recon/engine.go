@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/A-cyb3r/hawkeye/internal/config"
-	"github.com/A-cyb3r/hawkeye/internal/logger"
+	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/logger"
 )
 
 type Engine struct {

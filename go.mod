@@ -1,4 +1,4 @@
-module github.com/A-cyb3r/hawkeye
+module github.com/Btr4k/bugbounty-agent
 
 go 1.24.0
 
@@ -7,6 +7,7 @@ require (
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/viper v1.18.2
 	go.uber.org/zap v1.26.0
+	golang.org/x/text v0.34.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -29,6 +30,5 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
 	golang.org/x/sys v0.15.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
