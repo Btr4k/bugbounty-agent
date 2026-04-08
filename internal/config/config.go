@@ -287,6 +287,11 @@ func (c *Config) ResolveAIConfig() {
 		}
 	}
 
+	// Final fallback provider (must be before key fallback so switch works)
+	if c.AI.Provider == "" || c.AI.Provider == "auto" {
+		c.AI.Provider = "deepseek"
+	}
+
 	// Backward compatibility: if api_key still empty, try provider-specific fallbacks
 	if c.AI.APIKey == "" {
 		switch c.AI.Provider {
@@ -299,11 +304,6 @@ func (c *Config) ResolveAIConfig() {
 		case "openrouter":
 			c.AI.APIKey = os.Getenv("OPENROUTER_API_KEY")
 		}
-	}
-
-	// Final fallback provider
-	if c.AI.Provider == "" || c.AI.Provider == "auto" {
-		c.AI.Provider = "deepseek"
 	}
 
 	// Backward compat: if model is empty, use provider default
