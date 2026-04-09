@@ -400,6 +400,12 @@ func shouldSkipMatch(patternType, match string) bool {
 			strings.Contains(lower, "placeholder") {
 			return true
 		}
+		// Skip SVG/HTML content — value contains markup, not a credential
+		if strings.Contains(match, "<") || strings.Contains(match, "/>") ||
+			strings.Contains(lower, "svg") || strings.Contains(lower, "circle") ||
+			strings.Contains(lower, "path") || strings.Contains(lower, "rect") {
+			return true
+		}
 	case "debug_mode":
 		// Skip if inside a comment (very rough heuristic)
 		if strings.HasPrefix(strings.TrimSpace(match), "//") ||
@@ -409,6 +415,25 @@ func shouldSkipMatch(patternType, match string) bool {
 	case "eval_usage":
 		// Skip common safe eval patterns
 		if strings.Contains(lower, "json.parse") {
+			return true
+		}
+		// Skip RequireJS and other module loaders that use eval by design
+		if strings.Contains(lower, "require") || strings.Contains(lower, "define") ||
+			strings.Contains(lower, "module") || strings.Contains(lower, "commonjs") {
+			return true
+		}
+	case "hardcoded_url":
+		// Skip well-known public/standard URLs that are not security findings
+		if strings.Contains(lower, "w3.org") ||
+			strings.Contains(lower, "schema.org") ||
+			strings.Contains(lower, "xmlsoap.org") ||
+			strings.Contains(lower, "openxmlformats.org") ||
+			strings.Contains(lower, "example.com") ||
+			strings.Contains(lower, "cdn.") ||
+			strings.Contains(lower, "jquery.com") ||
+			strings.Contains(lower, "bootstrapcdn") ||
+			strings.Contains(lower, "googleapis.com/ajax") ||
+			strings.Contains(lower, "cdnjs.cloudflare.com") {
 			return true
 		}
 	case "generic_secret":
