@@ -41,7 +41,7 @@ func (e *Engine) runArjun(ctx context.Context, liveHosts []string) ([]Finding, [
 	}
 
 	// Select best targets for arjun — prioritize API endpoints and dynamic pages
-	targets := selectArjunTargets(liveHosts)
+	targets := selectArjunTargets(liveHosts, e.cfg.Scanning.Tools.Arjun.MaxTargets)
 	if len(targets) == 0 {
 		return findings, newParamURLs, nil
 	}
@@ -122,19 +122,21 @@ func (e *Engine) runArjunOnTarget(ctx context.Context, target string) ([]ArjunRe
 		"--get",              // Test GET parameters
 		"--post",             // Test POST parameters
 		"-oJ", tmpOut.Name(), // JSON output
-		"-t", "5",            // Threads (balanced — arjun is already slow)
-		"--stable",           // More accurate detection (fewer false positives)
-		"-q",                 // Quiet mode
+		"-t", "5", // Threads (balanced — arjun is already slow)
+		"--stable", // More accurate detection (fewer false positives)
+		"-q",       // Quiet mode
+		"--disable-redirects",
 		// Note: no -d delay flag — default is fine; explicit 3s would be far too slow
 	}
 
 	cmd := exec.CommandContext(targetCtx, "arjun", args...)
-	if err := cmd.Run(); err != nil {
-		// arjun exits non-zero when no params found — normal
-	}
+	runErr := cmd.Run()
 
 	data, err := os.ReadFile(tmpOut.Name())
 	if err != nil || len(data) == 0 {
+		if runErr != nil {
+			return nil, fmt.Errorf("arjun failed: %w", runErr)
+		}
 		return nil, nil
 	}
 
@@ -213,8 +215,10 @@ func parseArjunArray(target string, results []map[string]interface{}) []ArjunRes
 
 // selectArjunTargets picks the best endpoints for arjun parameter discovery.
 // Prioritizes API endpoints and paths that are likely to have parameters.
-func selectArjunTargets(hosts []string) []string {
-	const maxTargets = 15
+func selectArjunTargets(hosts []string, maxTargets int) []string {
+	if maxTargets <= 0 {
+		maxTargets = 15
+	}
 
 	interestingPaths := []string{
 		"/api", "/api/v1", "/api/v2", "/api/v3",

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -21,6 +22,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const appVersion = "2.2.0"
+
 var (
 	cfgFile      string
 	targetDomain string
@@ -35,10 +38,11 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "hawkeye",
-		Short: "HawkEye - AI-Powered Bug Bounty Hunting Tool",
-		Long:  banner(),
-		RunE:  runAgent,
+		Use:     "hawkeye",
+		Short:   "HawkEye - AI-Powered Bug Bounty Hunting Tool",
+		Long:    banner(),
+		Version: appVersion,
+		RunE:    runAgent,
 	}
 
 	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "config.yaml", "Config file")
@@ -80,7 +84,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	if aiProvider != "" {
 		cfg.AI.Provider = aiProvider
 		// Re-resolve config for the new provider (API key, base URL, default model)
-		cfg.AI.APIKey = "" // Reset to trigger re-resolution
+		cfg.AI.APIKey = ""  // Reset to trigger re-resolution
 		cfg.AI.BaseURL = "" // Reset to trigger auto-detection
 		if aiModel == "" {
 			cfg.AI.Model = "" // Reset to trigger default model for new provider
@@ -97,7 +101,10 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	// Validate required tools are installed before wasting time
-	checkTools(log)
+	ensureGoBinOnPath()
+	if err := checkTools(cfg, log); err != nil {
+		return err
+	}
 
 	// Add target domain to config
 	cfg.Target.Domains = []string{targetDomain}
@@ -151,7 +158,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	var reconResults *recon.Results
 	phaseStart := time.Now()
 
-	if skipRecon {
+	if skipRecon || !cfg.Recon.Enabled {
 		dim.Println("  ⏭️  Skipping reconnaissance phase (--skip-recon)")
 		reconResults = &recon.Results{
 			Subdomains: cfg.Target.Domains,
@@ -205,7 +212,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	var critical, high, medium, low, info int
 	var displayFindings []scanner.Finding
 
-	if skipScan || jsOnly {
+	if skipScan || jsOnly || !cfg.Scanning.Enabled {
 		if jsOnly {
 			dim.Println("  ⏭️  Skipping vulnerability scanning (--js-only: recon done, JS analysis next)")
 		} else {
@@ -359,7 +366,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		// Note about filtered info findings
 		if info > 0 {
 			dim.Printf("  💡 Note: %d informational findings were hidden from display\n", info)
-			dim.Println("     (They're still analyzed by AI and included in the report)")
+			dim.Println("     (Recon observations are not sent to AI or included in the vulnerability report)")
 			fmt.Println()
 		}
 		white.Printf("  ")
@@ -437,7 +444,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		jsAnalyzer := analyzer.NewEngine(cfg, log)
 		aiFindings, err := jsAnalyzer.AnalyzeJSFiles(ctx, jsInput)
 		if err != nil {
-			log.Warnf("JS AI analysis failed: %v", err)
+			return fmt.Errorf("JS AI analysis failed: %w", err)
 		}
 
 		// Merge regex + AI findings (dedup by core secret value, not raw evidence string)
@@ -529,12 +536,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	analyzerEngine := analyzer.NewEngine(cfg, log)
 	analysisResults, err := analyzerEngine.Analyze(ctx, scanResults)
 	if err != nil {
-		log.Warnf("Analysis failed: %v", err)
+		return fmt.Errorf("validation pipeline failed: %w", err)
 	}
 
 	analysisDuration := time.Since(phaseStart)
 	green.Printf("  ✅ Completed in %s\n", analysisDuration.Round(time.Second))
-	fmt.Printf("  ├── ✓ Validated:       %s\n", white.Sprintf("%d", len(analysisResults.ValidatedFindings)))
+	fmt.Printf("  ├── ✓ Pipeline accepted: %s\n", white.Sprintf("%d", len(analysisResults.ValidatedFindings)))
 	fmt.Printf("  └── ✗ False Positives: %s\n", white.Sprintf("%d", len(analysisResults.FalsePositives)))
 	fmt.Println()
 
@@ -560,52 +567,99 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// Print final summary
 	printSummary(duration, critical, high, medium, low, info, reportPath,
 		len(reconResults.Subdomains), len(scanResults.Findings),
-		len(analysisResults.ValidatedFindings))
+		len(analysisResults.ValidatedFindings), scanResults.Complete)
 
 	return nil
 }
 
+func ensureGoBinOnPath() {
+	paths := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		seen[path] = true
+	}
+	home, _ := os.UserHomeDir()
+	candidates := []string{filepath.Join(home, "go", "bin")}
+	if goPath := os.Getenv("GOPATH"); goPath != "" {
+		candidates = append(candidates, filepath.Join(goPath, "bin"))
+	}
+	for _, candidate := range candidates {
+		if candidate != "" && !seen[candidate] {
+			paths = append(paths, candidate)
+			seen[candidate] = true
+		}
+	}
+	os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator)))
+}
+
 // checkTools validates that critical external tools are installed before scanning starts.
 // Logs warnings for optional tools and fatals for required ones.
-func checkTools(log interface{ Warnf(string, ...interface{}) }) {
+func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{}) }) error {
 	type tool struct {
-		name     string
-		required bool
-		install  string
+		name    string
+		enabled bool
+		install string
 	}
+	runRecon := cfg.Recon.Enabled && !skipRecon
+	runScan := cfg.Scanning.Enabled && !skipScan && !jsOnly
 	tools := []tool{
-		// Required
-		{"subfinder", true, "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"},
-		{"httpx", true, "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"},
-		{"nuclei", true, "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"},
-		// Optional but highly recommended
-		{"katana", false, "go install github.com/projectdiscovery/katana/cmd/katana@latest"},
-		{"assetfinder", false, "go install github.com/tomnomnom/assetfinder@latest"},
-		{"dalfox", false, "go install github.com/hahwul/dalfox/v2@latest"},
-		{"ffuf", false, "go install github.com/ffuf/ffuf/v2@latest"},
-		{"nmap", false, "apt install nmap"},
-		{"arjun", false, "pip3 install arjun"},
+		{"subfinder", runRecon && cfg.Recon.Tools.Subfinder, "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"},
+		{"assetfinder", runRecon && cfg.Recon.Tools.Assetfinder, "go install github.com/tomnomnom/assetfinder@latest"},
+		{"waybackurls", runRecon && cfg.Recon.Tools.Wayback, "go install github.com/tomnomnom/waybackurls@latest"},
+		{"katana", runRecon && cfg.Recon.Tools.Katana, "go install github.com/projectdiscovery/katana/cmd/katana@latest"},
+		{"httpx", runScan && cfg.Scanning.Tools.Httpx.Enabled, "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"},
+		{"nuclei", runScan && (cfg.Scanning.Tools.Nuclei.Enabled || cfg.Scanning.Tools.SQLi.Enabled), "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"},
+		{"dalfox", runScan && cfg.Scanning.Tools.Dalfox.Enabled, "go install github.com/hahwul/dalfox/v2@latest"},
+		{"ffuf", runScan && cfg.Scanning.Tools.Ffuf.Enabled, "go install github.com/ffuf/ffuf/v2@latest"},
+		{"nmap", runScan && cfg.Scanning.Tools.Nmap.Enabled, "apt install nmap"},
+		{"arjun", runScan && cfg.Scanning.Tools.Arjun.Enabled, "pip3 install arjun"},
 	}
 
 	missing := []string{}
 	for _, t := range tools {
-		if _, err := exec.LookPath(t.name); err != nil {
-			if t.required {
-				missing = append(missing, fmt.Sprintf("  ❌ REQUIRED: %-12s → install: %s", t.name, t.install))
-			} else {
-				log.Warnf("Optional tool not found: %-10s (install: %s)", t.name, t.install)
-			}
+		if !t.enabled {
+			continue
+		}
+		if !toolAvailable(t.name) {
+			missing = append(missing, fmt.Sprintf("%s (install: %s)", t.name, t.install))
 		}
 	}
 
 	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "\n⚠️  Missing required tools:\n")
-		for _, m := range missing {
-			fmt.Fprintf(os.Stderr, "%s\n", m)
-		}
-		fmt.Fprintf(os.Stderr, "\nInstall missing tools and re-run.\n\n")
-		os.Exit(1)
+		return fmt.Errorf("enabled tools are missing: %s", strings.Join(missing, "; "))
 	}
+	log.Infof("Preflight passed: all enabled external tools are available")
+	return nil
+}
+
+func toolAvailable(name string) bool {
+	if name != "httpx" {
+		_, err := exec.LookPath(name)
+		return err == nil
+	}
+
+	home, _ := os.UserHomeDir()
+	candidates := []string{filepath.Join(home, "go", "bin", "httpx")}
+	if goPath := os.Getenv("GOPATH"); goPath != "" {
+		candidates = append(candidates, filepath.Join(goPath, "bin", "httpx"))
+	}
+	if path, err := exec.LookPath("httpx"); err == nil {
+		candidates = append(candidates, path)
+	}
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		output, err := exec.CommandContext(ctx, candidate, "-version").CombinedOutput()
+		cancel()
+		if err == nil && strings.Contains(strings.ToLower(string(output)), "projectdiscovery") {
+			return true
+		}
+	}
+	return false
 }
 
 // validateDomain checks that the domain only contains valid characters
@@ -628,6 +682,11 @@ func validateDomain(domain string) error {
 	for _, b := range blocked {
 		if lowered == b {
 			return fmt.Errorf("target '%s' is not a valid external domain", domain)
+		}
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("domain contains an invalid DNS label")
 		}
 	}
 	return nil
@@ -660,7 +719,7 @@ func printPhaseHeader(num, title, icon string) {
 }
 
 func printBanner() {
-	banner := `
+	banner := fmt.Sprintf(`
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃                                                              ┃
 ┃   ██╗  ██╗ █████╗ ██╗    ██╗██╗  ██╗███████╗██╗   ██╗███████╗
@@ -670,14 +729,14 @@ func printBanner() {
 ┃   ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗
 ┃   ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝
 ┃                                                              ┃
-┃            AI-Powered Bug Bounty Hunting Tool v2.1           ┃
+┃           AI-Powered Bug Bounty Hunting Tool v%-13s┃
 ┃            Multi-AI Engine | Nuclei | Deep Scan              ┃
 ┃                                                              ┃
 ┃                    Developed by @A_cyb3r                     ┃
 ┃                https://twitter.com/A_cyb3r                   ┃
 ┃                                                              ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-`
+`, appVersion)
 	fmt.Println(color.CyanString(banner))
 }
 
@@ -691,7 +750,7 @@ func banner() string {
 }
 
 func printSummary(duration time.Duration, critical, high, medium, low, info int,
-	reportPath string, subdomains, totalFindings, validated int) {
+	reportPath string, subdomains, totalFindings, validated int, scanComplete bool) {
 
 	total := critical + high + medium + low + info
 
@@ -715,7 +774,7 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	fmt.Printf("  🔎 Vulnerabilities:   %-26d", totalFindings)
 	cyan.Println("║")
 	cyan.Print("  ║")
-	fmt.Printf("  ✓  AI Validated:      %-26d", validated)
+	fmt.Printf("  ✓  Pipeline Accepted: %-26d", validated)
 	cyan.Println("║")
 	cyan.Println("  ╠════════════════════════════════════════════════════╣")
 	cyan.Print("  ║")
@@ -768,13 +827,15 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	cyan.Println("║")
 	cyan.Println("  ╠════════════════════════════════════════════════════╣")
 	cyan.Print("  ║")
-	dim.Print("  Developed by @A_cyb3r | HawkEye v2.1")
+	dim.Printf("  Developed by @A_cyb3r | HawkEye v%s", appVersion)
 	cyan.Println("║")
 	cyan.Println("  ╚════════════════════════════════════════════════════╝")
 
 	fmt.Println()
-	if total == 0 {
-		green.Println("  ✅ SECURE: No vulnerabilities detected - Target appears secure")
+	if !scanComplete {
+		yellow.Println("  ⚠️  PARTIAL: Vulnerability scanning was skipped or disabled")
+	} else if total == 0 {
+		green.Println("  ✅ No vulnerabilities detected by the completed scan")
 	} else if critical > 0 {
 		red.Printf("  🚨 URGENT: Found %d CRITICAL vulnerabilities - Immediate action required!\n", critical)
 	} else if high > 0 {

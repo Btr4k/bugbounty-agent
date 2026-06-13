@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.1-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" />
-  <img src="https://img.shields.io/badge/Go-1.24+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
+  <img src="https://img.shields.io/badge/version-2.2.0-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" />
+  <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
   <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20GPT--4-a855f7?style=for-the-badge" />
   <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" />
   <img src="https://img.shields.io/badge/platform-Linux-f97316?style=for-the-badge&logo=linux&logoColor=white" />
@@ -12,7 +12,7 @@
 
 <p align="center">
   <b>Recon → Scan → AI Validation → Report</b><br/>
-  One command. Full attack surface. Zero noise.
+  One command. Scoped attack surface. High-signal findings.
 </p>
 
 ---
@@ -21,7 +21,7 @@
 
 HawkEye is a full-pipeline bug bounty automation agent written in Go.  
 It chains recon tools, vulnerability scanners, and an AI validator into a single workflow —  
-producing a clean, analyst-grade report with confirmed findings only.
+producing a scoped report that contains only grounded, AI-reviewed findings.
 
 ```
 ./hawkeye -d hackerone-target.com
@@ -54,11 +54,10 @@ That's it. HawkEye handles the rest.
   │                                                                 │
   │  httpx         → live host detection + status codes            │
   │  nuclei        → CVEs · misconfigs · exposures · takeovers     │
-  │  CORS engine   → origin reflection · null · subdomain spoof    │
-  │  ffuf          → hidden paths · admin panels · vhost fuzzing   │
-  │  dalfox        → reflected & DOM XSS with PoC                  │
-  │  arjun         → undocumented GET/POST parameters              │
-  │  nmap          → open ports                                     │
+  │  ffuf          → verified sensitive-file exposure              │
+  │  dalfox        → reflected XSS with PoC                        │
+  │  arjun         → feeds undocumented params into Dalfox         │
+  │  nmap          → opt-in reconnaissance only                    │
   │  SQLi scanner  → injection via parameter analysis              │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
@@ -66,22 +65,21 @@ That's it. HawkEye handles the rest.
   ┌─────────────────────────────────────────────────────────────────┐
   │  PHASE 2.5 — JS ANALYSIS                                        │
   │                                                                 │
-  │  Regex engine  → API keys · secrets · endpoints · S3 buckets   │
+  │  Regex engine  → high-confidence credentials and tokens        │
   │  AI (LLM)      → deep analysis of app bundles (12KB/file)      │
   │                                                                 │
-  │  Detects: AWS/GitHub/Stripe/Firebase keys · JWT tokens         │
-  │           hardcoded passwords · internal API routes            │
-  │           DOM XSS sinks · postMessage issues                   │
+  │  Detects: AWS/GitHub/Stripe keys · JWT tokens                  │
+  │           hardcoded passwords · database credentials           │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
                                 ▼
   ┌─────────────────────────────────────────────────────────────────┐
-  │  PHASE 3 — AI VALIDATION                                        │
+  │  PHASE 3 — VALIDATION PIPELINE                                  │
   │                                                                 │
-  │  Every finding is reviewed by the AI:                          │
-  │  · Confirms real vs false positive                             │
+  │  Every finding passes deterministic checks and AI review:      │
+  │  · Rejects unsupported and likely false-positive results       │
   │  · Assigns CVSS-informed severity                              │
-  │  · Generates PoC for each confirmed finding                    │
+  │  · Preserves tool-captured reproduction commands               │
   │  · Writes impact assessment + remediation                      │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
@@ -91,7 +89,7 @@ That's it. HawkEye handles the rest.
   │                                                                 │
   │  Markdown report with:                                         │
   │  · Executive summary · Risk score · Severity breakdown         │
-  │  · Confirmed findings only · Evidence + PoC per finding        │
+  │  · Validation-pipeline findings only · Captured evidence       │
   └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -103,17 +101,16 @@ That's it. HawkEye handles the rest.
 |---|---|---|
 | Subdomain Recon | subfinder · assetfinder · crt.sh · C99 | Subdomains |
 | URL Discovery | waybackurls · katana | Endpoints, parameters, JS files |
-| Live Detection | httpx | Live hosts, HTTP status, tech stack |
-| Vulnerability Scan | nuclei (full templates) | CVEs, misconfigs, exposures, takeovers |
-| CORS Testing | Built-in Go engine | Origin reflection, null origin, subdomain spoof, HTTP downgrade |
-| Directory Fuzzing | ffuf | Hidden paths, admin panels, sensitive files |
-| Vhost Discovery | ffuf (Host header) | Hidden virtual hosts |
-| XSS | dalfox | Reflected & DOM XSS with PoC |
+| Live Detection | httpx | Live hosts used by downstream scanners |
+| Vulnerability Scan | nuclei (high-value templates) | CVEs, misconfigs, exposures, takeovers |
+| Sensitive File Validation | ffuf + built-in verifier | Accessible files with matching sensitive content |
+| Vhost Discovery (opt-in) | ffuf (Host header) | Recon observations only |
+| XSS | dalfox | Reflected XSS with PoC |
 | SQLi | nuclei + param filter | SQL injection vectors |
-| Hidden Params | arjun | Undocumented GET/POST parameters |
-| Port Scan | nmap | Open ports |
-| JS Analysis | Regex + LLM | API keys, secrets, endpoints, S3 buckets, tokens |
-| AI Validation | DeepSeek / Claude / GPT-4 | False positive filtering + PoC generation |
+| Hidden Params | arjun | Feeds discovered parameters into Dalfox; not reported as vulnerabilities |
+| Port Scan (opt-in) | nmap | Recon observations only |
+| JS Analysis | Regex + grounded LLM output | Credentials, keys, and tokens |
+| Validation Pipeline | Deterministic rules + DeepSeek / Claude / GPT-4 | False-positive filtering + evidence review |
 
 ---
 
@@ -158,6 +155,7 @@ Options:
       --js-only              Run JS analysis only (skips vulnerability scanning)
       --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter
       --ai-model    string   Override AI model name
+      --version              Show HawkEye version
   -h, --help                 Show help
 ```
 
@@ -170,7 +168,7 @@ Options:
 # Full scan with live progress output
 ./hawkeye -d target.com --verbose
 
-# JS secrets and endpoints only (fast, no scanning)
+# JS credential and token analysis only (fast, no vulnerability scanning)
 ./hawkeye -d target.com --js-only
 
 # Skip subdomain enumeration
@@ -193,7 +191,7 @@ Options:
 ### System Requirements
 
 - **OS**: Linux (Ubuntu 20.04+, Debian 11+, Kali, Parrot)
-- **Go**: 1.24 or later
+- **Go**: 1.25 or later
 - **RAM**: 512MB minimum, 2GB recommended for large targets
 
 ### Automatic (recommended)
@@ -335,7 +333,7 @@ Executive Summary
   └── Risk score · Finding counts · Subdomains discovered
 
 Critical Findings
-  └── Title · URL · Evidence · AI Analysis · PoC
+  └── Title · URL · Captured Evidence · Analysis · Tool Command
 
 High / Medium / Low Findings
   └── Same structure
@@ -343,23 +341,6 @@ High / Medium / Low Findings
 Subdomain List
   └── All discovered subdomains
 ```
-
----
-
-## CORS Severity Reference
-
-HawkEye's built-in CORS engine tests multiple attack vectors and assigns severity  
-based on actual exploitability — not just header presence:
-
-| Pattern | Severity | Exploitable? |
-|---|---|---|
-| Origin reflected + `credentials: true` | **Critical** | Yes — any attacker site can steal authenticated data |
-| Null origin + `credentials: true` | **High** | Yes — exploitable via sandboxed iframe |
-| Subdomain spoof + `credentials: true` | **High** | Yes — attacker registers a matching domain |
-| HTTP origin on HTTPS + `credentials: true` | **High** | Yes — requires network MITM position |
-| Origin reflected, no credentials | **High** | Yes — public/unauthenticated data readable cross-origin |
-| Subdomain spoof, no credentials | **Medium** | Partial — weak origin validation, no credentials |
-| `*` + `credentials: true` | **Medium** | No — browsers reject this combination per CORS spec |
 
 ---
 
@@ -373,5 +354,5 @@ based on actual exploitability — not just header presence:
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.1
+  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.0
 </p>

@@ -11,25 +11,23 @@ import (
 )
 
 type Config struct {
-	AI            AIConfig            `yaml:"ai" mapstructure:"ai"`
-	Claude        ClaudeConfig        `yaml:"claude" mapstructure:"claude"`
-	C99           C99Config           `yaml:"c99" mapstructure:"c99"`
-	Target        TargetConfig        `yaml:"target" mapstructure:"target"`
-	Recon         ReconConfig         `yaml:"recon" mapstructure:"recon"`
-	Scanning      ScanningConfig      `yaml:"scanning" mapstructure:"scanning"`
-	Analysis      AnalysisConfig      `yaml:"analysis" mapstructure:"analysis"`
-	Reporting     ReportingConfig     `yaml:"reporting" mapstructure:"reporting"`
-	Notifications NotificationsConfig `yaml:"notifications" mapstructure:"notifications"`
-	Logging       LoggingConfig       `yaml:"logging" mapstructure:"logging"`
+	AI        AIConfig        `yaml:"ai" mapstructure:"ai"`
+	Claude    ClaudeConfig    `yaml:"claude" mapstructure:"claude"`
+	C99       C99Config       `yaml:"c99" mapstructure:"c99"`
+	Target    TargetConfig    `yaml:"target" mapstructure:"target"`
+	Recon     ReconConfig     `yaml:"recon" mapstructure:"recon"`
+	Scanning  ScanningConfig  `yaml:"scanning" mapstructure:"scanning"`
+	Analysis  AnalysisConfig  `yaml:"analysis" mapstructure:"analysis"`
+	Reporting ReportingConfig `yaml:"reporting" mapstructure:"reporting"`
 }
 
 // AIConfig unified AI provider configuration
 type AIConfig struct {
-	Provider  string `yaml:"provider" mapstructure:"provider"`   // claude, deepseek, openai, openrouter, custom
+	Provider  string `yaml:"provider" mapstructure:"provider"` // claude, deepseek, openai, openrouter, custom
 	APIKey    string `yaml:"api_key" mapstructure:"api_key"`
 	Model     string `yaml:"model" mapstructure:"model"`
 	MaxTokens int    `yaml:"max_tokens" mapstructure:"max_tokens"`
-	BaseURL   string `yaml:"base_url" mapstructure:"base_url"`   // for openrouter/custom
+	BaseURL   string `yaml:"base_url" mapstructure:"base_url"` // for openrouter/custom
 }
 
 type C99Config struct {
@@ -46,7 +44,6 @@ type ClaudeConfig struct {
 type TargetConfig struct {
 	Domains            []string `yaml:"domains" mapstructure:"domains"`
 	ExcludedSubdomains []string `yaml:"excluded_subdomains" mapstructure:"excluded_subdomains"`
-	Scope              string   `yaml:"scope" mapstructure:"scope"`
 }
 
 type ReconConfig struct {
@@ -58,12 +55,11 @@ type ReconConfig struct {
 }
 
 type ReconToolsConfig struct {
-	Subfinder     bool `yaml:"subfinder" mapstructure:"subfinder"`
-	Amass         bool `yaml:"amass" mapstructure:"amass"`
-	Assetfinder   bool `yaml:"assetfinder" mapstructure:"assetfinder"`
-	GitHubDorking bool `yaml:"github_dorking" mapstructure:"github_dorking"`
-	Wayback       bool `yaml:"wayback" mapstructure:"wayback"`
-	Katana        bool `yaml:"katana" mapstructure:"katana"`
+	Subfinder        bool `yaml:"subfinder" mapstructure:"subfinder"`
+	Assetfinder      bool `yaml:"assetfinder" mapstructure:"assetfinder"`
+	Wayback          bool `yaml:"wayback" mapstructure:"wayback"`
+	Katana           bool `yaml:"katana" mapstructure:"katana"`
+	CertTransparency bool `yaml:"cert_transparency" mapstructure:"cert_transparency"`
 }
 
 type ScanningConfig struct {
@@ -79,24 +75,26 @@ type ScanningToolsConfig struct {
 	Httpx  HttpxConfig  `yaml:"httpx" mapstructure:"httpx"`
 	Nmap   NmapConfig   `yaml:"nmap" mapstructure:"nmap"`
 	Dalfox DalfoxConfig `yaml:"dalfox" mapstructure:"dalfox"`
-	SQLMap SQLMapConfig `yaml:"sqlmap" mapstructure:"sqlmap"`
+	SQLi   SQLiConfig   `yaml:"sqli" mapstructure:"sqli"`
 	Ffuf   FfufConfig   `yaml:"ffuf" mapstructure:"ffuf"`
-	CORS   CORSConfig   `yaml:"cors" mapstructure:"cors"`
+	Arjun  ArjunConfig  `yaml:"arjun" mapstructure:"arjun"`
 }
 
 type FfufConfig struct {
-	Enabled       bool   `yaml:"enabled" mapstructure:"enabled"`
-	WordlistPath  string `yaml:"wordlist_path" mapstructure:"wordlist_path"`
-	MaxTargets    int    `yaml:"max_targets" mapstructure:"max_targets"`
+	Enabled      bool   `yaml:"enabled" mapstructure:"enabled"`
+	WordlistPath string `yaml:"wordlist_path" mapstructure:"wordlist_path"`
+	MaxTargets   int    `yaml:"max_targets" mapstructure:"max_targets"`
+	VhostFuzzing bool   `yaml:"vhost_fuzzing" mapstructure:"vhost_fuzzing"`
 }
 
-type SQLMapConfig struct {
+type ArjunConfig struct {
+	Enabled    bool `yaml:"enabled" mapstructure:"enabled"`
+	MaxTargets int  `yaml:"max_targets" mapstructure:"max_targets"`
+}
+
+type SQLiConfig struct {
 	Enabled bool `yaml:"enabled" mapstructure:"enabled"`
 	MaxURLs int  `yaml:"max_urls" mapstructure:"max_urls"`
-}
-
-type CORSConfig struct {
-	Enabled bool `yaml:"enabled" mapstructure:"enabled"`
 }
 
 type NucleiConfig struct {
@@ -118,37 +116,20 @@ type NmapConfig struct {
 }
 
 type DalfoxConfig struct {
-	Enabled       bool   `yaml:"enabled" mapstructure:"enabled"`
-	BlindURL      string `yaml:"blind_url" mapstructure:"blind_url"`
-	MaxURLs       int    `yaml:"max_urls" mapstructure:"max_urls"`
+	Enabled  bool   `yaml:"enabled" mapstructure:"enabled"`
+	BlindURL string `yaml:"blind_url" mapstructure:"blind_url"`
+	MaxURLs  int    `yaml:"max_urls" mapstructure:"max_urls"`
 }
 
 type AnalysisConfig struct {
-	Enabled             bool    `yaml:"enabled" mapstructure:"enabled"`
-	MinConfidence       float64 `yaml:"min_confidence" mapstructure:"min_confidence"`
-	AutoValidate        bool    `yaml:"auto_validate" mapstructure:"auto_validate"`
-	FalsePositiveFilter bool    `yaml:"false_positive_filter" mapstructure:"false_positive_filter"`
-	JSAnalysis          bool    `yaml:"js_analysis" mapstructure:"js_analysis"`
+	MinConfidence float64 `yaml:"min_confidence" mapstructure:"min_confidence"`
+	JSAnalysis    bool    `yaml:"js_analysis" mapstructure:"js_analysis"`
 }
 
 type ReportingConfig struct {
-	Format         string   `yaml:"format" mapstructure:"format"`
-	Language       string   `yaml:"language" mapstructure:"language"`
 	IncludePOC     bool     `yaml:"include_poc" mapstructure:"include_poc"`
 	SeverityFilter []string `yaml:"severity_filter" mapstructure:"severity_filter"`
 	OutputDir      string   `yaml:"output_dir" mapstructure:"output_dir"`
-}
-
-type NotificationsConfig struct {
-	Enabled        bool   `yaml:"enabled" mapstructure:"enabled"`
-	SlackWebhook   string `yaml:"slack_webhook" mapstructure:"slack_webhook"`
-	DiscordWebhook string `yaml:"discord_webhook" mapstructure:"discord_webhook"`
-}
-
-type LoggingConfig struct {
-	Level     string `yaml:"level" mapstructure:"level"`
-	File      string `yaml:"file" mapstructure:"file"`
-	MaxSizeMB int    `yaml:"max_size_mb" mapstructure:"max_size_mb"`
 }
 
 // loadEnvFile loads environment variables from .env file if it exists.
@@ -195,6 +176,9 @@ func loadEnvFile() {
 func Load(filename string) (*Config, error) {
 	// Load .env file first
 	loadEnvFile()
+	if err := validateConfigKeys(filename); err != nil {
+		return nil, err
+	}
 
 	// Set defaults
 	viper.SetDefault("ai.provider", "deepseek")
@@ -206,9 +190,7 @@ func Load(filename string) (*Config, error) {
 	viper.SetDefault("recon.max_wayback_urls", 10000)
 	viper.SetDefault("scanning.threads", 50)
 	viper.SetDefault("scanning.rate_limit", 100)
-	viper.SetDefault("analysis.min_confidence", 0.7)
-	viper.SetDefault("reporting.format", "markdown")
-	viper.SetDefault("reporting.language", "ar")
+	viper.SetDefault("analysis.min_confidence", 0.85)
 	viper.SetDefault("c99.enabled", false)
 
 	// Read config file
@@ -231,6 +213,9 @@ func Load(filename string) (*Config, error) {
 	cfg.AI.APIKey = os.ExpandEnv(cfg.AI.APIKey)
 	cfg.Claude.APIKey = os.ExpandEnv(cfg.Claude.APIKey)
 	cfg.C99.APIKey = os.ExpandEnv(cfg.C99.APIKey)
+	if strings.HasPrefix(strings.ToLower(cfg.C99.APIKey), "your-") {
+		cfg.C99.APIKey = ""
+	}
 
 	// Also check direct env vars as fallback
 	if cfg.Claude.APIKey == "" || cfg.Claude.APIKey == "${ANTHROPIC_API_KEY}" {
@@ -253,6 +238,22 @@ func Load(filename string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func validateConfigKeys(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+	defer file.Close()
+
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+	var cfg Config
+	if err := decoder.Decode(&cfg); err != nil {
+		return fmt.Errorf("config contains an unknown or invalid field: %w", err)
+	}
+	return nil
 }
 
 // autoDetectProvider scans environment variables and returns the first provider
@@ -369,6 +370,11 @@ func (c *Config) Validate() error {
 	if c.AI.Provider == "custom" && c.AI.BaseURL == "" {
 		return fmt.Errorf("base_url is required when using custom AI provider")
 	}
+	switch c.AI.Provider {
+	case "claude", "deepseek", "openai", "openrouter", "custom":
+	default:
+		return fmt.Errorf("unsupported AI provider %q", c.AI.Provider)
+	}
 
 	// Note: Target.Domains is NOT validated here because it is set from the CLI
 	// flag (--target) in main.go AFTER config.Load() returns.
@@ -379,6 +385,19 @@ func (c *Config) Validate() error {
 
 	if c.Scanning.Threads <= 0 {
 		return fmt.Errorf("scanning threads must be positive")
+	}
+	if c.Scanning.RateLimit <= 0 {
+		return fmt.Errorf("scanning rate limit must be positive")
+	}
+	if c.Analysis.MinConfidence < 0.85 || c.Analysis.MinConfidence > 1 {
+		return fmt.Errorf("analysis min_confidence must be between 0.85 and 1 for reportable findings")
+	}
+	for _, severity := range c.Reporting.SeverityFilter {
+		switch strings.ToLower(severity) {
+		case "critical", "high", "medium", "low":
+		default:
+			return fmt.Errorf("invalid reporting severity %q", severity)
+		}
 	}
 
 	return nil
@@ -391,7 +410,7 @@ func (c *Config) Save(filename string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(filename, data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 

@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            package="hawkeye-${GITHUB_REF_NAME}-linux-${arch}"
+            mkdir -p "dist/${package}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+              go build -trimpath -ldflags="-s -w" -o "dist/${package}/hawkeye" ./cmd/main.go
+            cp config.yaml .env.example README.md LICENSE SECURITY.md "dist/${package}/"
+            tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+            rm -rf "dist/${package}"
+          done
+          cd dist
+          sha256sum ./*.tar.gz > checksums.txt
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

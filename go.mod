@@ -1,6 +1,6 @@
 module github.com/Btr4k/bugbounty-agent
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/fatih/color v1.16.0
@@ -29,6 +29,6 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
-	golang.org/x/sys v0.15.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )

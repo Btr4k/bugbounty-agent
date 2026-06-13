@@ -31,7 +31,7 @@ func NewGenerator(cfg *config.Config, log *logger.Logger) *Generator {
 
 // Generate creates a professional bug bounty report
 func (g *Generator) Generate(reconResults *recon.Results, scanResults *scanner.Results, analysis *analyzer.Analysis) (string, error) {
-	if err := os.MkdirAll(g.cfg.Reporting.OutputDir, 0755); err != nil {
+	if err := os.MkdirAll(g.cfg.Reporting.OutputDir, 0700); err != nil {
 		return "", fmt.Errorf("failed to create output directory: %w", err)
 	}
 
@@ -41,7 +41,7 @@ func (g *Generator) Generate(reconResults *recon.Results, scanResults *scanner.R
 
 	content := g.generateMarkdownReport(reconResults, scanResults, analysis)
 
-	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(outputPath, []byte(content), 0600); err != nil {
 		return "", fmt.Errorf("failed to write report: %w", err)
 	}
 
@@ -59,11 +59,11 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Date**: %s  \n", time.Now().Format("2006-01-02 15:04")))
 	report.WriteString(fmt.Sprintf("**Target**: %s  \n", target))
 	report.WriteString(fmt.Sprintf("**Subdomains Found**: %d  \n", len(reconResults.Subdomains)))
-	report.WriteString(fmt.Sprintf("**Total Findings**: %d (validated by AI)  \n\n", len(analysis.ValidatedFindings)))
+	report.WriteString(fmt.Sprintf("**Vulnerability Scan Complete**: %t  \n", scanResults.Complete))
+	report.WriteString(fmt.Sprintf("**Total Findings**: %d (accepted by the validation pipeline)  \n\n", len(analysis.ValidatedFindings)))
 
 	// Executive Summary with Risk Score
-	// Weight JS-analysis-only findings at 50% to prevent inflated scores
-	// from informational observations (endpoint patterns, public keys, etc.)
+	// Weight JS-analysis-only findings at 50% to prevent inflated scores.
 	riskScore := 0
 	for _, vf := range analysis.ValidatedFindings {
 		weight := 1.0
@@ -82,7 +82,9 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		}
 	}
 	riskLevel := "🟢 Low Risk"
-	if riskScore >= 30 {
+	if !scanResults.Complete {
+		riskLevel = "⚪ Partial Assessment"
+	} else if riskScore >= 30 {
 		riskLevel = "🔴 Critical Risk"
 	} else if riskScore >= 15 {
 		riskLevel = "🟠 High Risk"
@@ -92,7 +94,7 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 
 	report.WriteString("## Executive Summary\n\n")
 	report.WriteString(fmt.Sprintf("**Overall Risk Level**: %s (score: %d)  \n", riskLevel, riskScore))
-	report.WriteString(fmt.Sprintf("**AI-Validated Findings**: %d confirmed vulnerabilities  \n", analysis.Stats.Validated))
+	report.WriteString(fmt.Sprintf("**Validation-Pipeline Findings**: %d high-signal findings  \n", analysis.Stats.Validated))
 	report.WriteString(fmt.Sprintf("**False Positives Filtered**: %d  \n", analysis.Stats.FalsePositives))
 	report.WriteString(fmt.Sprintf("**Attack Surface**: %d subdomains discovered  \n\n", len(reconResults.Subdomains)))
 
@@ -145,54 +147,6 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		}
 	}
 
-	// Also include raw scan findings that weren't processed at all (non-info).
-	// "Processed" = validated as true positive OR rejected as false positive.
-	// Pre-validated rejections and AI rejections are both excluded here —
-	// they were already evaluated and determined to be false positives.
-	if len(scanResults.Findings) > 0 {
-		var unvalidated []scanner.Finding
-		// Track every finding that went through the analysis pipeline (validated or rejected).
-		// Key: "url|title" to avoid collisions when one URL has multiple finding types.
-		processedKeys := make(map[string]bool)
-		for _, vf := range analysis.ValidatedFindings {
-			processedKeys[vf.URL+"|"+vf.Title] = true
-		}
-		for _, fp := range analysis.FalsePositives {
-			processedKeys[fp.URL+"|"+fp.Title] = true
-		}
-		for _, sf := range scanResults.Findings {
-			if sf.Severity != "info" && !processedKeys[sf.URL+"|"+sf.Title] {
-				unvalidated = append(unvalidated, sf)
-			}
-		}
-
-		if len(unvalidated) > 0 {
-			report.WriteString("## Additional Scanner Findings\n\n")
-			report.WriteString("_These findings were detected by automated scanners but not yet validated by AI._\n\n")
-			for i, f := range unvalidated {
-				emoji := g.getSeverityEmoji(f.Severity)
-				report.WriteString(fmt.Sprintf("### %d. %s [%s] %s\n\n", i+1, emoji, strings.ToUpper(f.Severity), f.Title))
-				if f.URL != "" {
-					report.WriteString(fmt.Sprintf("- **URL**: `%s`\n", f.URL))
-				}
-				if f.Target != "" && f.Target != f.URL {
-					report.WriteString(fmt.Sprintf("- **Target**: `%s`\n", f.Target))
-				}
-				if f.Evidence != "" {
-					evidence := f.Evidence
-					if len(evidence) > 200 {
-						evidence = evidence[:200] + "..."
-					}
-					report.WriteString(fmt.Sprintf("- **Evidence**: `%s`\n", evidence))
-				}
-				if f.CVE != "" {
-					report.WriteString(fmt.Sprintf("- **CVE**: %s\n", f.CVE))
-				}
-				report.WriteString("\n")
-			}
-		}
-	}
-
 	// Subdomains discovered
 	if len(reconResults.Subdomains) > 0 {
 		report.WriteString("## Subdomains Discovered\n\n")
@@ -223,6 +177,7 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 	if finding.Type != "" {
 		details.WriteString(fmt.Sprintf("- **Type**: %s\n", finding.Type))
 	}
+	details.WriteString(fmt.Sprintf("- **Validation Confidence**: %.2f\n", finding.Confidence))
 	if finding.CVE != "" {
 		details.WriteString(fmt.Sprintf("- **CVE**: %s\n", finding.CVE))
 	}
@@ -238,6 +193,13 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 		}
 		details.WriteString(fmt.Sprintf("\n**Evidence**:\n```\n%s\n```\n", evidence))
 	}
+	if finding.Response != "" {
+		response := finding.Response
+		if len(response) > 800 {
+			response = response[:800] + "..."
+		}
+		details.WriteString(fmt.Sprintf("\n**Captured Response**:\n```http\n%s\n```\n", response))
+	}
 
 	// AI Analysis (brief)
 	if finding.AIAnalysis != "" {
@@ -248,9 +210,10 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 		details.WriteString(fmt.Sprintf("\n**Analysis**: %s\n", analysis))
 	}
 
-	// PoC
-	if finding.ProofOfConcept != "" {
-		poc := finding.ProofOfConcept
+	// Only include a tool-captured reproduction command. An AI-generated command
+	// is guidance, not proof that the vulnerability was reproduced.
+	if g.cfg.Reporting.IncludePOC && finding.Metadata["curl"] != "" {
+		poc := finding.Metadata["curl"]
 		if len(poc) > 300 {
 			poc = poc[:300] + "..."
 		}
@@ -264,11 +227,23 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 func (g *Generator) filterBySeverity(findings []analyzer.ValidatedFinding, severity string) []analyzer.ValidatedFinding {
 	var filtered []analyzer.ValidatedFinding
 	for _, f := range findings {
-		if strings.ToLower(f.Severity) == severity && f.IsValid {
+		if strings.ToLower(f.Severity) == severity && f.IsValid && g.severityAllowed(severity) {
 			filtered = append(filtered, f)
 		}
 	}
 	return filtered
+}
+
+func (g *Generator) severityAllowed(severity string) bool {
+	if len(g.cfg.Reporting.SeverityFilter) == 0 {
+		return true
+	}
+	for _, allowed := range g.cfg.Reporting.SeverityFilter {
+		if strings.EqualFold(allowed, severity) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Generator) getSeverityEmoji(severity string) string {

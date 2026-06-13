@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -93,16 +94,15 @@ func normalizeURLForDedup(parsed *url.URL) string {
 // runSQLiScan performs SQL injection detection using two strategies:
 //  1. Nuclei with sqli/injection tags on live hosts (fast, template-based)
 //  2. Targeted nuclei fuzzing on gf-filtered parameterized URLs (precise)
-//
-// SQLMap is NOT run automatically — it's too slow and gets blocked by WAFs.
-// Users who want SQLMap can run it manually on the nuclei-confirmed targets.
 func (e *Engine) runSQLiScan(ctx context.Context, liveHosts []string, allURLs []string) ([]Finding, error) {
 	var findings []Finding
+	var scanErrors []error
 
 	// ── Strategy 1: Nuclei SQLi templates on live hosts ──
 	nucleiFindings, err := e.runNucleiSQLi(ctx, liveHosts)
 	if err != nil {
 		e.log.Warnf("Nuclei SQLi scan error: %v", err)
+		scanErrors = append(scanErrors, err)
 	} else {
 		findings = append(findings, nucleiFindings...)
 	}
@@ -110,14 +110,18 @@ func (e *Engine) runSQLiScan(ctx context.Context, liveHosts []string, allURLs []
 	// ── Strategy 2: Parameter-targeted nuclei fuzzing ──
 	sqliURLs := filterSQLiProneURLs(allURLs)
 	if len(sqliURLs) > 0 {
-		// Cap at 50 — nuclei fuzzing is fast enough
-		if len(sqliURLs) > 50 {
-			sqliURLs = sqliURLs[:50]
+		maxURLs := e.cfg.Scanning.Tools.SQLi.MaxURLs
+		if maxURLs <= 0 {
+			maxURLs = 50
+		}
+		if len(sqliURLs) > maxURLs {
+			sqliURLs = sqliURLs[:maxURLs]
 		}
 		e.log.Debugf("SQLi: found %d gf-filtered param URLs to fuzz", len(sqliURLs))
 		paramFindings, err := e.runNucleiSQLiFuzz(ctx, sqliURLs)
 		if err != nil {
 			e.log.Warnf("Nuclei SQLi fuzz error: %v", err)
+			scanErrors = append(scanErrors, err)
 		} else {
 			findings = append(findings, paramFindings...)
 		}
@@ -125,6 +129,9 @@ func (e *Engine) runSQLiScan(ctx context.Context, liveHosts []string, allURLs []
 		e.log.Debugf("SQLi: no SQL-prone parameter URLs found — skipping param fuzzing")
 	}
 
+	if len(scanErrors) > 0 {
+		return findings, errors.Join(scanErrors...)
+	}
 	return findings, nil
 }
 
@@ -157,12 +164,14 @@ func (e *Engine) runNucleiSQLi(ctx context.Context, hosts []string) ([]Finding, 
 		"-l", tmpFile.Name(),
 		"-jsonl",
 		"-silent",
+		"-irr",
 		"-tags", "sqli,injection,sql",
 		"-severity", "critical,high,medium",
 		"-c", "25",
 		"-rl", "50",
 		"-timeout", "15",
 		"-retries", "2",
+		"-fhr",
 	}
 
 	// Add template path if configured
@@ -183,14 +192,14 @@ func (e *Engine) runNucleiSQLi(ctx context.Context, hosts []string) ([]Finding, 
 
 	output, err := cmd.Output()
 	if err != nil && len(output) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("nuclei SQLi scan failed: %w", err)
 	}
 
 	return parseNucleiOutput(output), nil
 }
 
 // runNucleiSQLiFuzz runs nuclei fuzzing templates on gf-filtered parameterized URLs.
-// This is more targeted and effective than blind sqlmap on Wayback URLs.
+// This targets parameterized URLs instead of blindly testing every historical URL.
 func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]Finding, error) {
 	if len(paramURLs) == 0 {
 		return nil, nil
@@ -215,12 +224,14 @@ func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]F
 		"-l", tmpFile.Name(),
 		"-jsonl",
 		"-silent",
+		"-irr",
 		"-tags", "sqli,injection,fuzz",
 		"-severity", "critical,high,medium",
 		"-c", "10",
 		"-rl", "30",
 		"-timeout", "20",
 		"-retries", "1",
+		"-fhr",
 	}
 
 	if e.cfg.Scanning.Tools.Nuclei.TemplatesPath != "" {
@@ -237,7 +248,7 @@ func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]F
 
 	output, err := cmd.Output()
 	if err != nil && len(output) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("nuclei SQLi fuzz failed: %w", err)
 	}
 
 	return parseNucleiOutput(output), nil

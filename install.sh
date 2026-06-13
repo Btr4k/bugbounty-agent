@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# HawkEye v2.1 — Dependency Installer
+# HawkEye v2.2.0 — Dependency Installer
 # Tested on: Ubuntu 20.04+, Debian 11+, Kali Linux
 # Usage: chmod +x install.sh && ./install.sh
 # ============================================================
@@ -22,7 +22,7 @@ echo "  ███████║███████║██║ █╗ ██�
 echo "  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝  "
 echo "  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝"
-echo -e "                  Dependency Installer v2.1${RESET}"
+echo -e "                 Dependency Installer v2.2.0${RESET}"
 echo ""
 
 # ─── Check OS ────────────────────────────────────────────────
@@ -42,6 +42,9 @@ check_go() {
     fi
     GO_VER=$(go version | awk '{print $3}' | sed 's/go//')
     info "Go version: $GO_VER"
+    if [[ "$(printf '%s\n' "1.25.0" "$GO_VER" | sort -V | head -n1)" != "1.25.0" ]]; then
+        error "Go 1.25 or later is required. Install it from: https://go.dev/dl/"
+    fi
     success "Go found"
 }
 
@@ -61,7 +64,9 @@ install_go_tools() {
     )
 
     for tool in "${!GO_TOOLS[@]}"; do
-        if command -v "$tool" &>/dev/null; then
+        if [[ "$tool" == "httpx" ]] && "$HOME/go/bin/httpx" -version 2>&1 | grep -qi projectdiscovery; then
+            success "$tool already installed (ProjectDiscovery)"
+        elif [[ "$tool" != "httpx" ]] && command -v "$tool" &>/dev/null; then
             success "$tool already installed"
         else
             info "Installing $tool..."
@@ -112,6 +117,7 @@ build_hawkeye() {
 setup_env() {
     if [[ ! -f ".env" ]]; then
         cp .env.example .env
+        chmod 600 .env
         warn "Created .env from template — edit it and add your API keys:"
         warn "  nano .env"
     else
@@ -121,6 +127,7 @@ setup_env() {
 
 # ─── Run ─────────────────────────────────────────────────────
 check_go
+export PATH="$PATH:$(go env GOPATH)/bin"
 install_system_tools
 install_go_tools
 install_python_tools

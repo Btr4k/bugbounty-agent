@@ -32,38 +32,11 @@ type PreValidResult struct {
 // Call this for every non-JS finding before sending to the AI batch.
 func PreValidateFinding(f scanner.Finding) PreValidResult {
 	switch f.Type {
-	case "cors-misconfiguration":
-		return preValidCORS(f)
 	case "directory-bruteforce":
 		return preValidDirectory(f)
 	case "ssl":
 		return preValidSSL(f)
 	}
-	return PreValidResult{Outcome: PreValidKeep}
-}
-
-// ─── CORS ────────────────────────────────────────────────────────────────────
-
-func preValidCORS(f scanner.Finding) PreValidResult {
-	acao := f.Metadata["acao"]
-	acac := strings.ToLower(strings.TrimSpace(f.Metadata["acac"]))
-
-	// Rule C-1: Wildcard without credentials.
-	// Per the CORS specification (RFC 6454 + Fetch Standard), browsers REFUSE to
-	// send cookies or authorization headers when ACAO is *.  Without credentials,
-	// an attacker can only read public, unauthenticated responses — identical to
-	// what they could fetch directly.  This is not exploitable.
-	if acao == "*" && acac != "true" {
-		return PreValidResult{
-			Outcome: PreValidReject,
-			Reason: "CORS wildcard (Access-Control-Allow-Origin: *) without " +
-				"Access-Control-Allow-Credentials: true is NOT exploitable. " +
-				"Browsers enforce this restriction per the CORS specification — " +
-				"credentials are never sent with wildcard origins. " +
-				"An attacker can only read data that is already public.",
-		}
-	}
-
 	return PreValidResult{Outcome: PreValidKeep}
 }
 

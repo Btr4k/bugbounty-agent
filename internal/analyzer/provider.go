@@ -124,7 +124,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}

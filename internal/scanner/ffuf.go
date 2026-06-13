@@ -4,8 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -19,6 +23,7 @@ import (
 //  2. Virtual-host (vhost) fuzzing to discover hidden internal apps
 func (e *Engine) runFfuf(ctx context.Context, liveHosts []string) ([]Finding, error) {
 	var findings []Finding
+	var scanErrors []error
 
 	if len(liveHosts) == 0 {
 		return findings, nil
@@ -33,16 +38,23 @@ func (e *Engine) runFfuf(ctx context.Context, liveHosts []string) ([]Finding, er
 	pathFindings, err := e.runFfufPaths(ctx, liveHosts)
 	if err != nil {
 		e.log.Debugf("ffuf path scan error: %v", err)
+		scanErrors = append(scanErrors, fmt.Errorf("path scan: %w", err))
 	}
 	findings = append(findings, pathFindings...)
 
 	// ── Phase 2: Virtual-host discovery ──
-	vhostFindings, err := e.runFfufVhost(ctx, liveHosts)
-	if err != nil {
-		e.log.Debugf("ffuf vhost scan error: %v", err)
+	if e.cfg.Scanning.Tools.Ffuf.VhostFuzzing {
+		vhostFindings, err := e.runFfufVhost(ctx, liveHosts)
+		if err != nil {
+			e.log.Debugf("ffuf vhost scan error: %v", err)
+			scanErrors = append(scanErrors, fmt.Errorf("vhost scan: %w", err))
+		}
+		findings = append(findings, vhostFindings...)
 	}
-	findings = append(findings, vhostFindings...)
 
+	if len(scanErrors) > 0 {
+		return findings, errors.Join(scanErrors...)
+	}
 	return findings, nil
 }
 
@@ -51,6 +63,7 @@ func (e *Engine) runFfuf(ctx context.Context, liveHosts []string) ([]Finding, er
 // and the top N are scanned.
 func (e *Engine) runFfufPaths(ctx context.Context, liveHosts []string) ([]Finding, error) {
 	var findings []Finding
+	var scanErrors []error
 
 	wordlistPath := e.cfg.Scanning.Tools.Ffuf.WordlistPath
 	if wordlistPath == "" {
@@ -161,11 +174,15 @@ func (e *Engine) runFfufPaths(ctx context.Context, liveHosts []string) ([]Findin
 		hostFindings, err := e.runFfufOnHost(ctx, host, wordlistPath)
 		if err != nil {
 			e.log.Debugf("ffuf failed for %s: %v", host, err)
+			scanErrors = append(scanErrors, fmt.Errorf("%s: %w", host, err))
 			continue
 		}
 		findings = append(findings, hostFindings...)
 	}
 
+	if len(scanErrors) > 0 {
+		return findings, errors.Join(scanErrors...)
+	}
 	return findings, nil
 }
 
@@ -247,13 +264,12 @@ func (e *Engine) runFfufOnHost(ctx context.Context, host, wordlistPath string) (
 		"-w", wordlistPath,
 		"-mc", "200,201,204,301,302,307,401,403,405,500",
 		"-fc", "404",
-		"-ac",                          // Auto-calibrate
-		"-s",                           // Silent
+		"-ac", // Auto-calibrate
+		"-s",  // Silent
 		"-json",
 		"-timeout", "10",
-		"-rate", "80",                  // Increased from 50
-		"-t", "15",                     // More threads per host
-		"-recursion", "-recursion-depth", "2", // Deeper recursion
+		"-rate", "80", // Increased from 50
+		"-t", "15", // More threads per host
 		"-o", tmpOut.Name(),
 	}
 
@@ -301,6 +317,10 @@ func (e *Engine) runFfufOnHost(ctx context.Context, host, wordlistPath string) (
 		if severity == "" {
 			continue
 		}
+		if !e.verifyFfufExposure(ctx, result.URL, result.Input.FUZZ) {
+			e.log.Debugf("ffuf: rejected unverified exposure candidate %s", result.URL)
+			continue
+		}
 
 		title := classifyFfufTitle(result.Input.FUZZ, result.Status)
 
@@ -325,6 +345,80 @@ func (e *Engine) runFfufOnHost(ctx context.Context, host, wordlistPath string) (
 	}
 
 	return findings, nil
+}
+
+// verifyFfufExposure confirms that a 200 response contains content expected for
+// the sensitive path. A path name and status code alone are not a vulnerability.
+func (e *Engine) verifyFfufExposure(ctx context.Context, rawURL, path string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil || len(body) == 0 {
+		return false
+	}
+
+	lowerPath := strings.ToLower(path)
+	lowerBody := strings.ToLower(string(body))
+	switch {
+	case strings.HasPrefix(lowerPath, ".env"):
+		return !containsAny(lowerBody, "your-", "change_me", "changeme", "example_key", "example-secret") &&
+			strings.Contains(lowerBody, "=") &&
+			containsAny(lowerBody, "app_key=", "database_url=", "db_password=", "aws_access_key_id=", "secret_key=")
+	case lowerPath == ".git/config":
+		return strings.Contains(lowerBody, "[core]") && strings.Contains(lowerBody, "repositoryformatversion")
+	case lowerPath == ".git/head":
+		return strings.HasPrefix(strings.TrimSpace(lowerBody), "ref: refs/") || len(strings.TrimSpace(lowerBody)) == 40
+	case strings.Contains(lowerPath, ".aws/credentials"):
+		return strings.Contains(lowerBody, "aws_access_key_id") && strings.Contains(lowerBody, "aws_secret_access_key")
+	case strings.Contains(lowerPath, ".htpasswd"):
+		return strings.Contains(lowerBody, ":$") || strings.Contains(lowerBody, ":{sha}")
+	case strings.Contains(lowerPath, "wp-config"):
+		return strings.Contains(lowerBody, "db_name") && strings.Contains(lowerBody, "db_password")
+	case strings.HasSuffix(lowerPath, ".sql"):
+		return containsAny(lowerBody, "create table", "insert into", "sql dump")
+	case strings.HasSuffix(lowerPath, ".zip"):
+		return bytes.HasPrefix(body, []byte("PK\x03\x04"))
+	case strings.Contains(lowerPath, ".kube/config"):
+		return strings.Contains(lowerBody, "apiversion:") && strings.Contains(lowerBody, "clusters:")
+	case strings.Contains(lowerPath, ".npmrc"):
+		return strings.Contains(lowerBody, "_authtoken=")
+	case strings.Contains(lowerPath, "actuator/env"):
+		return strings.Contains(lowerBody, "propertysources")
+	case strings.Contains(lowerPath, "actuator/configprops"):
+		return strings.Contains(lowerBody, "contexts")
+	case strings.Contains(lowerPath, "actuator/heapdump"):
+		return bytes.HasPrefix(body, []byte("JAVA PROFILE"))
+	default:
+		return false
+	}
+}
+
+func containsAny(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 // runFfufVhost discovers virtual hosts by fuzzing the Host header.
@@ -407,7 +501,10 @@ func (e *Engine) runFfufVhost(ctx context.Context, liveHosts []string) ([]Findin
 		return findings, nil
 	}
 
-	baseDomain := extractRootDomain(extractHostname(baseTarget))
+	baseDomain := ""
+	if len(e.cfg.Target.Domains) > 0 {
+		baseDomain = strings.TrimPrefix(strings.ToLower(e.cfg.Target.Domains[0]), "*.")
+	}
 	if baseDomain == "" {
 		return findings, nil
 	}
@@ -510,11 +607,6 @@ func (e *Engine) runFfufVhost(ctx context.Context, liveHosts []string) ([]Findin
 
 		vhostName := fmt.Sprintf("%s.%s", result.Input.FUZZ, baseDomain)
 
-		severity := "high"
-		if result.Status == 401 || result.Status == 403 {
-			severity = "medium"
-		}
-
 		findings = append(findings, Finding{
 			ID:    fmt.Sprintf("ffuf-vhost-%s", result.Input.FUZZ),
 			Title: fmt.Sprintf("Virtual Host Discovered: %s", vhostName),
@@ -523,7 +615,7 @@ func (e *Engine) runFfufVhost(ctx context.Context, liveHosts []string) ([]Findin
 					"This host may expose internal or admin functionality not accessible via standard subdomain enumeration.",
 				vhostName, result.Status, result.Length,
 			),
-			Severity: severity,
+			Severity: "info",
 			Type:     "vhost-discovery",
 			Target:   baseTarget,
 			URL:      fmt.Sprintf("https://%s", vhostName),
@@ -557,6 +649,9 @@ func extractRootDomain(hostname string) string {
 // classifyFfufSeverity determines severity based on what was found
 func classifyFfufSeverity(path string, status int) string {
 	lower := strings.ToLower(path)
+	if lower == ".env.example" {
+		return ""
+	}
 
 	criticalPaths := []string{
 		".env", ".git/config", ".git/head", ".aws/credentials",
@@ -566,14 +661,14 @@ func classifyFfufSeverity(path string, status int) string {
 	}
 	for _, p := range criticalPaths {
 		if lower == p || strings.HasPrefix(lower, p) {
-			if status == 200 || status == 301 || status == 302 {
+			if status == 200 {
 				return "critical"
 			}
 		}
 	}
 
-	// Paths where 200/redirect = high severity finding.
-	// For 403/401: these are access-controlled but potentially bypassable → low.
+	// Discovery of an admin or API path is useful recon, but is not a
+	// vulnerability without proof of unauthorized sensitive access.
 	accessControlPaths := []string{
 		"admin", "administrator", "phpmyadmin", "adminer",
 		"graphql", "graphiql", "swagger", "api-docs",
@@ -581,14 +676,7 @@ func classifyFfufSeverity(path string, status int) string {
 	}
 	for _, p := range accessControlPaths {
 		if lower == p || strings.HasPrefix(lower, p+"/") || strings.HasPrefix(lower, p+".") {
-			if status == 200 || status == 301 || status == 302 {
-				return "high"
-			}
-			if status == 401 || status == 403 {
-				// Access denied = server is protecting the resource.
-				// Still reportable as low because auth bypass may be possible.
-				return "low"
-			}
+			return ""
 		}
 	}
 
@@ -603,7 +691,7 @@ func classifyFfufSeverity(path string, status int) string {
 	}
 	for _, p := range diagnosticPaths {
 		if lower == p || strings.HasPrefix(lower, p+"/") || strings.HasPrefix(lower, p+".") {
-			if status == 200 || status == 301 || status == 302 {
+			if status == 200 {
 				return "high"
 			}
 			// 403/401 → server is blocking the diagnostic endpoint correctly.
@@ -621,27 +709,10 @@ func classifyFfufSeverity(path string, status int) string {
 	}
 	for _, p := range mediumPaths {
 		if lower == p || strings.HasPrefix(lower, p) {
-			if status == 200 || status == 301 || status == 302 {
+			if status == 200 {
 				return "medium"
 			}
 		}
-	}
-
-	if status == 200 {
-		lowPaths := []string{"robots.txt", "sitemap.xml", "security.txt", "crossdomain.xml"}
-		for _, p := range lowPaths {
-			if lower == p {
-				return "low"
-			}
-		}
-	}
-
-	if status == 200 && (strings.Contains(lower, "api") || strings.Contains(lower, "v1") || strings.Contains(lower, "v2")) {
-		return "medium"
-	}
-
-	if status == 500 {
-		return "low"
 	}
 
 	return ""

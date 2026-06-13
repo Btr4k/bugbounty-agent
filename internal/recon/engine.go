@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
+	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
 type Engine struct {
@@ -67,7 +70,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	defer cancel()
 
 	results := &Results{
-		Subdomains:   make([]string, 0),
+		Subdomains:   append([]string(nil), e.cfg.Target.Domains...),
 		URLs:         make([]string, 0),
 		Endpoints:    make([]string, 0),
 		IPs:          make([]string, 0),
@@ -78,6 +81,12 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 	var wg sync.WaitGroup
 	mu := &sync.Mutex{}
+	var toolErrors []error
+	recordToolError := func(tool string, err error) {
+		mu.Lock()
+		toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
+		mu.Unlock()
+	}
 
 	e.log.PhaseNote(fmt.Sprintf("Target: %s (timeout: %ds)", e.cfg.Target.Domains[0], e.cfg.Recon.Timeout))
 
@@ -91,6 +100,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			subs, err := e.runSubfinder(ctx)
 			if err != nil {
 				e.log.ToolFail("Subfinder", err)
+				recordToolError("subfinder", err)
 				return
 			}
 			e.log.ToolDone("Subfinder", len(subs), time.Since(start))
@@ -112,6 +122,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			subs, err := e.runAssetfinder(ctx)
 			if err != nil {
 				e.log.ToolFail("Assetfinder", err)
+				recordToolError("assetfinder", err)
 				return
 			}
 			e.log.ToolDone("Assetfinder", len(subs), time.Since(start))
@@ -133,6 +144,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			urls, err := e.runWaybackURLs(ctx)
 			if err != nil {
 				e.log.ToolFail("WaybackURLs", err)
+				recordToolError("waybackurls", err)
 				return
 			}
 			e.log.ToolDone("WaybackURLs", len(urls), time.Since(start))
@@ -142,27 +154,6 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		}()
 	} else {
 		e.log.ToolSkip("WaybackURLs", "disabled in config")
-	}
-
-	// GitHub Secrets
-	if e.cfg.Recon.Tools.GitHubDorking {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			e.log.ToolStart("GitHub Dorking", "searching for exposed secrets...")
-			start := time.Now()
-			secrets, err := e.searchGitHubSecrets(ctx)
-			if err != nil {
-				e.log.ToolFail("GitHub Dorking", err)
-				return
-			}
-			e.log.ToolDone("GitHub Dorking", len(secrets), time.Since(start))
-			mu.Lock()
-			results.Secrets = append(results.Secrets, secrets...)
-			mu.Unlock()
-		}()
-	} else {
-		e.log.ToolSkip("GitHub Dorking", "disabled in config")
 	}
 
 	// C99 API Intelligence
@@ -175,6 +166,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			subs, err := e.runC99Subdomains(ctx)
 			if err != nil {
 				e.log.ToolFail("C99 API", err)
+				recordToolError("c99", err)
 				return
 			}
 			e.log.ToolDone("C99 API", len(subs), time.Since(start))
@@ -187,21 +179,26 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	}
 
 	// Certificate Transparency
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		e.log.ToolStart("CertTransparency", "querying CT logs...")
-		start := time.Now()
-		subs, err := e.runCertTransparency(ctx)
-		if err != nil {
-			e.log.ToolFail("CertTransparency", err)
-			return
-		}
-		e.log.ToolDone("CertTransparency", len(subs), time.Since(start))
-		mu.Lock()
-		results.Subdomains = append(results.Subdomains, subs...)
-		mu.Unlock()
-	}()
+	if e.cfg.Recon.Tools.CertTransparency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.log.ToolStart("CertTransparency", "querying CT logs...")
+			start := time.Now()
+			subs, err := e.runCertTransparency(ctx)
+			if err != nil {
+				e.log.ToolFail("CertTransparency", err)
+				recordToolError("certificate-transparency", err)
+				return
+			}
+			e.log.ToolDone("CertTransparency", len(subs), time.Since(start))
+			mu.Lock()
+			results.Subdomains = append(results.Subdomains, subs...)
+			mu.Unlock()
+		}()
+	} else {
+		e.log.ToolSkip("CertTransparency", "disabled in config")
+	}
 
 	// Wait for all goroutines
 	wg.Wait()
@@ -212,6 +209,9 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 	// Sanitize subdomains: strip wildcards, remove invalid entries
 	results.Subdomains = e.sanitizeSubdomains(results.Subdomains)
+	policy := scopepolicy.New(e.cfg.Target)
+	results.Subdomains = policy.FilterHosts(results.Subdomains)
+	results.URLs = policy.FilterURLs(results.URLs)
 
 	// Apply limits (guard against MaxSubdomains=0 to avoid wiping results)
 	if e.cfg.Recon.MaxSubdomains > 0 && len(results.Subdomains) > e.cfg.Recon.MaxSubdomains {
@@ -230,6 +230,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		kURLs, err := e.runKatana(ctx, results.Subdomains)
 		if err != nil {
 			e.log.ToolFail("Katana", err)
+			recordToolError("katana", err)
 		} else {
 			e.log.ToolDone("Katana", len(kURLs), time.Since(start))
 			jsURLs = append(jsURLs, kURLs...)
@@ -249,6 +250,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 	// Deduplicate JS URLs
 	jsURLs = e.deduplicate(jsURLs)
+	jsURLs = policy.FilterURLs(jsURLs)
 
 	// Download JS content
 	if len(jsURLs) > 0 {
@@ -258,6 +260,9 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		e.log.ToolDone("JS Download", len(results.JSFiles), time.Since(start))
 	}
 
+	if len(toolErrors) > 0 {
+		return results, fmt.Errorf("enabled recon tools failed: %w", errors.Join(toolErrors...))
+	}
 	return results, nil
 }
 
@@ -365,56 +370,6 @@ func (e *Engine) runWaybackURLs(ctx context.Context) ([]string, error) {
 	return results, nil
 }
 
-func (e *Engine) searchGitHubSecrets(ctx context.Context) ([]Secret, error) {
-	e.log.Debug("Searching GitHub for secrets...")
-
-	var secrets []Secret
-
-	// GitHub dorking patterns
-	patterns := []string{
-		"api_key",
-		"secret_key",
-		"password",
-		"token",
-		"aws_access_key",
-		"private_key",
-	}
-
-	for _, domain := range e.cfg.Target.Domains {
-		for _, pattern := range patterns {
-			// Using github-search or manual API calls
-			// This is a placeholder - implement actual GitHub API integration
-			query := fmt.Sprintf("%s %s", domain, pattern)
-
-			cmd := exec.CommandContext(ctx, "github-search",
-				"-q", query,
-				"-r", "10",
-			)
-
-			output, err := cmd.Output()
-			if err != nil {
-				continue // Skip if tool not available
-			}
-
-			// Parse results and extract secrets
-			scanner := bufio.NewScanner(strings.NewReader(string(output)))
-			for scanner.Scan() {
-				line := scanner.Text()
-				if strings.Contains(line, pattern) {
-					secrets = append(secrets, Secret{
-						Type:       pattern,
-						Value:      line,
-						Source:     "github",
-						Confidence: 0.7,
-					})
-				}
-			}
-		}
-	}
-
-	return secrets, nil
-}
-
 func (e *Engine) deduplicate(items []string) []string {
 	seen := make(map[string]bool)
 	result := make([]string, 0)
@@ -465,10 +420,10 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 
 	var results []string
 	for _, domain := range e.cfg.Target.Domains {
-		url := fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json",
-			e.cfg.C99.APIKey, domain)
+		apiURL := fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json",
+			url.QueryEscape(e.cfg.C99.APIKey), url.QueryEscape(domain))
 
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("C99 request creation failed: %w", err)
 		}
@@ -476,7 +431,8 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("C99 API request failed: %w", err)
+			sanitized := strings.ReplaceAll(err.Error(), e.cfg.C99.APIKey, "[REDACTED]")
+			return nil, fmt.Errorf("C99 API request failed: %s", sanitized)
 		}
 		defer resp.Body.Close()
 
@@ -484,7 +440,7 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("C99 API returned status %d", resp.StatusCode)
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read C99 response: %w", err)
 		}
@@ -525,6 +481,8 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 	e.log.Debug("Querying Certificate Transparency logs...")
 
 	var results []string
+	successfulDomains := 0
+	var requestErrors []error
 	for _, domain := range e.cfg.Target.Domains {
 		crtURL := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
 
@@ -563,7 +521,7 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 				continue
 			}
 
-			body, err = io.ReadAll(resp.Body)
+			body, err = io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
 			resp.Body.Close()
 			if err != nil {
 				lastErr = err
@@ -576,8 +534,10 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 
 		if lastErr != nil {
 			e.log.Warnf("crt.sh all attempts failed for %s: %v", domain, lastErr)
+			requestErrors = append(requestErrors, fmt.Errorf("%s: %w", domain, lastErr))
 			continue
 		}
+		successfulDomains++
 
 		var crtEntries []struct {
 			NameValue string `json:"name_value"`
@@ -600,6 +560,9 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 	}
 
 	e.log.Infof("Certificate Transparency found %d entries", len(results))
+	if successfulDomains == 0 && len(requestErrors) > 0 {
+		return results, errors.Join(requestErrors...)
+	}
 	return results, nil
 }
 
@@ -648,11 +611,12 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 
 	args := []string{
 		"-list", tmpFile.Name(),
-		"-jsluice",          // extract JS file URLs and inline JS endpoints (v1.1+)
+		"-jsluice", // extract JS file URLs and inline JS endpoints (v1.1+)
 		"-silent",
-		"-d", "2",           // crawl depth
-		"-c", "10",          // concurrency
+		"-d", "2", // crawl depth
+		"-c", "10", // concurrency
 		"-timeout", "10",
+		"-fs", "fqdn", // never crawl links on a different host
 		// No -em filter: Go-side filter handles .js suffix check,
 		// preserving URLs with query strings like app.js?v=123
 	}
@@ -697,10 +661,10 @@ func (e *Engine) extractJSFromURLs(urls []string) []string {
 func isNoiseJS(u string) bool {
 	lower := strings.ToLower(u)
 	noisePatterns := []string{
-		"/cdn-cgi/",           // Cloudflare challenge & analytics scripts
+		"/cdn-cgi/",            // Cloudflare challenge & analytics scripts
 		"/challenge-platform/", // Cloudflare bot-management JS
 		"challenges.cloudflare.com",
-		"/wp-includes/js/",    // WordPress core (not app code)
+		"/wp-includes/js/",     // WordPress core (not app code)
 		"/wp-content/plugins/", // WordPress plugins — noisy, rarely interesting
 		"googletagmanager.com",
 		"google-analytics.com",
@@ -756,6 +720,12 @@ func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile 
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !scopepolicy.New(e.cfg.Target).AllowsURL(req.URL.String()) {
+				return http.ErrUseLastResponse
+			}
+			return nil
 		},
 	}
 
@@ -836,5 +806,3 @@ func isToolInstalled(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
 }
-
-

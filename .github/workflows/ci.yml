@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+
+      - name: Verify modules
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -trimpath -o hawkeye ./cmd/main.go
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...

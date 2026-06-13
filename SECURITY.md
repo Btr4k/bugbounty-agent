@@ -19,7 +19,8 @@ HawkEye is designed for **authorized security testing only**.
 
 If you discover a security vulnerability in HawkEye itself, please report it via:
 
-- GitHub Issues: https://github.com/Btr4k/bugbounty-agent/issues
-- Twitter: [@A_cyb3r](https://twitter.com/A_cyb3r)
+- GitHub private vulnerability reporting:
+  https://github.com/Btr4k/bugbounty-agent/security/advisories/new
 
-Please do not publicly disclose vulnerabilities until they have been addressed.
+Do not open a public GitHub issue for undisclosed vulnerabilities. Please include
+the affected version, reproduction steps, impact, and any suggested remediation.

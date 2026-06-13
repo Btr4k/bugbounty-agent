@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	"github.com/Btr4k/bugbounty-agent/internal/recon"
+	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
 type Engine struct {
@@ -28,6 +30,7 @@ type Engine struct {
 type Results struct {
 	Findings []Finding
 	Stats    ScanStats
+	Complete bool
 }
 
 type Finding struct {
@@ -71,8 +74,17 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	results := &Results{
 		Findings: make([]Finding, 0),
 	}
+	policy := scopepolicy.New(e.cfg.Target)
+	reconResults.Subdomains = policy.FilterHosts(reconResults.Subdomains)
+	reconResults.URLs = policy.FilterURLs(reconResults.URLs)
 
 	mu := &sync.Mutex{}
+	var toolErrors []error
+	recordToolError := func(tool string, err error) {
+		mu.Lock()
+		toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
+		mu.Unlock()
+	}
 
 	// Show what tools will run
 	totalTargets := len(reconResults.Subdomains)
@@ -112,10 +124,12 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 		if err != nil {
 			e.log.ToolFail("Httpx", err)
+			recordToolError("httpx", err)
 		} else {
 			e.log.ToolDone("Httpx", len(hosts), time.Since(start))
 			e.log.PhaseNote(fmt.Sprintf("Live hosts: %d / %d subdomains respond", len(hosts), totalTargets))
 			liveHosts = hosts
+			liveHosts = policy.FilterURLs(liveHosts)
 			mu.Lock()
 			results.Findings = append(results.Findings, findings...)
 			mu.Unlock()
@@ -202,6 +216,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			})
 			if err != nil {
 				e.log.ToolFail("Nuclei", err)
+				recordToolError("nuclei", err)
 				return
 			}
 
@@ -233,6 +248,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := e.runNmap(ctx, liveHosts)
 			if err != nil {
 				e.log.ToolFail("Nmap", err)
+				recordToolError("nmap", err)
 				return
 			}
 
@@ -246,8 +262,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	}
 
 	// SQL Injection — nuclei-based (fast, WAF-aware) + gf-style param filtering
-	// Replaces blind sqlmap: nuclei sqli templates on live hosts + targeted param fuzzing
-	if e.cfg.Scanning.Tools.SQLMap.Enabled {
+	if e.cfg.Scanning.Tools.SQLi.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -264,6 +279,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := e.runSQLiScan(sqliCtx, liveHosts, reconResults.URLs)
 			if err != nil {
 				e.log.ToolFail("SQLi-Scan", err)
+				recordToolError("sqli", err)
 				return
 			}
 
@@ -289,6 +305,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := e.runFfuf(ffufCtx, liveHosts)
 			if err != nil {
 				e.log.ToolFail("Ffuf", err)
+				recordToolError("ffuf", err)
 				return
 			}
 
@@ -301,54 +318,28 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		e.log.ToolSkip("Ffuf", "disabled in config")
 	}
 
-	// CORS Misconfiguration Check — independent of Arjun, start early in parallel
-	if e.cfg.Scanning.Tools.CORS.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			e.log.ToolStart("CORS Check", fmt.Sprintf("testing %d live hosts for CORS misconfigurations...", len(liveHosts)))
-			start := time.Now()
-
-			corsCtx, corsCancel := context.WithTimeout(ctx, 3*time.Minute)
-			defer corsCancel()
-
-			findings, err := e.runCORSCheck(corsCtx, liveHosts)
-			if err != nil {
-				e.log.ToolFail("CORS Check", err)
-				return
-			}
-
-			e.log.ToolDone("CORS Check", len(findings), time.Since(start))
-			mu.Lock()
-			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
-		}()
-	} else {
-		e.log.ToolSkip("CORS Check", "disabled in config")
-	}
-
-	// Arjun Hidden Parameter Discovery — runs sequentially so results feed into Dalfox below.
-	// FFUF and CORS are already launched above and run in parallel while Arjun works.
+	// Arjun is discovery-only. Its output feeds Dalfox, but hidden parameter names
+	// are not vulnerabilities and are intentionally not reported as findings.
+	// FFUF is already launched above and runs in parallel while Arjun works.
 	var arjunParamURLs []string
-	{
+	if e.cfg.Scanning.Tools.Arjun.Enabled {
 		arjunCtx, arjunCancel := context.WithTimeout(ctx, 5*time.Minute)
 		e.log.ToolStart("Arjun", fmt.Sprintf("discovering hidden parameters on %d live hosts...", len(liveHosts)))
 		arjunStart := time.Now()
-		aFindings, newURLs, arjunErr := e.runArjun(arjunCtx, liveHosts)
+		_, newURLs, arjunErr := e.runArjun(arjunCtx, liveHosts)
 		arjunCancel()
 		if arjunErr != nil {
 			e.log.ToolFail("Arjun", arjunErr)
-		} else if len(aFindings) > 0 || len(newURLs) > 0 {
-			e.log.ToolDone("Arjun", len(aFindings), time.Since(arjunStart))
+			recordToolError("arjun", arjunErr)
+		} else if len(newURLs) > 0 {
+			e.log.ToolDone("Arjun", len(newURLs), time.Since(arjunStart))
 			e.log.Debugf("Arjun: +%d param URLs added to Dalfox queue", len(newURLs))
-			mu.Lock()
-			results.Findings = append(results.Findings, aFindings...)
-			mu.Unlock()
 			arjunParamURLs = newURLs
 		} else {
 			e.log.Debugf("Arjun: no hidden parameters found")
 		}
+	} else {
+		e.log.ToolSkip("Arjun", "disabled in config")
 	}
 
 	// Dalfox XSS Parameter Fuzzing — uses Wayback URLs + Arjun-discovered params
@@ -384,6 +375,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := e.runDalfox(dalfoxCtx, allParamURLs)
 			if err != nil {
 				e.log.ToolFail("Dalfox", err)
+				recordToolError("dalfox", err)
 				return
 			}
 
@@ -407,59 +399,42 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	//            "Environment File Exposed" both pointing at the same /.env URL).
 	//            Keep whichever finding has the higher severity; ties keep the first.
 
-	severityRank := map[string]int{
-		"critical": 4,
-		"high":     3,
-		"medium":   2,
-		"low":      1,
-		"info":     0,
-	}
-
-	// Pass 1: exact dedup (title + URL)
-	exactSeen := make(map[string]bool)
-	pass1 := make([]Finding, 0, len(results.Findings))
-	for _, f := range results.Findings {
-		key := strings.ToLower(f.Title + "|" + f.URL)
-		if !exactSeen[key] {
-			exactSeen[key] = true
-			pass1 = append(pass1, f)
-		}
-	}
-
-	// Pass 2: cross-tool dedup by URL — keep highest-severity finding per URL.
-	// Findings from JS analysis are intentionally excluded from this pass because
-	// a single JS file can legitimately contain multiple distinct issue types
-	// (e.g. eval() AND a hardcoded API key are different findings on the same URL).
-	urlBest := make(map[string]Finding) // key: normalised URL
-	var jsFindings []Finding
-	for _, f := range pass1 {
-		if f.Type == "js-analysis" {
-			jsFindings = append(jsFindings, f)
-			continue
-		}
-		key := strings.ToLower(f.URL)
-		existing, exists := urlBest[key]
-		if !exists {
-			urlBest[key] = f
-			continue
-		}
-		// Replace if this finding has strictly higher severity
-		if severityRank[strings.ToLower(f.Severity)] > severityRank[strings.ToLower(existing.Severity)] {
-			urlBest[key] = f
-		}
-	}
-
-	deduped := make([]Finding, 0, len(urlBest)+len(jsFindings))
-	for _, f := range urlBest {
-		deduped = append(deduped, f)
-	}
-	deduped = append(deduped, jsFindings...)
-	results.Findings = deduped
+	// Exact dedup only. Broad URL/class dedup can erase distinct vulnerabilities
+	// on the same endpoint, which is worse than retaining a duplicate candidate.
+	results.Findings = deduplicateFindings(policy, results.Findings)
 
 	// Calculate statistics
 	e.calculateStats(results)
+	if len(toolErrors) > 0 {
+		return results, fmt.Errorf("enabled scanner tools failed: %w", errors.Join(toolErrors...))
+	}
+	results.Complete = true
 
 	return results, nil
+}
+
+func findingInScope(policy *scopepolicy.Policy, finding Finding) bool {
+	if finding.URL != "" {
+		return policy.AllowsURL(finding.URL)
+	}
+	return policy.AllowsHost(finding.Target)
+}
+
+func deduplicateFindings(policy *scopepolicy.Policy, findings []Finding) []Finding {
+	exactSeen := make(map[string]bool)
+	deduped := make([]Finding, 0, len(findings))
+	for _, finding := range findings {
+		if !findingInScope(policy, finding) {
+			continue
+		}
+		key := strings.ToLower(finding.Title + "|" + finding.URL)
+		if exactSeen[key] {
+			continue
+		}
+		exactSeen[key] = true
+		deduped = append(deduped, finding)
+	}
+	return deduped
 }
 
 // runNucleiDirect runs Nuclei with full URLs directly (preserves ports from httpx)
@@ -490,8 +465,13 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 		"-l", tmpFile.Name(),
 		"-jsonl",
 		"-silent",
+		"-irr",
 		"-stats",
 		"-si", "30",
+		"-fhr", // follow redirects only on the same host
+	}
+	if len(e.cfg.Scanning.Tools.Nuclei.Severity) > 0 {
+		args = append(args, "-severity", strings.Join(e.cfg.Scanning.Tools.Nuclei.Severity, ","))
 	}
 
 	templatesBase := e.cfg.Scanning.Tools.Nuclei.TemplatesPath
@@ -546,6 +526,9 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	output, err := cmd.Output()
 	if err != nil {
 		e.log.Debugf("Nuclei finished with error (might be normal): %v", err)
+		if len(output) == 0 {
+			return nil, fmt.Errorf("nuclei failed: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+		}
 	}
 
 	// Parse JSON output (same parsing as runNuclei)
@@ -801,10 +784,14 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 		"-json",
 		"-silent",
 		"-td",
-		"-sc",
-		"-fr",
 		"-t", fmt.Sprintf("%d", e.cfg.Scanning.Threads),
 		"-rl", fmt.Sprintf("%d", e.cfg.Scanning.RateLimit),
+	}
+	if e.cfg.Scanning.Tools.Httpx.StatusCode {
+		args = append(args, "-sc")
+	}
+	if e.cfg.Scanning.Tools.Httpx.FollowRedirects {
+		args = append(args, "-fhr")
 	}
 
 	cmd := exec.CommandContext(ctx, httpxBin, args...)
@@ -818,6 +805,9 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 		e.log.Debugf("Httpx finished with error: %v", err)
 		if stderrBuf.Len() > 0 {
 			e.log.Debugf("Httpx stderr: %s", stderrBuf.String())
+		}
+		if len(output) == 0 {
+			return nil, nil, fmt.Errorf("httpx failed: %w", err)
 		}
 	}
 
@@ -848,31 +838,8 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 			liveHosts = append(liveHosts, httpxResult.URL)
 		}
 
-		// Create findings for interesting status codes or technologies
-		if httpxResult.StatusCode >= 500 {
-			findings = append(findings, Finding{
-				ID:          "httpx-server-error",
-				Title:       "Server Error Detected",
-				Description: fmt.Sprintf("Server returned %d status code", httpxResult.StatusCode),
-				Severity:    "low",
-				Type:        "misconfiguration",
-				URL:         httpxResult.URL,
-				Evidence:    fmt.Sprintf("Status Code: %d", httpxResult.StatusCode),
-			})
-		}
-
-		if len(httpxResult.Technologies) > 0 {
-			findings = append(findings, Finding{
-				ID:          "httpx-tech-detection",
-				Title:       "Web Technologies Detected",
-				Description: "Technologies found on the target",
-				Severity:    "info",
-				Type:        "fingerprint",
-				URL:         httpxResult.URL,
-				Evidence:    strings.Join(httpxResult.Technologies, ", "),
-				Tags:        httpxResult.Technologies,
-			})
-		}
+		// httpx is a discovery/fingerprinting input. Status codes and technology
+		// names alone are not vulnerabilities and must not enter the report.
 	}
 
 	return findings, liveHosts, nil
@@ -881,6 +848,7 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, error) {
 
 	var findings []Finding
+	var scanErrors []error
 
 	// Validate and filter targets
 	targets = validateSubdomains(targets)
@@ -924,6 +892,7 @@ func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, erro
 			} else {
 				e.log.Debugf("Nmap scan failed for %s: %v", target, err)
 			}
+			scanErrors = append(scanErrors, fmt.Errorf("%s: %w", target, err))
 			continue
 		}
 
@@ -943,6 +912,9 @@ func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, erro
 				})
 			}
 		}
+	}
+	if len(scanErrors) > 0 {
+		return findings, errors.Join(scanErrors...)
 	}
 
 	return findings, nil
@@ -1229,7 +1201,7 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		"--timeout", "10",
 		"--delay", "100",
 		"--worker", "5",
-		"--only-poc", "r",  // Only report reflected XSS PoC
+		"--only-poc", "r", // Only report reflected XSS PoC
 	}
 
 	// Add blind XSS callback if configured
@@ -1249,6 +1221,9 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		if stderrBuf.Len() > 0 {
 			e.log.Debugf("Dalfox stderr: %s", stderrBuf.String())
 		}
+		if len(output) == 0 {
+			return nil, fmt.Errorf("dalfox failed: %w", err)
+		}
 	}
 
 	// Parse JSON output (one JSON object per line)
@@ -1262,14 +1237,14 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		}
 
 		var dalfoxResult struct {
-			Type          string `json:"type"`
-			Severity      string `json:"severity"`
-			PoCType       string `json:"poc_type"`
-			PoCURL        string `json:"data"`
-			Param         string `json:"param"`
-			InjectType    string `json:"inject_type"`
-			CWE           string `json:"cwe"`
-			MessageStr    string `json:"message_str"`
+			Type       string `json:"type"`
+			Severity   string `json:"severity"`
+			PoCType    string `json:"poc_type"`
+			PoCURL     string `json:"data"`
+			Param      string `json:"param"`
+			InjectType string `json:"inject_type"`
+			CWE        string `json:"cwe"`
+			MessageStr string `json:"message_str"`
 		}
 
 		if err := json.Unmarshal([]byte(line), &dalfoxResult); err != nil {

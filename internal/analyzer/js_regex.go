@@ -36,12 +36,6 @@ var jsPatterns = []regexPattern{
 		Type:     "aws_secret",
 	},
 	{
-		Name:     "Google API Key",
-		Pattern:  regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),
-		Severity: "low",
-		Type:     "google_api_key",
-	},
-	{
 		Name:     "Google OAuth Token",
 		Pattern:  regexp.MustCompile(`ya29\.[0-9A-Za-z_-]+`),
 		Severity: "critical",
@@ -52,12 +46,6 @@ var jsPatterns = []regexPattern{
 		Pattern:  regexp.MustCompile(`sk_live_[0-9a-zA-Z]{24,}`),
 		Severity: "critical",
 		Type:     "stripe_key",
-	},
-	{
-		Name:     "Stripe Publishable Key",
-		Pattern:  regexp.MustCompile(`pk_live_[0-9a-zA-Z]{24,}`),
-		Severity: "medium",
-		Type:     "stripe_pub_key",
 	},
 	{
 		Name:     "GitHub Token",
@@ -89,13 +77,6 @@ var jsPatterns = []regexPattern{
 		Severity: "critical",
 		Type:     "mailgun_key",
 	},
-	{
-		Name:     "Firebase Config",
-		Pattern:  regexp.MustCompile(`(?i)firebase[a-zA-Z]*\.initializeApp\s*\(`),
-		Severity: "low",
-		Type:     "firebase_config",
-	},
-
 	// ═══ JWT & Session Tokens ═══
 	{
 		Name:     "JWT Token",
@@ -142,101 +123,6 @@ var jsPatterns = []regexPattern{
 		Type:     "url_credentials",
 	},
 
-	// ═══ Internal Endpoints & APIs ═══
-	{
-		Name:     "Admin/Internal API Endpoint",
-		Pattern:  regexp.MustCompile(`(?i)["'](/api/(admin|internal|debug|private|v[0-9]+/(admin|internal|users|config|settings|delete|upload|reset|token|auth)))[/"']`),
-		Severity: "high",
-		Type:     "internal_api",
-	},
-	{
-		// Catches ALL /api/vN/... endpoints — for attack surface mapping
-		Name:    "API Versioned Endpoint",
-		Pattern: regexp.MustCompile(`(?i)["'](/api/v[0-9]+/[a-zA-Z0-9/_-]{3,50})[/"']`),
-		Severity: "medium",
-		Type:    "api_endpoint",
-	},
-	{
-		// Catches /api/something patterns not caught by above
-		Name:    "API Endpoint",
-		Pattern: regexp.MustCompile(`(?i)["'](/api/[a-zA-Z0-9/_-]{3,60})[/"']`),
-		Severity: "low",
-		Type:    "api_endpoint_generic",
-	},
-	{
-		Name:     "GraphQL Endpoint",
-		Pattern:  regexp.MustCompile(`(?i)["'](https?://[^"']*/(graphql|graphiql|playground))[/"']`),
-		Severity: "medium",
-		Type:     "graphql_endpoint",
-	},
-	{
-		Name:     "WebSocket Endpoint",
-		Pattern:  regexp.MustCompile(`(?i)["'](wss?://[^"'\s]+)["']`),
-		Severity: "medium",
-		Type:     "websocket_endpoint",
-	},
-	{
-		// Full external API URLs hardcoded in JS
-		Name:    "Hardcoded External API URL",
-		Pattern: regexp.MustCompile(`(?i)["'](https?://[a-zA-Z0-9._-]{4,}/[a-zA-Z0-9/_-]{3,})['"]\s*[,;]`),
-		Severity: "low",
-		Type:    "hardcoded_url",
-	},
-	{
-		Name:     "Hardcoded Internal IP",
-		Pattern:  regexp.MustCompile(`["'](10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})["']`),
-		Severity: "medium",
-		Type:     "internal_ip",
-	},
-	{
-		// S3 bucket names exposed in JS
-		Name:    "S3 Bucket URL",
-		Pattern: regexp.MustCompile(`(?i)["'](https?://[a-zA-Z0-9._-]+\.s3[.-][a-zA-Z0-9._-]*\.amazonaws\.com[^"']*)['"']`),
-		Severity: "high",
-		Type:    "s3_bucket",
-	},
-
-	// ═══ Security Misconfigurations ═══
-	{
-		// Only match definite assignments: debug: true  or  debug = true
-		// NOT conditional checks like: if(t.debug), settings.debug&&, t&&t.debug
-		Name:     "Debug Mode Enabled",
-		Pattern:  regexp.MustCompile(`(?i)[^.\w](debug)\s*[=:]\s*(true|1|"true"|'true')`),
-		Severity: "medium",
-		Type:     "debug_mode",
-	},
-	{
-		Name:     "CORS Wildcard in Code",
-		Pattern:  regexp.MustCompile(`(?i)Access-Control-Allow-Origin['":\s]+\*`),
-		Severity: "medium",
-		Type:     "cors_wildcard",
-	},
-	{
-		Name:     "DOM XSS Sink (innerHTML)",
-		Pattern:  regexp.MustCompile(`\.innerHTML\s*=\s*[^"'][a-zA-Z]`),
-		Severity: "medium",
-		Type:     "dom_xss_sink",
-	},
-	{
-		Name:     "Eval with Variable",
-		Pattern:  regexp.MustCompile(`eval\s*\([^)"']+\)`),
-		Severity: "medium",
-		Type:     "eval_usage",
-	},
-	{
-		Name:     "PostMessage without Origin Check",
-		Pattern:  regexp.MustCompile(`(?i)addEventListener\s*\(\s*["']message["']`),
-		Severity: "low",
-		Type:     "postmessage_listener",
-	},
-
-	// ═══ Sensitive Data Exposure ═══
-	{
-		Name:     "Email Address",
-		Pattern:  regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`),
-		Severity: "low",
-		Type:     "email",
-	},
 	{
 		Name:     "Generic Secret/API Key Pattern",
 		Pattern:  regexp.MustCompile(`(?i)(api[_\-]?key|api[_\-]?secret|secret[_\-]?key|access[_\-]?token|auth[_\-]?token)\s*[=:]\s*["'][a-zA-Z0-9_\-./+=]{16,}["']`),
@@ -249,14 +135,12 @@ var jsPatterns = []regexPattern{
 // matched string and returns the bare token/key for deduplication purposes.
 // This prevents the same key matched by two patterns from appearing twice.
 var coreSecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(AKIA[0-9A-Z]{16})`),                          // AWS
-	regexp.MustCompile(`(AIza[0-9A-Za-z_-]{35})`),                     // Google
-	regexp.MustCompile(`(ya29\.[0-9A-Za-z_-]+)`),                      // Google OAuth
-	regexp.MustCompile(`(sk_live_[0-9a-zA-Z]{24,})`),                  // Stripe secret
-	regexp.MustCompile(`(pk_live_[0-9a-zA-Z]{24,})`),                  // Stripe pub
-	regexp.MustCompile(`(ghp_[0-9a-zA-Z]{36})`),                       // GitHub
-	regexp.MustCompile(`(xox[bpsar]-[0-9a-zA-Z-]{10,})`),              // Slack
-	regexp.MustCompile(`(SK[0-9a-fA-F]{32})`),                         // Twilio
+	regexp.MustCompile(`(AKIA[0-9A-Z]{16})`),                         // AWS
+	regexp.MustCompile(`(ya29\.[0-9A-Za-z_-]+)`),                     // Google OAuth
+	regexp.MustCompile(`(sk_live_[0-9a-zA-Z]{24,})`),                 // Stripe secret
+	regexp.MustCompile(`(ghp_[0-9a-zA-Z]{36})`),                      // GitHub
+	regexp.MustCompile(`(xox[bpsar]-[0-9a-zA-Z-]{10,})`),             // Slack
+	regexp.MustCompile(`(SK[0-9a-fA-F]{32})`),                        // Twilio
 	regexp.MustCompile(`(SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43})`), // SendGrid
 	regexp.MustCompile(`(eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+)`),    // JWT
 }
@@ -279,11 +163,14 @@ func ScanJSWithRegex(jsFiles []struct {
 	Source  string
 }) []scanner.Finding {
 	var findings []scanner.Finding
-	seen := make(map[string]bool) // Dedup: type+value
+	seen := make(map[string]bool)        // Dedup: type+value
 	seenSecrets := make(map[string]bool) // Cross-pattern dedup: core secret value
 
 	for _, js := range jsFiles {
 		for _, pattern := range jsPatterns {
+			if !isStrongJSFindingType(pattern.Type) {
+				continue
+			}
 			matches := pattern.Pattern.FindAllString(js.Content, 5) // Max 5 matches per pattern per file
 			for _, match := range matches {
 				// Truncate very long matches
@@ -314,48 +201,21 @@ func ScanJSWithRegex(jsFiles []struct {
 					continue
 				}
 
-				// Context-aware severity adjustment:
-				// Google API keys found in Firebase config context are public by design
-				severity := pattern.Severity
-				if pattern.Type == "google_api_key" {
-					// Check surrounding context for Firebase indicators
-					idx := strings.Index(js.Content, match)
-					if idx >= 0 {
-						start := idx - 200
-						if start < 0 {
-							start = 0
-						}
-						end := idx + len(match) + 200
-						if end > len(js.Content) {
-							end = len(js.Content)
-						}
-						context := strings.ToLower(js.Content[start:end])
-						if strings.Contains(context, "firebase") ||
-							strings.Contains(context, "firebaseconfig") ||
-							strings.Contains(context, "initializeapp") ||
-							strings.Contains(context, "authdomain") ||
-							strings.Contains(context, "storagebucket") ||
-							strings.Contains(context, "messagingsenderid") {
-							severity = "info"
-						}
-					}
-				}
-
 				findings = append(findings, scanner.Finding{
 					ID:          fmt.Sprintf("js-regex-%s", pattern.Type),
 					Title:       fmt.Sprintf("JS: %s", pattern.Name),
 					Description: fmt.Sprintf("Regex scanner found %s in %s", pattern.Name, js.URL),
-					Severity:    severity,
+					Severity:    pattern.Severity,
 					Type:        "js-analysis",
 					URL:         js.URL,
 					Evidence:    value,
 					Tags:        []string{"js", "regex-scan", pattern.Type},
 					Metadata: map[string]string{
-						"source":     "regex-js-scanner",
-						"tool":       "regex",
-						"pattern":    pattern.Type,
-						"file_url":   js.URL,
-						"file_size":  fmt.Sprintf("%d", js.Size),
+						"source":    "regex-js-scanner",
+						"tool":      "regex",
+						"pattern":   pattern.Type,
+						"file_url":  js.URL,
+						"file_size": fmt.Sprintf("%d", js.Size),
 					},
 				})
 			}
@@ -365,36 +225,36 @@ func ScanJSWithRegex(jsFiles []struct {
 	return findings
 }
 
+func isStrongJSFindingType(patternType string) bool {
+	switch patternType {
+	case "aws_key", "aws_secret", "google_oauth", "stripe_key",
+		"github_token", "slack_token", "twilio_key", "sendgrid_key",
+		"mailgun_key", "jwt", "bearer_token", "auth_header",
+		"hardcoded_password", "database_url", "private_key",
+		"url_credentials", "generic_secret":
+		return true
+	default:
+		return false
+	}
+}
+
 // shouldSkipMatch filters out common false positives
 func shouldSkipMatch(patternType, match string) bool {
 	lower := strings.ToLower(match)
+	if containsPlaceholder(lower) {
+		return true
+	}
 
 	switch patternType {
-	case "email":
-		// Skip example/placeholder emails and developer emails in copyright headers
-		if strings.Contains(lower, "example.com") ||
-			strings.Contains(lower, "placeholder") ||
-			strings.Contains(lower, "test@") ||
-			strings.Contains(lower, "noreply") ||
-			strings.Contains(lower, "user@") ||
-			strings.Contains(lower, "email@") ||
-			// Skip well-known framework/library author emails
-			strings.Contains(lower, "@gmail.com") ||
-			strings.Contains(lower, "@yahoo.com") ||
-			strings.Contains(lower, "@hotmail.com") ||
-			// Skip emails from common framework domains
-			strings.Contains(lower, "jquery.com") ||
-			strings.Contains(lower, "yiiframework.com") ||
-			strings.Contains(lower, "symfony.com") ||
-			strings.Contains(lower, "laravel.com") ||
-			strings.Contains(lower, "mailwizz.com") {
-			return true
-		}
 	case "hardcoded_password":
 		// Skip common placeholder/env-var patterns
 		if strings.Contains(lower, "process.env") ||
 			strings.Contains(lower, "${") ||
 			strings.Contains(lower, "password123") ||
+			strings.Contains(lower, `"password"`) ||
+			strings.Contains(lower, `"admin"`) ||
+			strings.Contains(lower, `"secret"`) ||
+			strings.Contains(lower, `"changeme"`) ||
 			strings.Contains(lower, "your-password") ||
 			strings.Contains(lower, "change_me") ||
 			strings.Contains(lower, "placeholder") {
@@ -406,40 +266,10 @@ func shouldSkipMatch(patternType, match string) bool {
 			strings.Contains(lower, "path") || strings.Contains(lower, "rect") {
 			return true
 		}
-	case "debug_mode":
-		// Skip if inside a comment (very rough heuristic)
-		if strings.HasPrefix(strings.TrimSpace(match), "//") ||
-			strings.HasPrefix(strings.TrimSpace(match), "*") {
-			return true
-		}
-	case "eval_usage":
-		// Skip common safe eval patterns
-		if strings.Contains(lower, "json.parse") {
-			return true
-		}
-		// Skip RequireJS and other module loaders that use eval by design
-		if strings.Contains(lower, "require") || strings.Contains(lower, "define") ||
-			strings.Contains(lower, "module") || strings.Contains(lower, "commonjs") {
-			return true
-		}
-	case "hardcoded_url":
-		// Skip well-known public/standard URLs that are not security findings
-		if strings.Contains(lower, "w3.org") ||
-			strings.Contains(lower, "schema.org") ||
-			strings.Contains(lower, "xmlsoap.org") ||
-			strings.Contains(lower, "openxmlformats.org") ||
-			strings.Contains(lower, "example.com") ||
-			strings.Contains(lower, "cdn.") ||
-			strings.Contains(lower, "jquery.com") ||
-			strings.Contains(lower, "bootstrapcdn") ||
-			strings.Contains(lower, "googleapis.com/ajax") ||
-			strings.Contains(lower, "cdnjs.cloudflare.com") {
-			return true
-		}
 	case "generic_secret":
-		// Skip if the value is a Google API key (already caught by google_api_key pattern)
+		// Public client-side Google keys require separate restriction testing.
 		if strings.Contains(match, "AIza") {
-			return false // Let the cross-pattern dedup handle it
+			return true
 		}
 		// Skip CSRF tokens — these are expected in client-side code
 		if strings.Contains(lower, "csrf") {
@@ -447,5 +277,18 @@ func shouldSkipMatch(patternType, match string) bool {
 		}
 	}
 
+	return false
+}
+
+func containsPlaceholder(value string) bool {
+	placeholders := []string{
+		"example", "placeholder", "dummy", "sample", "changeme",
+		"change_me", "your-", "your_", "xxxxx", "<token>", "<secret>",
+	}
+	for _, placeholder := range placeholders {
+		if strings.Contains(value, placeholder) {
+			return true
+		}
+	}
 	return false
 }
