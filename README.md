@@ -3,11 +3,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-2.2.0-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" />
-  <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" />
-  <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20GPT--4-a855f7?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" />
-  <img src="https://img.shields.io/badge/platform-Linux-f97316?style=for-the-badge&logo=linux&logoColor=white" />
+  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.0-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.0" /></a>
+  <a href="https://github.com/Btr4k/bugbounty-agent/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Btr4k/bugbounty-agent/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.25 or later" />
+  <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20OpenRouter-a855f7?style=for-the-badge" alt="Supported AI providers" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge" alt="MIT License" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux-f97316?style=for-the-badge&logo=linux&logoColor=white" alt="Linux" />
 </p>
 
 <p align="center">
@@ -124,9 +125,9 @@ cd bugbounty-agent
 # 2. Install all dependencies
 chmod +x install.sh && ./install.sh
 
-# 3. Set your AI key
+# 3. Set one AI key (the provider is auto-detected)
 cp .env.example .env
-echo "DEEPSEEK_API_KEY=your-key-here" >> .env
+# Edit .env and replace one placeholder with a real key
 
 # 4. Build
 go build -o hawkeye ./cmd/main.go
@@ -153,7 +154,7 @@ Options:
       --skip-recon           Skip recon phase (subdomains already known)
       --skip-scan            Skip vulnerability scanning phase
       --js-only              Run JS analysis only (skips vulnerability scanning)
-      --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter
+      --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter | custom
       --ai-model    string   Override AI model name
       --version              Show HawkEye version
   -h, --help                 Show help
@@ -237,24 +238,67 @@ go build -o hawkeye ./cmd/main.go
 
 ### AI Provider
 
-Edit `config.yaml` or set env vars in `.env`:
+Copy `.env.example` to `.env`, then set exactly one provider key. HawkEye
+auto-detects the provider in this priority order: Claude, DeepSeek, OpenAI,
+then OpenRouter. System environment variables take precedence over `.env`.
+
+| Provider | Environment Variable | Default Model |
+|---|---|---|
+| Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` |
+| OpenRouter | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat` |
+
+To select a provider explicitly, edit `config.yaml`:
 
 ```yaml
 ai:
-  provider: "deepseek"            # deepseek | claude | openai | openrouter
+  provider: "deepseek"            # deepseek | claude | openai | openrouter | custom
   api_key: "${DEEPSEEK_API_KEY}"  # loaded from .env automatically
   model: "deepseek-chat"
   max_tokens: 2000
 ```
 
-### Supported AI Providers
+For an OpenAI-compatible custom endpoint, both `model` and `base_url` are
+required:
 
-| Provider | Model | Recommended For |
-|---|---|---|
-| **DeepSeek** | deepseek-chat | Default — best cost/quality ratio |
-| **Claude** | claude-sonnet-4-20250514 | Highest accuracy |
-| **OpenAI** | gpt-4o-mini | Fast and cheap |
-| **OpenRouter** | any model | Multi-model access |
+```yaml
+ai:
+  provider: "custom"
+  api_key: "${AI_API_KEY}"
+  model: "your-model"
+  base_url: "https://your-endpoint.example/v1"
+```
+
+### Scope and Rate Limits
+
+The domain supplied with `--domain` or `--target` becomes the authorized root
+scope. HawkEye permits that domain and its subdomains, rejects discovered
+out-of-scope hosts, and filters IP addresses out of active scanning.
+
+Use `excluded_subdomains` for assets that the program explicitly excludes, and
+set `rate_limit` to match the program's rules:
+
+```yaml
+target:
+  excluded_subdomains:
+    - "production.example.com"
+    - "*.third-party.example.com"
+
+scanning:
+  rate_limit: 25
+```
+
+Always review the target program's written scope before starting a scan.
+
+### Safety and Limitations
+
+- Automated and AI-reviewed findings still require manual verification before
+  submission.
+- A partial scan or failed external tool is reported as incomplete; it does not
+  mean the target is secure.
+- Active scanners can generate substantial traffic. Set `rate_limit`, disable
+  prohibited modules, and follow the program's rules.
 
 ### C99.nl API (Subdomain Intelligence)
 
@@ -341,6 +385,38 @@ High / Medium / Low Findings
 Subdomain List
   └── All discovered subdomains
 ```
+
+---
+
+## Troubleshooting
+
+### Enabled tools are missing
+
+HawkEye checks every enabled external tool before scanning and exits with the
+installation command for anything missing. Run `./install.sh`, or disable the
+unused tool in `config.yaml`.
+
+### AI API key is required
+
+Copy `.env.example` to `.env`, replace one AI-provider placeholder with a real
+key, and run HawkEye from the repository directory. Do not commit `.env`;
+it is intentionally ignored by Git.
+
+### Develop and Test
+
+```bash
+# Run the test suite
+go test ./...
+
+# Run static analysis
+go vet ./...
+
+# Build the CLI
+go build -trimpath -o hawkeye ./cmd/main.go
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for release changes and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ---
 
