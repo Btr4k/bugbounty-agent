@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="HawkEye" width="720" />
+  <img src="hawkeye-banner-v2.2.0.png" alt="HawkEye AI-Powered Bug Bounty Agent" width="720" />
 </p>
 
 <p align="center">
