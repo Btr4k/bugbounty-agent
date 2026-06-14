@@ -10,6 +10,7 @@ ai:
   model: ""                         # Leave empty for provider default
   max_tokens: 2000
   base_url: ""                     # Only needed for openrouter/custom
+  timeout: 300                      # Per-request HTTP timeout (seconds). Raise for slow providers/large JS batches
 
 # Provider presets (just change 'provider' and 'api_key'):
 # ┌─────────────┬──────────────────────────┬────────────────────────────┬──────────────┐

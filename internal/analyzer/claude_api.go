@@ -60,13 +60,18 @@ type claudeError struct {
 	} `json:"error"`
 }
 
-func NewClaudeProvider(apiKey, model string, maxTokens int) *ClaudeProvider {
+func NewClaudeProvider(apiKey, model string, maxTokens, timeoutSeconds int) *ClaudeProvider {
+	// Matches the OpenAI-compatible provider: large JS-analysis batches can take
+	// minutes to generate. A short timeout trips mid-body; default to 300s.
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 300
+	}
 	return &ClaudeProvider{
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
 	}
 }
