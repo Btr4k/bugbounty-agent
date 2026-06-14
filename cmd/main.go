@@ -639,7 +639,11 @@ func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{})
 			continue
 		}
 		if !toolAvailable(t.name) {
-			missing = append(missing, fmt.Sprintf("%s (install: %s)", t.name, t.install))
+			install := t.install
+			if t.name == "httpx" {
+				install += httpxConflictHint()
+			}
+			missing = append(missing, fmt.Sprintf("%s (install: %s)", t.name, install))
 		}
 	}
 
@@ -648,6 +652,26 @@ func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{})
 	}
 	log.Infof("Preflight passed: all enabled external tools are available")
 	return nil
+}
+
+// httpxConflictHint returns an explanatory suffix when a non-ProjectDiscovery
+// `httpx` (commonly the Python httpx CLI) is on PATH while the ProjectDiscovery
+// one is absent. This is a frequent point of confusion — the user "has httpx"
+// but it is the wrong binary.
+func httpxConflictHint() string {
+	p, err := exec.LookPath("httpx")
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, p, "-version").CombinedOutput()
+	if strings.Contains(strings.ToLower(string(out)), "projectdiscovery") {
+		return "" // the one on PATH is already the right binary
+	}
+	return fmt.Sprintf(" — NOTE: a non-ProjectDiscovery 'httpx' is on PATH at %s "+
+		"(likely the Python httpx). Run the command above; it installs the correct "+
+		"binary to ~/go/bin/httpx, which HawkEye detects automatically", p)
 }
 
 func toolAvailable(name string) bool {
