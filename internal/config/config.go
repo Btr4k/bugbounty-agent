@@ -32,6 +32,7 @@ type AIConfig struct {
 	Model     string `yaml:"model" mapstructure:"model"`
 	MaxTokens int    `yaml:"max_tokens" mapstructure:"max_tokens"`
 	BaseURL   string `yaml:"base_url" mapstructure:"base_url"` // for openrouter/custom
+	Timeout   int    `yaml:"timeout" mapstructure:"timeout"`   // per-request HTTP timeout in seconds (default 300)
 }
 
 type C99Config struct {
@@ -206,6 +207,8 @@ func Load(filename string) (*Config, error) {
 	viper.SetDefault("recon.max_wayback_urls", 10000)
 	viper.SetDefault("scanning.threads", 50)
 	viper.SetDefault("scanning.rate_limit", 100)
+	viper.SetDefault("scanning.timeout", 1200)
+	viper.SetDefault("ai.timeout", 300)
 	viper.SetDefault("analysis.min_confidence", 0.85)
 	viper.SetDefault("c99.enabled", false)
 
@@ -363,6 +366,12 @@ func (c *Config) ResolveAIConfig() {
 		} else {
 			c.AI.MaxTokens = 2000
 		}
+	}
+
+	// Per-request HTTP timeout. Large JS-analysis batches on slower providers
+	// (e.g. DeepSeek) can take minutes to generate a full response.
+	if c.AI.Timeout <= 0 {
+		c.AI.Timeout = 300
 	}
 
 	// Auto-set base URL for known providers

@@ -181,6 +181,13 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	// ════════════════════════════════════════════════
 	var wg sync.WaitGroup
 
+	// The main Nuclei scan and the SQLi scan both spawn a nuclei subprocess that
+	// buffers all output in memory. Running them concurrently doubles peak memory
+	// and triggered the OOM killer ("signal: killed") on constrained hosts. This
+	// mutex serializes the two heavy nuclei runs while ffuf/arjun/dalfox still run
+	// in parallel alongside them.
+	var nucleiMu sync.Mutex
+
 	// Nuclei Scanning — uses full URLs from httpx (preserves ports like :8080, :8443)
 	if e.cfg.Scanning.Tools.Nuclei.Enabled {
 		wg.Add(1)
@@ -232,6 +239,10 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 			e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d live targets with high-value templates...", len(nucleiTargets)))
 			start := time.Now()
+
+			// Serialize against the SQLi nuclei run to bound peak memory.
+			nucleiMu.Lock()
+			defer nucleiMu.Unlock()
 
 			nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
 			defer nucleiCancel()
@@ -297,6 +308,11 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			e.log.ToolStart("SQLi-Scan",
 				fmt.Sprintf("nuclei sqli templates on %d hosts + %d gf-filtered param URLs...",
 					len(liveHosts), sqliURLCount))
+
+			// Wait for the main nuclei run to finish before starting our own, then
+			// start the timeout budget — so blocking on the lock doesn't eat it.
+			nucleiMu.Lock()
+			defer nucleiMu.Unlock()
 			start := time.Now()
 
 			sqliCtx, sqliCancel := context.WithTimeout(ctx, 12*time.Minute)

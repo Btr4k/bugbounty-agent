@@ -66,7 +66,13 @@ type openAIError struct {
 	} `json:"error"`
 }
 
-func NewOpenAIProvider(apiKey, model string, maxTokens int, baseURL, provider string) *OpenAIProvider {
+func NewOpenAIProvider(apiKey, model string, maxTokens int, baseURL, provider string, timeoutSeconds int) *OpenAIProvider {
+	// Large prompts (JS batches up to ~60KB) on slower providers like DeepSeek
+	// can take well over 2 minutes to generate + stream a full response. A short
+	// timeout trips mid-body; default to 300s when unset.
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 300
+	}
 	return &OpenAIProvider{
 		apiKey:    apiKey,
 		model:     model,
@@ -74,7 +80,7 @@ func NewOpenAIProvider(apiKey, model string, maxTokens int, baseURL, provider st
 		baseURL:   baseURL,
 		provider:  provider,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: time.Duration(timeoutSeconds) * time.Second,
 		},
 	}
 }
