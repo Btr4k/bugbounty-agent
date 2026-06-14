@@ -24,6 +24,7 @@ type ClaudeAnalyzer struct {
 
 type Analysis struct {
 	ValidatedFindings  []ValidatedFinding
+	ManualReview       []ValidatedFinding
 	FalsePositives     []ValidatedFinding
 	ValidatedCount     int
 	FalsePositiveCount int
@@ -36,14 +37,17 @@ type Analysis struct {
 
 type ValidatedFinding struct {
 	scanner.Finding
-	IsValid              bool    `json:"is_valid"`
-	Confidence           float64 `json:"confidence"`
-	AIAnalysis           string  `json:"ai_analysis"`
-	ImpactAssessment     string  `json:"impact_assessment"`
-	Remediation          string  `json:"remediation"`
-	ProofOfConcept       string  `json:"proof_of_concept,omitempty"`
-	CybersecurityContext string  `json:"cybersecurity_context"`
-	BugBountyValue       string  `json:"bug_bounty_value"`
+	IsValid              bool     `json:"is_valid"`
+	Decision             string   `json:"decision"`
+	Confidence           float64  `json:"confidence"`
+	EvidenceRefs         []string `json:"evidence_refs,omitempty"`
+	MissingEvidence      []string `json:"missing_evidence,omitempty"`
+	AIAnalysis           string   `json:"ai_analysis"`
+	ImpactAssessment     string   `json:"impact_assessment"`
+	Remediation          string   `json:"remediation"`
+	ProofOfConcept       string   `json:"proof_of_concept,omitempty"`
+	CybersecurityContext string   `json:"cybersecurity_context"`
+	BugBountyValue       string   `json:"bug_bounty_value"`
 }
 
 type Statistics struct {
@@ -54,6 +58,7 @@ type Statistics struct {
 	Low            int
 	Info           int
 	Validated      int
+	ManualReview   int
 	FalsePositives int
 }
 
@@ -91,6 +96,7 @@ func createAIProvider(cfg *config.Config, log *logger.Logger) AIProvider {
 func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Results) (*Analysis, error) {
 	analysis := &Analysis{
 		ValidatedFindings: make([]ValidatedFinding, 0),
+		ManualReview:      make([]ValidatedFinding, 0),
 		FalsePositives:    make([]ValidatedFinding, 0),
 		Recommendations:   make([]string, 0),
 		Timestamp:         time.Now(),
@@ -113,10 +119,12 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		}
 		if f.Type == "js-analysis" {
 			analysis.ValidatedFindings = append(analysis.ValidatedFindings, ValidatedFinding{
-				Finding:    f,
-				IsValid:    true,
-				Confidence: 0.85,
-				AIAnalysis: "Pre-validated by JS analysis pipeline (regex + AI)",
+				Finding:      f,
+				IsValid:      true,
+				Decision:     "confirmed",
+				Confidence:   0.85,
+				EvidenceRefs: []string{"machine-captured JS source"},
+				AIAnalysis:   "Pre-validated by JS analysis pipeline (regex + AI)",
 			})
 		} else {
 			toValidate = append(toValidate, f)
@@ -142,6 +150,7 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 			analysis.FalsePositives = append(analysis.FalsePositives, ValidatedFinding{
 				Finding:    f,
 				IsValid:    false,
+				Decision:   "rejected",
 				Confidence: 1.0,
 				AIAnalysis: "[Pre-Validation] " + result.Reason,
 			})
@@ -178,7 +187,7 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		}
 
 		batch := toValidate[i:end]
-		validated, rejected, err := a.analyzeBatch(ctx, batch)
+		validated, manualReview, rejected, err := a.analyzeBatch(ctx, batch)
 		if err != nil {
 			a.log.Warnf("Failed to analyze batch %d-%d: %v", i, end, err)
 			batchErrors = append(batchErrors, fmt.Errorf("batch %d-%d: %w", i, end, err))
@@ -186,6 +195,7 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		}
 
 		analysis.ValidatedFindings = append(analysis.ValidatedFindings, validated...)
+		analysis.ManualReview = append(analysis.ManualReview, manualReview...)
 		analysis.FalsePositives = append(analysis.FalsePositives, rejected...)
 	}
 
@@ -207,9 +217,9 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 	return analysis, nil
 }
 
-func (a *ClaudeAnalyzer) analyzeBatch(ctx context.Context, findings []scanner.Finding) ([]ValidatedFinding, []ValidatedFinding, error) {
+func (a *ClaudeAnalyzer) analyzeBatch(ctx context.Context, findings []scanner.Finding) ([]ValidatedFinding, []ValidatedFinding, []ValidatedFinding, error) {
 	if len(findings) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	// Prepare prompt for Claude
@@ -218,19 +228,19 @@ func (a *ClaudeAnalyzer) analyzeBatch(ctx context.Context, findings []scanner.Fi
 	// Call AI provider with retry logic
 	response, err := a.client.CompleteWithRetry(ctx, securitySystemPrompt, prompt, 3)
 	if err != nil {
-		return nil, nil, fmt.Errorf("Claude API call failed: %w", err)
+		return nil, nil, nil, fmt.Errorf("AI provider call failed: %w", err)
 	}
 
 	// Parse response
-	validated, rejected, err := a.parseValidationResponse(response, findings)
+	validated, manualReview, rejected, err := a.parseValidationResponse(response, findings)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse validation: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to parse validation: %w", err)
 	}
-	if len(validated)+len(rejected) != len(findings) {
-		return nil, nil, fmt.Errorf("AI response adjudicated %d of %d findings", len(validated)+len(rejected), len(findings))
+	if len(validated)+len(manualReview)+len(rejected) != len(findings) {
+		return nil, nil, nil, fmt.Errorf("AI response adjudicated %d of %d findings", len(validated)+len(manualReview)+len(rejected), len(findings))
 	}
 
-	return validated, rejected, nil
+	return validated, manualReview, rejected, nil
 }
 
 func (a *ClaudeAnalyzer) buildAnalysisPrompt(findings []scanner.Finding) string {
@@ -274,19 +284,19 @@ func (a *ClaudeAnalyzer) buildAnalysisPrompt(findings []scanner.Finding) string 
 `)
 
 	for i, finding := range findings {
-		desc := finding.Description
+		desc := a.cfg.Redact(finding.Description)
 		if len(desc) > 200 {
 			desc = desc[:200] + "..."
 		}
-		evidence := finding.Evidence
+		evidence := a.cfg.Redact(finding.Evidence)
 		if len(evidence) > 150 {
 			evidence = evidence[:150] + "..."
 		}
-		request := finding.Request
+		request := a.cfg.Redact(finding.Request)
 		if len(request) > 300 {
 			request = request[:300] + "..."
 		}
-		response := finding.Response
+		response := a.cfg.Redact(finding.Response)
 		if len(response) > 500 {
 			response = response[:500] + "..."
 		}
@@ -298,17 +308,18 @@ func (a *ClaudeAnalyzer) buildAnalysisPrompt(findings []scanner.Finding) string 
 	   Response: %s
 	   Desc: %s
 
-`, i, finding.Severity, finding.Title, finding.Type, finding.URL, evidence, request, response, desc))
+`, i, finding.Severity, a.cfg.Redact(finding.Title), a.cfg.Redact(finding.Type), a.cfg.Redact(finding.URL), evidence, request, response, desc))
 	}
 
-	prompt.WriteString(`رد بـ JSON فقط — يجب أن يحتوي "reasoning" على خطوات التفكير قبل الحكم:
+	prompt.WriteString(`رد بـ JSON فقط. القرار يجب أن يكون confirmed أو manual-review أو rejected:
 {
   "findings": [
     {
       "index": 0,
-      "reasoning": "1) ما الدليل الفعلي؟ 2) هل ينطبق قاعدة رفض من القواعد أعلاه؟ 3) هل يمكن كتابة PoC ناجح الآن؟",
-      "is_valid": true,
+      "decision": "confirmed|manual-review|rejected",
       "confidence": 0.0,
+      "evidence_refs": ["الدليل الآلي المحدد الذي يدعم القرار"],
+      "missing_evidence": ["الدليل المطلوب قبل تأكيد النتيجة"],
       "analysis": "نتيجة الحكم المختصرة",
       "impact_assessment": "التأثير الفعلي إذا صحيح، أو سبب الرفض إذا false positive",
       "remediation": "الحل التقني المحدد",
@@ -322,36 +333,40 @@ func (a *ClaudeAnalyzer) buildAnalysisPrompt(findings []scanner.Finding) string 
 	return prompt.String()
 }
 
-func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindings []scanner.Finding) ([]ValidatedFinding, []ValidatedFinding, error) {
+func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindings []scanner.Finding) ([]ValidatedFinding, []ValidatedFinding, []ValidatedFinding, error) {
 	// Extract JSON from response
 	jsonStart := strings.Index(response, "{")
 	jsonEnd := strings.LastIndex(response, "}")
 
 	if jsonStart == -1 || jsonEnd == -1 {
-		return nil, nil, fmt.Errorf("no JSON found in response")
+		return nil, nil, nil, fmt.Errorf("no JSON found in response")
 	}
 
 	jsonStr := response[jsonStart : jsonEnd+1]
 
 	var parsed struct {
 		Findings []struct {
-			Index                int     `json:"index"`
-			IsValid              bool    `json:"is_valid"`
-			Confidence           float64 `json:"confidence"`
-			Analysis             string  `json:"analysis"`
-			ImpactAssessment     string  `json:"impact_assessment"`
-			Remediation          string  `json:"remediation"`
-			ProofOfConcept       string  `json:"proof_of_concept"`
-			CybersecurityContext string  `json:"cybersecurity_context"`
-			BugBountyValue       string  `json:"bug_bounty_value"`
+			Index                int      `json:"index"`
+			Decision             string   `json:"decision"`
+			IsValid              bool     `json:"is_valid"`
+			Confidence           float64  `json:"confidence"`
+			EvidenceRefs         []string `json:"evidence_refs"`
+			MissingEvidence      []string `json:"missing_evidence"`
+			Analysis             string   `json:"analysis"`
+			ImpactAssessment     string   `json:"impact_assessment"`
+			Remediation          string   `json:"remediation"`
+			ProofOfConcept       string   `json:"proof_of_concept"`
+			CybersecurityContext string   `json:"cybersecurity_context"`
+			BugBountyValue       string   `json:"bug_bounty_value"`
 		} `json:"findings"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse JSON: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
 	validated := make([]ValidatedFinding, 0)
+	manualReview := make([]ValidatedFinding, 0)
 	rejected := make([]ValidatedFinding, 0)
 	seenIndexes := make(map[int]bool)
 
@@ -365,8 +380,10 @@ func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindin
 
 		vf := ValidatedFinding{
 			Finding:              original,
-			IsValid:              f.IsValid,
+			Decision:             normalizeDecision(f.Decision, f.IsValid),
 			Confidence:           f.Confidence,
+			EvidenceRefs:         evidenceReferences(original),
+			MissingEvidence:      f.MissingEvidence,
 			AIAnalysis:           f.Analysis,
 			ImpactAssessment:     f.ImpactAssessment,
 			Remediation:          f.Remediation,
@@ -375,41 +392,80 @@ func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindin
 			BugBountyValue:       f.BugBountyValue,
 		}
 
-		rejectionReason := deterministicValidationRejection(original, f.Confidence, a.cfg.Analysis.MinConfidence)
-		if rejectionReason != "" {
+		gateDecision, gateReason := deterministicValidationDecision(original, f.Confidence, a.cfg.Analysis.MinConfidence)
+		if gateReason != "" {
 			vf.IsValid = false
-			vf.AIAnalysis = "[Deterministic Validation] " + rejectionReason
-			rejected = append(rejected, vf)
-		} else if f.IsValid {
+			vf.Decision = gateDecision
+			vf.AIAnalysis = "[Deterministic Validation] " + gateReason
+			if gateDecision == "manual-review" {
+				vf.MissingEvidence = append(vf.MissingEvidence, gateReason)
+				manualReview = append(manualReview, vf)
+			} else {
+				rejected = append(rejected, vf)
+			}
+		} else if vf.Decision == "confirmed" {
+			vf.IsValid = true
 			validated = append(validated, vf)
+		} else if vf.Decision == "manual-review" {
+			vf.IsValid = false
+			manualReview = append(manualReview, vf)
 		} else {
+			vf.IsValid = false
 			rejected = append(rejected, vf)
 		}
 	}
 
-	return validated, rejected, nil
+	return validated, manualReview, rejected, nil
 }
 
-func deterministicValidationRejection(f scanner.Finding, confidence, configuredThreshold float64) string {
+func evidenceReferences(f scanner.Finding) []string {
+	refs := make([]string, 0, 4)
+	if strings.TrimSpace(f.Evidence) != "" {
+		refs = append(refs, "machine-captured evidence")
+	}
+	if strings.TrimSpace(f.Request) != "" {
+		refs = append(refs, "captured request")
+	}
+	if strings.TrimSpace(f.Response) != "" {
+		refs = append(refs, "captured response")
+	}
+	if f.Metadata["curl"] != "" {
+		refs = append(refs, "tool-captured reproduction command")
+	}
+	return refs
+}
+
+func normalizeDecision(decision string, isValid bool) string {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
+	case "confirmed", "manual-review", "rejected":
+		return strings.ToLower(strings.TrimSpace(decision))
+	}
+	if isValid {
+		return "confirmed"
+	}
+	return "rejected"
+}
+
+func deterministicValidationDecision(f scanner.Finding, confidence, configuredThreshold float64) (string, string) {
 	threshold := configuredThreshold
 	if threshold < 0.85 {
 		threshold = 0.85
 	}
 	if confidence < threshold {
-		return fmt.Sprintf("confidence %.2f is below the reportable threshold %.2f", confidence, threshold)
+		return "manual-review", fmt.Sprintf("confidence %.2f is below the reportable threshold %.2f", confidence, threshold)
 	}
 
 	switch strings.ToLower(f.Type) {
 	case "http", "sqli":
 		if strings.TrimSpace(f.Response) == "" {
-			return "HTTP finding has no captured response proving the matched condition"
+			return "rejected", "HTTP finding has no captured response proving the matched condition"
 		}
 	}
 
 	if strings.TrimSpace(f.Evidence) == "" && strings.TrimSpace(f.Response) == "" {
-		return "finding has no machine-captured evidence or response"
+		return "rejected", "finding has no machine-captured evidence or response"
 	}
-	return ""
+	return "", ""
 }
 
 // generateLocalSummary creates summary without API call (saves tokens)
@@ -431,8 +487,8 @@ func (a *ClaudeAnalyzer) generateLocalSummary(analysis *Analysis) string {
 		summary.WriteString(fmt.Sprintf("%d منخفضة. ", analysis.Stats.Low))
 	}
 
-	summary.WriteString(fmt.Sprintf("تم التحقق من %d ثغرة بواسطة AI وفلترة %d نتيجة خاطئة.",
-		analysis.Stats.Validated, analysis.Stats.FalsePositives))
+	summary.WriteString(fmt.Sprintf("تم تأكيد %d نتيجة، وإحالة %d للمراجعة اليدوية، وفلترة %d نتيجة خاطئة.",
+		analysis.Stats.Validated, analysis.Stats.ManualReview, analysis.Stats.FalsePositives))
 
 	if len(analysis.TopFindings) > 0 {
 		summary.WriteString("\n\nأهم الثغرات المكتشفة:\n")
@@ -523,10 +579,11 @@ func (a *ClaudeAnalyzer) calculateStatistics(analysis *Analysis) {
 	}
 
 	// Count false positives from the separate slice
+	analysis.Stats.ManualReview = len(analysis.ManualReview)
 	analysis.Stats.FalsePositives = len(analysis.FalsePositives)
 
-	// Total includes both validated and false positives
-	analysis.Stats.Total = analysis.Stats.Validated + analysis.Stats.FalsePositives
+	// Total includes every adjudicated candidate.
+	analysis.Stats.Total = analysis.Stats.Validated + analysis.Stats.ManualReview + analysis.Stats.FalsePositives
 
 	analysis.ValidatedCount = analysis.Stats.Validated
 	analysis.FalsePositiveCount = analysis.Stats.FalsePositives

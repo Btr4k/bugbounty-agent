@@ -1,11 +1,35 @@
 package scanner
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
+
+func TestAppendHeaderArgsIncludesConfiguredAuthentication(t *testing.T) {
+	engine := &Engine{cfg: &config.Config{
+		Authentication: config.AuthenticationConfig{
+			AllowedHosts: []string{"app.example.com"},
+			Headers:      map[string]string{"Authorization": "Bearer test-token"},
+			Cookies:      map[string]string{"session": "test-session"},
+		},
+	}}
+	args := engine.appendHeaderArgs([]string{"-silent"}, "-H", "https://app.example.com")
+	if !slices.Contains(args, "Authorization: Bearer test-token") ||
+		!slices.Contains(args, "Cookie: session=test-session") {
+		t.Fatalf("authentication headers missing from tool args: %#v", args)
+	}
+	redactionArgs := engine.appendNucleiRedactionArgs(nil)
+	if !slices.Contains(redactionArgs, "Authorization") || !slices.Contains(redactionArgs, "Cookie") {
+		t.Fatalf("nuclei redaction keys missing from tool args: %#v", redactionArgs)
+	}
+	blocked := engine.appendHeaderArgs([]string{"-silent"}, "-H", "https://evil.example.com")
+	if slices.Contains(blocked, "Authorization: Bearer test-token") {
+		t.Fatalf("authentication header leaked to disallowed host: %#v", blocked)
+	}
+}
 
 func TestFindingInScope(t *testing.T) {
 	policy := scopepolicy.New(config.TargetConfig{Domains: []string{"example.com"}})

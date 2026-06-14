@@ -182,6 +182,8 @@ func (e *Engine) runNucleiSQLi(ctx context.Context, hosts []string) ([]Finding, 
 			"-t", tp+"/http/injection/",
 		)
 	}
+	args = e.appendHeaderArgs(args, "-H", hosts...)
+	args = e.appendNucleiRedactionArgs(args)
 
 	nucleiCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
@@ -195,7 +197,7 @@ func (e *Engine) runNucleiSQLi(ctx context.Context, hosts []string) ([]Finding, 
 		return nil, fmt.Errorf("nuclei SQLi scan failed: %w", err)
 	}
 
-	return parseNucleiOutput(output), nil
+	return e.parseNucleiOutput(output), nil
 }
 
 // runNucleiSQLiFuzz runs nuclei fuzzing templates on gf-filtered parameterized URLs.
@@ -238,6 +240,8 @@ func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]F
 		tp := e.cfg.Scanning.Tools.Nuclei.TemplatesPath
 		args = append(args, "-t", tp+"/http/fuzzing/")
 	}
+	args = e.appendHeaderArgs(args, "-H", paramURLs...)
+	args = e.appendNucleiRedactionArgs(args)
 
 	fuzzCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
@@ -251,12 +255,12 @@ func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]F
 		return nil, fmt.Errorf("nuclei SQLi fuzz failed: %w", err)
 	}
 
-	return parseNucleiOutput(output), nil
+	return e.parseNucleiOutput(output), nil
 }
 
 // parseNucleiOutput parses nuclei JSONL output into Finding structs.
 // Shared by both SQLi strategies.
-func parseNucleiOutput(output []byte) []Finding {
+func (e *Engine) parseNucleiOutput(output []byte) []Finding {
 	var findings []Finding
 	sc := bufio.NewScanner(strings.NewReader(string(output)))
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -338,15 +342,15 @@ func parseNucleiOutput(output []byte) []Finding {
 			Target:      r.Host,
 			URL:         r.MatchedAt,
 			Evidence:    strings.Join(r.ExtractedResults, "\n"),
-			Request:     r.Request,
-			Response:    r.Response,
+			Request:     e.cfg.Redact(r.Request),
+			Response:    e.cfg.Redact(r.Response),
 			CVE:         cve,
 			Tags:        tags,
 			Timestamp:   time.Now().Format(time.RFC3339),
 			Metadata: map[string]string{
 				"tool":    "nuclei-sqli",
 				"matcher": r.MatcherName,
-				"curl":    r.CURLCommand,
+				"curl":    e.cfg.Redact(r.CURLCommand),
 			},
 		})
 	}

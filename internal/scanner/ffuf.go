@@ -272,6 +272,7 @@ func (e *Engine) runFfufOnHost(ctx context.Context, host, wordlistPath string) (
 		"-t", "15", // More threads per host
 		"-o", tmpOut.Name(),
 	}
+	args = e.appendHeaderArgs(args, "-H", host)
 
 	cmd := exec.CommandContext(hostCtx, "ffuf", args...)
 	var stderrBuf bytes.Buffer
@@ -353,6 +354,9 @@ func (e *Engine) verifyFfufExposure(ctx context.Context, rawURL, path string) bo
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return false
+	}
+	for name, value := range e.cfg.Authentication.HeaderValuesForTargets(rawURL) {
+		req.Header.Set(name, value)
 	}
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -541,6 +545,7 @@ func (e *Engine) runFfufVhost(ctx context.Context, liveHosts []string) ([]Findin
 		"-t", "10",
 		"-o", tmpOut.Name(),
 	}
+	args = e.appendHeaderArgs(args, "-H", liveHosts...)
 
 	cmd := exec.CommandContext(vhostCtx, "ffuf", args...)
 	var stderrBuf bytes.Buffer

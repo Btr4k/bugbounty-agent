@@ -291,10 +291,43 @@ scanning:
 
 Always review the target program's written scope before starting a scan.
 
+### Authenticated Testing
+
+HawkEye can attach authorized test-account headers and cookies to supported
+scanners and its internal HTTP requests:
+
+```env
+TARGET_TOKEN=replace-with-a-limited-test-token
+TARGET_SESSION=replace-with-a-limited-test-session
+```
+
+```yaml
+authentication:
+  allowed_hosts:
+    - "app.example.com"
+    - "*.api.example.com"
+  headers:
+    Authorization: "Bearer ${TARGET_TOKEN}"
+  cookies:
+    session: "${TARGET_SESSION}"
+```
+
+Authentication values are expanded from environment variables and redacted
+before findings are sent to the AI provider or written to reports. They may
+still be visible to local system administrators while external tools are
+running.
+
+Use only a dedicated, low-privilege test account. `allowed_hosts` is required
+and prevents credentials from being sent when any target in a tool invocation
+is not explicitly permitted. Never use personal, production, or administrator
+sessions.
+
 ### Safety and Limitations
 
 - Automated and AI-reviewed findings still require manual verification before
   submission.
+- Validation decisions are separated into `confirmed`, `manual-review`, and
+  `rejected`; only confirmed findings appear as reportable vulnerabilities.
 - A partial scan or failed external tool is reported as incomplete; it does not
   mean the target is secure.
 - Active scanners can generate substantial traffic. Set `rate_limit`, disable
