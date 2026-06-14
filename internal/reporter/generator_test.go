@@ -44,7 +44,11 @@ func TestGenerateIncludesOnlyValidatedFindingsAndUsesPrivatePermissions(t *testi
 	raw := scanner.Finding{Title: "Unvalidated raw finding", Severity: "critical", URL: "https://example.com"}
 
 	path, err := NewGenerator(cfg, log).Generate(
-		&recon.Results{Subdomains: []string{"example.com"}},
+		&recon.Results{
+			Subdomains:  []string{"example.com"},
+			Complete:    false,
+			FailedTools: []string{"certificate-transparency"},
+		},
 		&scanner.Results{Findings: []scanner.Finding{raw}, Complete: true},
 		&analyzer.Analysis{
 			ValidatedFindings: []analyzer.ValidatedFinding{validated},
@@ -73,7 +77,9 @@ func TestGenerateIncludesOnlyValidatedFindingsAndUsesPrivatePermissions(t *testi
 	if !strings.Contains(string(content), "Validation Confidence**: 0.95") ||
 		!strings.Contains(string(content), "Captured Request") ||
 		!strings.Contains(string(content), "Captured Response") ||
-		!strings.Contains(string(content), "Manual Review Required") {
+		!strings.Contains(string(content), "Manual Review Required") ||
+		!strings.Contains(string(content), "Partial Assessment") ||
+		!strings.Contains(string(content), "certificate-transparency") {
 		t.Fatal("report must include confidence, captured exchange, and manual review")
 	}
 	if strings.Contains(string(content), "secret-session-value") || !strings.Contains(string(content), "[REDACTED]") {

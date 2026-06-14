@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const appVersion = "2.2.1"
+const appVersion = "2.2.2"
 
 var (
 	cfgFile      string
@@ -172,6 +172,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			Endpoints:  make([]string, 0),
 			IPs:        make([]string, 0),
 			JSFiles:    make([]recon.JSFile, 0),
+			Complete:   false,
 		}
 		fmt.Println()
 	} else {
@@ -186,7 +187,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		}
 
 		reconDuration := time.Since(phaseStart)
-		green.Printf("  ✅ Completed in %s\n", reconDuration.Round(time.Second))
+		if reconResults.Complete {
+			green.Printf("  ✅ Completed in %s\n", reconDuration.Round(time.Second))
+		} else {
+			yellow.Printf("  ⚠️  Completed partially in %s (failed: %s)\n",
+				reconDuration.Round(time.Second), strings.Join(reconResults.FailedTools, ", "))
+		}
 		fmt.Printf("  ├── 🌐 Subdomains: %s\n", white.Sprintf("%d", len(reconResults.Subdomains)))
 		fmt.Printf("  ├── 🔗 URLs:       %s\n", white.Sprintf("%d", len(reconResults.URLs)))
 		fmt.Printf("  ├── 📍 Endpoints:  %s\n", white.Sprintf("%d", len(reconResults.Endpoints)))
@@ -226,6 +232,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		}
 		scanResults = &scanner.Results{
 			Findings: make([]scanner.Finding, 0),
+			Complete: false,
 		}
 		fmt.Println()
 	} else {
@@ -251,7 +258,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		green.Printf("  ✅ Scan completed successfully in %s\n", scanDuration.Round(time.Second))
+		if scanResults.Complete {
+			green.Printf("  ✅ Scan completed successfully in %s\n", scanDuration.Round(time.Second))
+		} else {
+			yellow.Printf("  ⚠️  Scan completed partially in %s (failed: %s)\n",
+				scanDuration.Round(time.Second), strings.Join(scanResults.FailedTools, ", "))
+		}
 		white.Printf("  📊 Actionable Findings: ")
 		cyan.Printf("%d vulnerabilities (low/medium/high/critical)\n", len(displayFindings))
 		if info > 0 {
@@ -573,7 +585,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// Print final summary
 	printSummary(duration, critical, high, medium, low, info, reportPath,
 		len(reconResults.Subdomains), len(scanResults.Findings),
-		len(analysisResults.ValidatedFindings), scanResults.Complete)
+		len(analysisResults.ValidatedFindings), reconResults.Complete && scanResults.Complete)
 
 	return nil
 }

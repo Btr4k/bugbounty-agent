@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.2.2
+
+- Continue reconnaissance and scanning when an optional external tool fails,
+  while marking the assessment as partial.
+- Apply `recon.timeout` only to passive reconnaissance sources so Katana and JS
+  downloads do not inherit an expired context.
+- Query crt.sh over IPv4 with shorter retries to avoid broken-IPv6 stalls.
+- Include failed optional tools and reconnaissance completeness in reports.
+
 ## v2.2.1
 
 - Add optional authenticated scanning with environment-backed headers and
