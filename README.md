@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.0-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.0" /></a>
+  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.1-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.1" /></a>
   <a href="https://github.com/Btr4k/bugbounty-agent/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Btr4k/bugbounty-agent/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.25 or later" />
   <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20OpenRouter-a855f7?style=for-the-badge" alt="Supported AI providers" />
@@ -156,6 +156,7 @@ Options:
       --js-only              Run JS analysis only (skips vulnerability scanning)
       --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter | custom
       --ai-model    string   Override AI model name
+      --check-config        Validate the config file and exit
       --version              Show HawkEye version
   -h, --help                 Show help
 ```
@@ -429,6 +430,16 @@ HawkEye checks every enabled external tool before scanning and exits with the
 installation command for anything missing. Run `./install.sh`, or disable the
 unused tool in `config.yaml`.
 
+### Unknown field in config
+
+This means the `hawkeye` binary is older than the accompanying `config.yaml`.
+Download both from the same release archive, rebuild from the current source,
+or verify compatibility with:
+
+```bash
+./hawkeye --check-config
+```
+
 ### AI API key is required
 
 Copy `.env.example` to `.env`, replace one AI-provider placeholder with a real
@@ -463,5 +474,5 @@ See [CHANGELOG.md](CHANGELOG.md) for release changes and
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.0
+  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.1
 </p>
