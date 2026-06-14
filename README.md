@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.2-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.2" /></a>
+  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.3-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.3" /></a>
   <a href="https://github.com/Btr4k/bugbounty-agent/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Btr4k/bugbounty-agent/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.25 or later" />
   <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20OpenRouter-a855f7?style=for-the-badge" alt="Supported AI providers" />
@@ -129,10 +129,7 @@ chmod +x install.sh && ./install.sh
 cp .env.example .env
 # Edit .env and replace one placeholder with a real key
 
-# 4. Build
-go build -o hawkeye ./cmd/main.go
-
-# 5. Scan
+# 4. Scan
 ./hawkeye -d target.com
 ```
 
@@ -220,8 +217,8 @@ go install github.com/hahwul/dalfox/v2@latest
 # System tools
 sudo apt install -y nmap
 
-# Optional — hidden parameter discovery
-pip3 install arjun
+# Optional — hidden parameter discovery (isolated Python environment)
+pipx install arjun
 
 # Wordlist for ffuf (strongly recommended)
 sudo apt install seclists
@@ -481,5 +478,5 @@ See [CHANGELOG.md](CHANGELOG.md) for release changes and
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.2
+  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.3
 </p>

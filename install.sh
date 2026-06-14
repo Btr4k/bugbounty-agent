@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# HawkEye v2.2.2 — Dependency Installer
+# HawkEye v2.2.3 — Dependency Installer
 # Tested on: Ubuntu 20.04+, Debian 11+, Kali Linux
 # Usage: chmod +x install.sh && ./install.sh
 # ============================================================
@@ -22,7 +22,7 @@ echo "  ███████║███████║██║ █╗ ██�
 echo "  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝  "
 echo "  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝"
-echo -e "                 Dependency Installer v2.2.2${RESET}"
+echo -e "                 Dependency Installer v2.2.3${RESET}"
 echo ""
 
 # ─── Check OS ────────────────────────────────────────────────
@@ -92,10 +92,20 @@ install_system_tools() {
 install_python_tools() {
     info "Installing Python tools (arjun)..."
 
-    if command -v pip3 &>/dev/null; then
-        pip3 install arjun -q 2>/dev/null && success "arjun installed" || warn "arjun failed"
+    if command -v arjun &>/dev/null; then
+        success "arjun already installed"
+    elif command -v pipx &>/dev/null; then
+        pipx install arjun >/dev/null 2>&1 && success "arjun installed" || warn "arjun failed to install with pipx"
+    elif command -v apt-get &>/dev/null; then
+        info "Installing pipx for isolated Python tools..."
+        apt-get install -y -q pipx >/dev/null 2>&1 &&
+            pipx install arjun >/dev/null 2>&1 &&
+            success "arjun installed" ||
+            warn "arjun failed — install manually with: pipx install arjun"
+    elif command -v pip3 &>/dev/null; then
+        pip3 install --user arjun -q 2>/dev/null && success "arjun installed" || warn "arjun failed — install manually with pipx"
     else
-        warn "pip3 not found — install Python3 then: pip3 install arjun"
+        warn "Python package installer not found — install pipx then: pipx install arjun"
     fi
 }
 

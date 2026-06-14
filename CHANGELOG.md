@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.2.3
+
+- Reject untouched placeholder API keys before a scan starts instead of
+  reporting them as configured.
+- Make the installer recognize an existing Arjun installation and use `pipx`
+  on externally managed Python environments.
+- Make AI request timeouts configurable and serialize Nuclei runs to reduce
+  timeouts and peak memory use.
+- Fall back to CertSpotter when crt.sh is unavailable.
+- Remove the redundant build step from the automatic-install quick start.
+
 ## v2.2.2
 
 - Continue reconnaissance and scanning when an optional external tool fails,
