@@ -233,9 +233,9 @@ func Load(filename string) (*Config, error) {
 	cfg.Claude.APIKey = os.ExpandEnv(cfg.Claude.APIKey)
 	cfg.C99.APIKey = os.ExpandEnv(cfg.C99.APIKey)
 	cfg.Authentication.expandEnv()
-	if strings.HasPrefix(strings.ToLower(cfg.C99.APIKey), "your-") {
-		cfg.C99.APIKey = ""
-	}
+	cfg.AI.APIKey = normalizeSecret(cfg.AI.APIKey)
+	cfg.Claude.APIKey = normalizeSecret(cfg.Claude.APIKey)
+	cfg.C99.APIKey = normalizeSecret(cfg.C99.APIKey)
 
 	// Also check direct env vars as fallback
 	if cfg.Claude.APIKey == "" || cfg.Claude.APIKey == "${ANTHROPIC_API_KEY}" {
@@ -290,11 +290,22 @@ func autoDetectProvider() (provider, apiKey string) {
 		{"openrouter", "OPENROUTER_API_KEY"},
 	}
 	for _, c := range candidates {
-		if key := os.Getenv(c.envVar); key != "" && !strings.HasPrefix(key, "your-") {
+		if key := normalizeSecret(os.Getenv(c.envVar)); key != "" {
 			return c.provider, key
 		}
 	}
 	return "", ""
+}
+
+func normalizeSecret(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "your-") ||
+		strings.HasPrefix(lower, "replace-with-") ||
+		strings.Contains(lower, "changeme") {
+		return ""
+	}
+	return value
 }
 
 // ResolveAIConfig fills in AI config defaults based on provider, with backward compat.
@@ -304,6 +315,8 @@ func (c *Config) ResolveAIConfig() {
 	if c.AI.APIKey == "${AI_API_KEY}" {
 		c.AI.APIKey = ""
 	}
+	c.AI.APIKey = normalizeSecret(c.AI.APIKey)
+	c.Claude.APIKey = normalizeSecret(c.Claude.APIKey)
 
 	// Auto-detect provider from env vars when:
 	//   - provider is "auto" or empty
@@ -334,11 +347,11 @@ func (c *Config) ResolveAIConfig() {
 		case "claude":
 			c.AI.APIKey = c.Claude.APIKey
 		case "deepseek":
-			c.AI.APIKey = os.Getenv("DEEPSEEK_API_KEY")
+			c.AI.APIKey = normalizeSecret(os.Getenv("DEEPSEEK_API_KEY"))
 		case "openai":
-			c.AI.APIKey = os.Getenv("OPENAI_API_KEY")
+			c.AI.APIKey = normalizeSecret(os.Getenv("OPENAI_API_KEY"))
 		case "openrouter":
-			c.AI.APIKey = os.Getenv("OPENROUTER_API_KEY")
+			c.AI.APIKey = normalizeSecret(os.Getenv("OPENROUTER_API_KEY"))
 		}
 	}
 

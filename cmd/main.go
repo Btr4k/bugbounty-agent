@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const appVersion = "2.2.2"
+const appVersion = "2.2.3"
 
 var (
 	cfgFile      string

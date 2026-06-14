@@ -28,6 +28,27 @@ func TestValidateRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestResolveAIConfigRejectsPlaceholderKeys(t *testing.T) {
+	for _, envVar := range []string{"ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"} {
+		t.Setenv(envVar, "")
+	}
+
+	cfg := Config{
+		AI:       AIConfig{Provider: "deepseek", APIKey: "your-deepseek-api-key-here"},
+		Recon:    ReconConfig{Timeout: 1},
+		Scanning: ScanningConfig{Threads: 1, RateLimit: 1},
+		Analysis: AnalysisConfig{MinConfidence: 0.85},
+	}
+	cfg.ResolveAIConfig()
+
+	if cfg.AI.APIKey != "" {
+		t.Fatalf("placeholder API key was accepted: %q", cfg.AI.APIKey)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected placeholder API key to fail validation")
+	}
+}
+
 func TestAuthenticationHeadersAndSecrets(t *testing.T) {
 	t.Setenv("TARGET_TOKEN", "secret-token-value")
 	auth := AuthenticationConfig{
