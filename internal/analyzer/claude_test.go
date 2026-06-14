@@ -24,15 +24,15 @@ func (f fakeProvider) ProviderName() string { return "fake" }
 func TestParseValidationResponseIgnoresNegativeIndex(t *testing.T) {
 	a := &ClaudeAnalyzer{cfg: &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.7}}}
 	original := []scanner.Finding{{Title: "real"}}
-	validated, rejected, err := a.parseValidationResponse(
+	validated, manualReview, rejected, err := a.parseValidationResponse(
 		`{"findings":[{"index":-1,"is_valid":true,"confidence":1}]}`,
 		original,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(validated) != 0 || len(rejected) != 0 {
-		t.Fatalf("negative index should be ignored: validated=%d rejected=%d", len(validated), len(rejected))
+	if len(validated) != 0 || len(manualReview) != 0 || len(rejected) != 0 {
+		t.Fatalf("negative index should be ignored: validated=%d manual=%d rejected=%d", len(validated), len(manualReview), len(rejected))
 	}
 }
 
@@ -70,7 +70,7 @@ func TestAnalyzeBatchRejectsIncompleteAdjudication(t *testing.T) {
 		cfg:    &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.7}},
 		client: fakeProvider{response: `{"findings":[]}`},
 	}
-	_, _, err := a.analyzeBatch(context.Background(), []scanner.Finding{{Title: "candidate"}})
+	_, _, _, err := a.analyzeBatch(context.Background(), []scanner.Finding{{Title: "candidate"}})
 	if err == nil {
 		t.Fatal("expected incomplete AI adjudication to fail")
 	}
@@ -86,29 +86,47 @@ func TestParseValidationResponseRejectsHTTPFindingWithoutCapturedResponse(t *tes
 			"curl": "curl https://example.com/bypass",
 		},
 	}}
-	validated, rejected, err := a.parseValidationResponse(
+	validated, manualReview, rejected, err := a.parseValidationResponse(
 		`{"findings":[{"index":0,"is_valid":true,"confidence":0.99,"analysis":"likely valid","proof_of_concept":"curl https://example.com/bypass"}]}`,
 		original,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(validated) != 0 || len(rejected) != 1 {
-		t.Fatalf("finding without captured response must be rejected: validated=%d rejected=%d", len(validated), len(rejected))
+	if len(validated) != 0 || len(manualReview) != 0 || len(rejected) != 1 {
+		t.Fatalf("finding without captured response must be rejected: validated=%d manual=%d rejected=%d", len(validated), len(manualReview), len(rejected))
 	}
 }
 
 func TestParseValidationResponseRequiresReportableConfidence(t *testing.T) {
 	a := &ClaudeAnalyzer{cfg: &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.7}}}
 	original := []scanner.Finding{{Title: "candidate", Evidence: "machine evidence"}}
-	validated, rejected, err := a.parseValidationResponse(
+	validated, manualReview, rejected, err := a.parseValidationResponse(
 		`{"findings":[{"index":0,"is_valid":true,"confidence":0.8}]}`,
 		original,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(validated) != 0 || len(rejected) != 1 {
-		t.Fatalf("confidence below 0.85 must require manual confirmation: validated=%d rejected=%d", len(validated), len(rejected))
+	if len(validated) != 0 || len(manualReview) != 1 || len(rejected) != 0 {
+		t.Fatalf("confidence below 0.85 must require manual confirmation: validated=%d manual=%d rejected=%d", len(validated), len(manualReview), len(rejected))
+	}
+}
+
+func TestParseValidationResponsePreservesStructuredDecisionAndEvidence(t *testing.T) {
+	a := &ClaudeAnalyzer{cfg: &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.85}}}
+	original := []scanner.Finding{{Title: "candidate", Evidence: "captured proof"}}
+	validated, manualReview, rejected, err := a.parseValidationResponse(
+		`{"findings":[{"index":0,"decision":"manual-review","confidence":0.95,"evidence_refs":["captured proof"],"missing_evidence":["control request"]}]}`,
+		original,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(validated) != 0 || len(manualReview) != 1 || len(rejected) != 0 {
+		t.Fatalf("unexpected decision routing: validated=%d manual=%d rejected=%d", len(validated), len(manualReview), len(rejected))
+	}
+	if len(manualReview[0].EvidenceRefs) != 1 || len(manualReview[0].MissingEvidence) != 1 {
+		t.Fatalf("structured evidence fields missing: %#v", manualReview[0])
 	}
 }

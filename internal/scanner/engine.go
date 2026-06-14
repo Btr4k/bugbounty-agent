@@ -70,6 +70,27 @@ func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
 	}
 }
 
+func (e *Engine) appendHeaderArgs(args []string, flag string, targets ...string) []string {
+	headers := e.cfg.Authentication.HeaderValuesForTargets(targets...)
+	if e.log != nil && e.cfg.Authentication.Configured() && len(headers) == 0 {
+		e.log.Debugf("Authentication not injected: one or more targets are not in authentication.allowed_hosts")
+	}
+	for name, value := range headers {
+		args = append(args, flag, name+": "+value)
+	}
+	return args
+}
+
+func (e *Engine) appendNucleiRedactionArgs(args []string) []string {
+	for name := range e.cfg.Authentication.Headers {
+		args = append(args, "-rd", name)
+	}
+	if len(e.cfg.Authentication.Cookies) > 0 {
+		args = append(args, "-rd", "Cookie")
+	}
+	return args
+}
+
 func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results, error) {
 	results := &Results{
 		Findings: make([]Finding, 0),
@@ -516,6 +537,8 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	args = append(args, "-timeout", "10")
 	args = append(args, "-retries", "2")
 	args = append(args, "-bulk-size", "25")
+	args = e.appendHeaderArgs(args, "-H", targets...)
+	args = e.appendNucleiRedactionArgs(args)
 
 	e.log.Debugf("Nuclei: scanning %d full URLs", len(targets))
 
@@ -527,7 +550,7 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	if err != nil {
 		e.log.Debugf("Nuclei finished with error (might be normal): %v", err)
 		if len(output) == 0 {
-			return nil, fmt.Errorf("nuclei failed: %w: %s", err, strings.TrimSpace(stderrBuf.String()))
+			return nil, fmt.Errorf("nuclei failed: %w: %s", err, e.cfg.Redact(strings.TrimSpace(stderrBuf.String())))
 		}
 	}
 
@@ -623,16 +646,16 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 			Type:        nucleiResult.Type,
 			Target:      nucleiResult.Host,
 			URL:         nucleiResult.MatchedAt,
-			Evidence:    strings.Join(nucleiResult.ExtractedResults, ", "),
-			Request:     nucleiResult.Request,
-			Response:    nucleiResult.Response,
+			Evidence:    e.cfg.Redact(strings.Join(nucleiResult.ExtractedResults, ", ")),
+			Request:     e.cfg.Redact(nucleiResult.Request),
+			Response:    e.cfg.Redact(nucleiResult.Response),
 			CVE:         cve,
 			Tags:        tags,
 			References:  references,
 			Timestamp:   nucleiResult.Timestamp,
 			Metadata: map[string]string{
 				"matcher": nucleiResult.MatcherName,
-				"curl":    nucleiResult.CURLCommand,
+				"curl":    e.cfg.Redact(nucleiResult.CURLCommand),
 				"tool":    "nuclei",
 			},
 		})
@@ -793,6 +816,7 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 	if e.cfg.Scanning.Tools.Httpx.FollowRedirects {
 		args = append(args, "-fhr")
 	}
+	args = e.appendHeaderArgs(args, "-H", targets...)
 
 	cmd := exec.CommandContext(ctx, httpxBin, args...)
 
@@ -804,7 +828,7 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 	if err != nil {
 		e.log.Debugf("Httpx finished with error: %v", err)
 		if stderrBuf.Len() > 0 {
-			e.log.Debugf("Httpx stderr: %s", stderrBuf.String())
+			e.log.Debugf("Httpx stderr: %s", e.cfg.Redact(stderrBuf.String()))
 		}
 		if len(output) == 0 {
 			return nil, nil, fmt.Errorf("httpx failed: %w", err)
@@ -1208,6 +1232,7 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 	if e.cfg.Scanning.Tools.Dalfox.BlindURL != "" {
 		args = append(args, "-b", e.cfg.Scanning.Tools.Dalfox.BlindURL)
 	}
+	args = e.appendHeaderArgs(args, "--header", urls...)
 
 	cmd := exec.CommandContext(ctx, "dalfox", args...)
 

@@ -3,7 +3,10 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -11,14 +14,15 @@ import (
 )
 
 type Config struct {
-	AI        AIConfig        `yaml:"ai" mapstructure:"ai"`
-	Claude    ClaudeConfig    `yaml:"claude" mapstructure:"claude"`
-	C99       C99Config       `yaml:"c99" mapstructure:"c99"`
-	Target    TargetConfig    `yaml:"target" mapstructure:"target"`
-	Recon     ReconConfig     `yaml:"recon" mapstructure:"recon"`
-	Scanning  ScanningConfig  `yaml:"scanning" mapstructure:"scanning"`
-	Analysis  AnalysisConfig  `yaml:"analysis" mapstructure:"analysis"`
-	Reporting ReportingConfig `yaml:"reporting" mapstructure:"reporting"`
+	AI             AIConfig             `yaml:"ai" mapstructure:"ai"`
+	Claude         ClaudeConfig         `yaml:"claude" mapstructure:"claude"`
+	C99            C99Config            `yaml:"c99" mapstructure:"c99"`
+	Target         TargetConfig         `yaml:"target" mapstructure:"target"`
+	Authentication AuthenticationConfig `yaml:"authentication" mapstructure:"authentication"`
+	Recon          ReconConfig          `yaml:"recon" mapstructure:"recon"`
+	Scanning       ScanningConfig       `yaml:"scanning" mapstructure:"scanning"`
+	Analysis       AnalysisConfig       `yaml:"analysis" mapstructure:"analysis"`
+	Reporting      ReportingConfig      `yaml:"reporting" mapstructure:"reporting"`
 }
 
 // AIConfig unified AI provider configuration
@@ -44,6 +48,18 @@ type ClaudeConfig struct {
 type TargetConfig struct {
 	Domains            []string `yaml:"domains" mapstructure:"domains"`
 	ExcludedSubdomains []string `yaml:"excluded_subdomains" mapstructure:"excluded_subdomains"`
+}
+
+// AuthenticationConfig contains optional credentials for authorized,
+// authenticated testing. Values may reference environment variables.
+type AuthenticationConfig struct {
+	AllowedHosts []string          `yaml:"allowed_hosts" mapstructure:"allowed_hosts"`
+	Headers      map[string]string `yaml:"headers" mapstructure:"headers"`
+	Cookies      map[string]string `yaml:"cookies" mapstructure:"cookies"`
+}
+
+func (a AuthenticationConfig) Configured() bool {
+	return len(a.Headers)+len(a.Cookies) > 0
 }
 
 type ReconConfig struct {
@@ -213,6 +229,7 @@ func Load(filename string) (*Config, error) {
 	cfg.AI.APIKey = os.ExpandEnv(cfg.AI.APIKey)
 	cfg.Claude.APIKey = os.ExpandEnv(cfg.Claude.APIKey)
 	cfg.C99.APIKey = os.ExpandEnv(cfg.C99.APIKey)
+	cfg.Authentication.expandEnv()
 	if strings.HasPrefix(strings.ToLower(cfg.C99.APIKey), "your-") {
 		cfg.C99.APIKey = ""
 	}
@@ -399,8 +416,127 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid reporting severity %q", severity)
 		}
 	}
+	for name, value := range c.Authentication.Headers {
+		name = strings.TrimSpace(name)
+		if name == "" || strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("authentication headers must not contain empty names or newlines")
+		}
+		switch strings.ToLower(name) {
+		case "host", "content-length", "transfer-encoding":
+			return fmt.Errorf("authentication header %q is not allowed", name)
+		}
+	}
+	for name, value := range c.Authentication.Cookies {
+		if strings.TrimSpace(name) == "" || strings.ContainsAny(name+value, "\r\n;") {
+			return fmt.Errorf("authentication cookies must not contain empty names, semicolons, or newlines")
+		}
+	}
+	if len(c.Authentication.Headers)+len(c.Authentication.Cookies) > 0 && len(c.Authentication.AllowedHosts) == 0 {
+		return fmt.Errorf("authentication allowed_hosts is required when headers or cookies are configured")
+	}
+	for _, host := range c.Authentication.AllowedHosts {
+		normalized := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(host)), "*.")
+		if normalized == "" || strings.ContainsAny(normalized, "* /:@\r\n") {
+			return fmt.Errorf("invalid authentication allowed host %q", host)
+		}
+	}
 
 	return nil
+}
+
+func (a *AuthenticationConfig) expandEnv() {
+	for name, value := range a.Headers {
+		a.Headers[name] = os.ExpandEnv(value)
+	}
+	for name, value := range a.Cookies {
+		a.Cookies[name] = os.ExpandEnv(value)
+	}
+}
+
+// HeaderValues returns authentication headers suitable for HTTP clients and
+// external tools. Cookies are emitted as a single Cookie header.
+func (a AuthenticationConfig) headerValues() map[string]string {
+	headers := make(map[string]string, len(a.Headers)+1)
+	for name, value := range a.Headers {
+		if strings.TrimSpace(value) != "" {
+			headers[name] = value
+		}
+	}
+	if cookie := a.CookieHeader(); cookie != "" {
+		headers["Cookie"] = cookie
+	}
+	return headers
+}
+
+// HeaderValuesForTargets returns credentials only when every target is
+// explicitly permitted. This prevents a shared tool invocation from leaking a
+// session to an untrusted discovered subdomain.
+func (a AuthenticationConfig) HeaderValuesForTargets(targets ...string) map[string]string {
+	if len(targets) == 0 {
+		return nil
+	}
+	for _, target := range targets {
+		if !a.AllowsTarget(target) {
+			return nil
+		}
+	}
+	return a.headerValues()
+}
+
+func (a AuthenticationConfig) AllowsTarget(raw string) bool {
+	host := strings.TrimSpace(strings.ToLower(raw))
+	if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
+		host = parsed.Hostname()
+	} else if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	}
+	host = strings.Trim(host, ".")
+	for _, rule := range a.AllowedHosts {
+		rule = strings.TrimSpace(strings.ToLower(rule))
+		wildcard := strings.HasPrefix(rule, "*.")
+		rule = strings.TrimPrefix(rule, "*.")
+		if host == rule || (wildcard && strings.HasSuffix(host, "."+rule)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a AuthenticationConfig) CookieHeader() string {
+	names := make([]string, 0, len(a.Cookies))
+	for name, value := range a.Cookies {
+		if strings.TrimSpace(value) != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+a.Cookies[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Redact replaces configured secrets with a stable marker before untrusted
+// output is logged, sent to an AI provider, or written to a report.
+func (c *Config) Redact(value string) string {
+	secrets := []string{c.AI.APIKey, c.Claude.APIKey, c.C99.APIKey}
+	for _, secret := range c.Authentication.Headers {
+		secrets = append(secrets, secret)
+		parts := strings.Fields(secret)
+		if len(parts) > 1 {
+			secrets = append(secrets, parts[len(parts)-1])
+		}
+	}
+	for _, secret := range c.Authentication.Cookies {
+		secrets = append(secrets, secret)
+	}
+	for _, secret := range secrets {
+		if len(secret) >= 6 {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
+	}
+	return value
 }
 
 // Save saves configuration to file

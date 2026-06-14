@@ -27,6 +27,17 @@ type Engine struct {
 	log *logger.Logger
 }
 
+func (e *Engine) appendHeaderArgs(args []string, flag string, targets ...string) []string {
+	headers := e.cfg.Authentication.HeaderValuesForTargets(targets...)
+	if e.log != nil && e.cfg.Authentication.Configured() && len(headers) == 0 {
+		e.log.Debugf("Authentication not injected: one or more targets are not in authentication.allowed_hosts")
+	}
+	for name, value := range headers {
+		args = append(args, flag, name+": "+value)
+	}
+	return args
+}
+
 type Results struct {
 	Subdomains   []string
 	URLs         []string
@@ -620,6 +631,7 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 		// No -em filter: Go-side filter handles .js suffix check,
 		// preserving URLs with query strings like app.js?v=123
 	}
+	args = e.appendHeaderArgs(args, "-H", subdomains...)
 
 	cmd := exec.CommandContext(katanaCtx, "katana", args...)
 	output, err := cmd.Output()
@@ -756,6 +768,9 @@ func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile 
 				return
 			}
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; BugBountyAgent/1.0)")
+			for name, value := range e.cfg.Authentication.HeaderValuesForTargets(url) {
+				req.Header.Set(name, value)
+			}
 
 			resp, err := client.Do(req)
 			if err != nil {

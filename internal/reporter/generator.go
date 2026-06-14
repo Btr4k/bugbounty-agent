@@ -60,7 +60,8 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Target**: %s  \n", target))
 	report.WriteString(fmt.Sprintf("**Subdomains Found**: %d  \n", len(reconResults.Subdomains)))
 	report.WriteString(fmt.Sprintf("**Vulnerability Scan Complete**: %t  \n", scanResults.Complete))
-	report.WriteString(fmt.Sprintf("**Total Findings**: %d (accepted by the validation pipeline)  \n\n", len(analysis.ValidatedFindings)))
+	report.WriteString(fmt.Sprintf("**Confirmed Findings**: %d  \n", len(analysis.ValidatedFindings)))
+	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n\n", len(analysis.ManualReview)))
 
 	// Executive Summary with Risk Score
 	// Weight JS-analysis-only findings at 50% to prevent inflated scores.
@@ -95,6 +96,7 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString("## Executive Summary\n\n")
 	report.WriteString(fmt.Sprintf("**Overall Risk Level**: %s (score: %d)  \n", riskLevel, riskScore))
 	report.WriteString(fmt.Sprintf("**Validation-Pipeline Findings**: %d high-signal findings  \n", analysis.Stats.Validated))
+	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n", analysis.Stats.ManualReview))
 	report.WriteString(fmt.Sprintf("**False Positives Filtered**: %d  \n", analysis.Stats.FalsePositives))
 	report.WriteString(fmt.Sprintf("**Attack Surface**: %d subdomains discovered  \n\n", len(reconResults.Subdomains)))
 
@@ -147,6 +149,15 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		}
 	}
 
+	if len(analysis.ManualReview) > 0 {
+		report.WriteString("## Manual Review Required\n\n")
+		report.WriteString("> These candidates are not confirmed vulnerabilities. Collect the missing evidence before submission.\n\n")
+		for _, finding := range analysis.ManualReview {
+			report.WriteString(g.formatFinding(findingIndex, finding))
+			findingIndex++
+		}
+	}
+
 	// Subdomains discovered
 	if len(reconResults.Subdomains) > 0 {
 		report.WriteString("## Subdomains Discovered\n\n")
@@ -171,9 +182,12 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 	details.WriteString(fmt.Sprintf("### %d. %s %s\n\n", index, emoji, finding.Title))
 
 	if finding.URL != "" {
-		details.WriteString(fmt.Sprintf("- **URL**: `%s`\n", finding.URL))
+		details.WriteString(fmt.Sprintf("- **URL**: `%s`\n", g.cfg.Redact(finding.URL)))
 	}
 	details.WriteString(fmt.Sprintf("- **Severity**: %s\n", strings.ToUpper(finding.Severity)))
+	if finding.Decision != "" {
+		details.WriteString(fmt.Sprintf("- **Decision**: %s\n", finding.Decision))
+	}
 	if finding.Type != "" {
 		details.WriteString(fmt.Sprintf("- **Type**: %s\n", finding.Type))
 	}
@@ -187,14 +201,21 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 
 	// Evidence
 	if finding.Evidence != "" {
-		evidence := finding.Evidence
+		evidence := g.cfg.Redact(finding.Evidence)
 		if len(evidence) > 300 {
 			evidence = evidence[:300] + "..."
 		}
 		details.WriteString(fmt.Sprintf("\n**Evidence**:\n```\n%s\n```\n", evidence))
 	}
+	if finding.Request != "" {
+		request := g.cfg.Redact(finding.Request)
+		if len(request) > 800 {
+			request = request[:800] + "..."
+		}
+		details.WriteString(fmt.Sprintf("\n**Captured Request**:\n```http\n%s\n```\n", request))
+	}
 	if finding.Response != "" {
-		response := finding.Response
+		response := g.cfg.Redact(finding.Response)
 		if len(response) > 800 {
 			response = response[:800] + "..."
 		}
@@ -203,17 +224,29 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 
 	// AI Analysis (brief)
 	if finding.AIAnalysis != "" {
-		analysis := finding.AIAnalysis
+		analysis := g.cfg.Redact(finding.AIAnalysis)
 		if len(analysis) > 200 {
 			analysis = analysis[:200] + "..."
 		}
 		details.WriteString(fmt.Sprintf("\n**Analysis**: %s\n", analysis))
 	}
+	if len(finding.EvidenceRefs) > 0 {
+		details.WriteString("\n**Evidence References**:\n")
+		for _, ref := range finding.EvidenceRefs {
+			details.WriteString(fmt.Sprintf("- %s\n", g.cfg.Redact(ref)))
+		}
+	}
+	if len(finding.MissingEvidence) > 0 {
+		details.WriteString("\n**Missing Evidence**:\n")
+		for _, missing := range finding.MissingEvidence {
+			details.WriteString(fmt.Sprintf("- %s\n", g.cfg.Redact(missing)))
+		}
+	}
 
 	// Only include a tool-captured reproduction command. An AI-generated command
 	// is guidance, not proof that the vulnerability was reproduced.
 	if g.cfg.Reporting.IncludePOC && finding.Metadata["curl"] != "" {
-		poc := finding.Metadata["curl"]
+		poc := g.cfg.Redact(finding.Metadata["curl"])
 		if len(poc) > 300 {
 			poc = poc[:300] + "..."
 		}

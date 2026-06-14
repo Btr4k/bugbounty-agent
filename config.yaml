@@ -38,6 +38,23 @@ target:
   domains: []
   excluded_subdomains: []
 
+# Optional authenticated testing. Use only accounts and sessions you own.
+# Values are expanded from environment variables and redacted from AI prompts
+# and reports. Avoid placing literal credentials in this file.
+authentication:
+  # Required when headers or cookies are configured. Credentials are injected
+  # only when every target in a tool invocation matches this allowlist.
+  allowed_hosts: []
+  # Example:
+  #   - "app.example.com"
+  #   - "*.api.example.com"
+  headers: {}
+  # Example:
+  #   Authorization: "Bearer ${TARGET_TOKEN}"
+  cookies: {}
+  # Example:
+  #   session: "${TARGET_SESSION}"
+
 # Reconnaissance Settings
 recon:
   enabled: true

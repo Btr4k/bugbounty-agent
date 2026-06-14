@@ -144,12 +144,8 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	cyan.Printf("%s\n", strings.ToUpper(cfg.AI.Provider))
 	white.Printf("  📦 AI Model:    ")
 	cyan.Printf("%s\n", cfg.AI.Model)
-	apiKeyMasked := cfg.AI.APIKey
-	if len(apiKeyMasked) > 12 {
-		apiKeyMasked = apiKeyMasked[:8] + "..." + apiKeyMasked[len(apiKeyMasked)-4:]
-	}
 	white.Printf("  🔑 API Key:     ")
-	dim.Printf("%s\n", apiKeyMasked)
+	dim.Printf("[configured]\n")
 	fmt.Println()
 
 	// ═══════════════════════════════════════
