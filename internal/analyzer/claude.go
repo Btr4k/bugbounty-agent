@@ -83,13 +83,14 @@ func createAIProvider(cfg *config.Config, log *logger.Logger) AIProvider {
 	model := cfg.AI.Model
 	maxTokens := cfg.AI.MaxTokens
 
+	timeout := cfg.AI.Timeout
 	switch provider {
 	case "deepseek", "openai", "openrouter", "custom":
 		log.Infof("AI Provider: %s (model: %s)", provider, model)
-		return NewOpenAIProvider(apiKey, model, maxTokens, cfg.AI.BaseURL, provider)
+		return NewOpenAIProvider(apiKey, model, maxTokens, cfg.AI.BaseURL, provider, timeout)
 	default: // "claude" or empty
 		log.Infof("AI Provider: claude (model: %s)", model)
-		return NewClaudeProvider(apiKey, model, maxTokens)
+		return NewClaudeProvider(apiKey, model, maxTokens, timeout)
 	}
 }
 
@@ -670,8 +671,11 @@ func (a *ClaudeAnalyzer) AnalyzeJSFiles(ctx context.Context, jsFiles []struct {
 	var allFindings []scanner.Finding
 	var batchErrors []error
 
-	// Process in batches of 5 files (fewer API calls = less rate limit pressure)
-	batchSize := 5
+	// Process in batches of 3 files. JS payloads are the largest prompts we send
+	// (up to ~12KB/file), so smaller batches keep each response fast enough to
+	// finish inside the provider HTTP timeout — larger batches timed out on
+	// slower providers like DeepSeek.
+	batchSize := 3
 	for i := 0; i < len(jsFiles); i += batchSize {
 		end := i + batchSize
 		if end > len(jsFiles) {

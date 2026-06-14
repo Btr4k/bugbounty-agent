@@ -61,6 +61,41 @@ func TestRunContinuesAfterOptionalSourceFailureAndPassiveTimeout(t *testing.T) {
 	}
 }
 
+func TestParseCertSpotterNames(t *testing.T) {
+	body := []byte(`[
+		{"dns_names":["*.seu.edu.sa","lms.seu.edu.sa"]},
+		{"dns_names":["seu.edu.sa"," itsm.seu.edu.sa ",""]}
+	]`)
+
+	names, err := parseCertSpotterNames(body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := map[string]bool{
+		"seu.edu.sa":      true, // wildcard prefix stripped
+		"lms.seu.edu.sa":  true,
+		"itsm.seu.edu.sa": true, // surrounding whitespace trimmed
+	}
+	if len(names) != 4 { // "*.seu.edu.sa" -> "seu.edu.sa" and the standalone "seu.edu.sa" both kept (dedup happens later)
+		t.Fatalf("expected 4 names, got %d: %v", len(names), names)
+	}
+	for _, n := range names {
+		if n == "" {
+			t.Fatalf("empty name should be filtered out: %v", names)
+		}
+		if !want[n] {
+			t.Fatalf("unexpected name %q in %v", n, names)
+		}
+	}
+}
+
+func TestParseCertSpotterNamesInvalidJSON(t *testing.T) {
+	if _, err := parseCertSpotterNames([]byte("not json")); err == nil {
+		t.Fatal("expected error on invalid JSON")
+	}
+}
+
 func writeExecutable(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0700); err != nil {

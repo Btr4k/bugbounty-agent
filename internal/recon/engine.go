@@ -205,7 +205,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("CertTransparency", "querying CT logs...")
 			start := time.Now()
-			subs, err := e.runCertTransparency(passiveCtx)
+			subs, err := e.runCertTransparency(ctx, passiveCtx)
 			if err != nil {
 				e.log.ToolFail("CertTransparency", err)
 				recordToolError("certificate-transparency", err)
@@ -500,8 +500,11 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 	return results, nil
 }
 
-// runCertTransparency queries Certificate Transparency logs with retry
-func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
+// runCertTransparency queries Certificate Transparency logs with retry.
+// crt.sh runs under passiveCtx (the shared passive-recon budget); the certspotter
+// fallback runs under a fresh budget derived from rootCtx so an exhausted passive
+// window can never starve it.
+func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]string, error) {
 	e.log.Debug("Querying Certificate Transparency logs...")
 
 	var results []string
@@ -528,12 +531,17 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 				e.log.Debugf("crt.sh: retry %d after %s", attempt+1, backoff)
 				select {
 				case <-time.After(backoff):
-				case <-ctx.Done():
-					return results, ctx.Err()
+				case <-passiveCtx.Done():
+					// Passive budget spent — stop retrying crt.sh and let the
+					// certspotter fallback below get its own fresh budget.
+					lastErr = passiveCtx.Err()
+				}
+				if lastErr != nil {
+					break
 				}
 			}
 
-			req, err := http.NewRequestWithContext(ctx, "GET", crtURL, nil)
+			req, err := http.NewRequestWithContext(passiveCtx, "GET", crtURL, nil)
 			if err != nil {
 				lastErr = err
 				continue
@@ -564,8 +572,21 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 		}
 
 		if lastErr != nil {
-			e.log.Warnf("crt.sh all attempts failed for %s: %v", domain, lastErr)
-			requestErrors = append(requestErrors, fmt.Errorf("%s: %w", domain, lastErr))
+			// crt.sh is frequently unreachable (e.g. IPv4-less DNS, i/o timeouts).
+			// Fall back to certspotter's free CT API so we still get CT data. Use a
+			// fresh budget off rootCtx so a spent passive window doesn't starve it.
+			e.log.Warnf("crt.sh all attempts failed for %s: %v — trying certspotter fallback", domain, lastErr)
+			csCtx, csCancel := context.WithTimeout(rootCtx, 30*time.Second)
+			csNames, csErr := e.queryCertSpotter(csCtx, domain)
+			csCancel()
+			if csErr != nil {
+				e.log.Warnf("certspotter fallback failed for %s: %v", domain, csErr)
+				requestErrors = append(requestErrors, fmt.Errorf("%s: crt.sh: %w; certspotter: %v", domain, lastErr, csErr))
+				continue
+			}
+			e.log.Infof("certspotter fallback found %d names for %s", len(csNames), domain)
+			results = append(results, csNames...)
+			successfulDomains++
 			continue
 		}
 		successfulDomains++
@@ -595,6 +616,57 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 		return results, errors.Join(requestErrors...)
 	}
 	return results, nil
+}
+
+// queryCertSpotter is the fallback Certificate Transparency source used when
+// crt.sh is unreachable. certspotter's free API needs no key and returns the
+// DNS names observed in CT logs for the domain and its subdomains.
+func (e *Engine) queryCertSpotter(ctx context.Context, domain string) ([]string, error) {
+	csURL := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain)
+	req, err := http.NewRequestWithContext(ctx, "GET", csURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("certspotter returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	return parseCertSpotterNames(body)
+}
+
+// parseCertSpotterNames extracts and normalizes DNS names from a certspotter
+// issuances response body. Kept pure (no I/O) so it is unit-testable.
+func parseCertSpotterNames(body []byte) ([]string, error) {
+	var entries []struct {
+		DNSNames []string `json:"dns_names"`
+	}
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("certspotter parse error: %w", err)
+	}
+
+	var names []string
+	for _, entry := range entries {
+		for _, name := range entry.DNSNames {
+			name = strings.TrimSpace(name)
+			name = strings.TrimPrefix(name, "*.")
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names, nil
 }
 
 // ═══════════════════════════════════════════════════════════
