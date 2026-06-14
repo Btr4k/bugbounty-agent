@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.2.1
 
 - Add optional authenticated scanning with environment-backed headers and
   cookies protected by an explicit target-host allowlist.
@@ -9,6 +9,7 @@
 - Separate validation outcomes into confirmed, manual-review, and rejected.
 - Include captured requests, evidence references, and missing evidence in
   reports.
+- Add `--check-config` and release-archive compatibility smoke testing.
 
 ## v2.2.0
 

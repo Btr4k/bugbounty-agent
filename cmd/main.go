@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const appVersion = "2.2.0"
+const appVersion = "2.2.1"
 
 var (
 	cfgFile      string
@@ -34,6 +34,7 @@ var (
 	skipRecon    bool
 	skipScan     bool
 	jsOnly       bool
+	checkConfig  bool
 )
 
 func main() {
@@ -55,6 +56,7 @@ func main() {
 	rootCmd.Flags().BoolVar(&skipRecon, "skip-recon", false, "Skip the reconnaissance phase")
 	rootCmd.Flags().BoolVar(&skipScan, "skip-scan", false, "Skip the vulnerability scanning phase")
 	rootCmd.Flags().BoolVar(&jsOnly, "js-only", false, "Run JS file analysis only (skips vulnerability scanning)")
+	rootCmd.Flags().BoolVar(&checkConfig, "check-config", false, "Validate the config file and exit")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -64,6 +66,14 @@ func main() {
 
 func runAgent(cmd *cobra.Command, args []string) error {
 	printBanner()
+
+	if checkConfig {
+		if _, err := config.Load(cfgFile); err != nil {
+			return fmt.Errorf("failed to load config: %w", err)
+		}
+		fmt.Printf("Configuration is valid and compatible with HawkEye v%s\n", appVersion)
+		return nil
+	}
 
 	// Validate that at least -t/--target or -d/--domain was provided
 	if targetDomain == "" {

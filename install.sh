@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# HawkEye v2.2.0 — Dependency Installer
+# HawkEye v2.2.1 — Dependency Installer
 # Tested on: Ubuntu 20.04+, Debian 11+, Kali Linux
 # Usage: chmod +x install.sh && ./install.sh
 # ============================================================
@@ -22,7 +22,7 @@ echo "  ███████║███████║██║ █╗ ██�
 echo "  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝  "
 echo "  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝"
-echo -e "                 Dependency Installer v2.2.0${RESET}"
+echo -e "                 Dependency Installer v2.2.1${RESET}"
 echo ""
 
 # ─── Check OS ────────────────────────────────────────────────
