@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,6 +47,8 @@ type Results struct {
 	Technologies []Technology
 	Secrets      []Secret
 	JSFiles      []JSFile
+	Complete     bool
+	FailedTools  []string
 }
 
 type JSFile struct {
@@ -76,10 +79,6 @@ func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
 }
 
 func (e *Engine) Run(ctx context.Context) (*Results, error) {
-	// Apply timeout from config
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(e.cfg.Recon.Timeout)*time.Second)
-	defer cancel()
-
 	results := &Results{
 		Subdomains:   append([]string(nil), e.cfg.Target.Domains...),
 		URLs:         make([]string, 0),
@@ -88,7 +87,15 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		Technologies: make([]Technology, 0),
 		Secrets:      make([]Secret, 0),
 		JSFiles:      make([]JSFile, 0),
+		Complete:     true,
+		FailedTools:  make([]string, 0),
 	}
+
+	// The configured recon timeout applies to passive sources only. Crawling and
+	// JS downloads have their own limits and must not inherit an expired passive
+	// recon context.
+	passiveCtx, passiveCancel := context.WithTimeout(ctx, time.Duration(e.cfg.Recon.Timeout)*time.Second)
+	defer passiveCancel()
 
 	var wg sync.WaitGroup
 	mu := &sync.Mutex{}
@@ -96,6 +103,8 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	recordToolError := func(tool string, err error) {
 		mu.Lock()
 		toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
+		results.Complete = false
+		results.FailedTools = append(results.FailedTools, tool)
 		mu.Unlock()
 	}
 
@@ -108,7 +117,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("Subfinder", "enumerating subdomains...")
 			start := time.Now()
-			subs, err := e.runSubfinder(ctx)
+			subs, err := e.runSubfinder(passiveCtx)
 			if err != nil {
 				e.log.ToolFail("Subfinder", err)
 				recordToolError("subfinder", err)
@@ -130,7 +139,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("Assetfinder", "discovering assets...")
 			start := time.Now()
-			subs, err := e.runAssetfinder(ctx)
+			subs, err := e.runAssetfinder(passiveCtx)
 			if err != nil {
 				e.log.ToolFail("Assetfinder", err)
 				recordToolError("assetfinder", err)
@@ -152,7 +161,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("WaybackURLs", "fetching historical URLs...")
 			start := time.Now()
-			urls, err := e.runWaybackURLs(ctx)
+			urls, err := e.runWaybackURLs(passiveCtx)
 			if err != nil {
 				e.log.ToolFail("WaybackURLs", err)
 				recordToolError("waybackurls", err)
@@ -174,7 +183,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("C99 API", "querying subdomain intelligence...")
 			start := time.Now()
-			subs, err := e.runC99Subdomains(ctx)
+			subs, err := e.runC99Subdomains(passiveCtx)
 			if err != nil {
 				e.log.ToolFail("C99 API", err)
 				recordToolError("c99", err)
@@ -196,7 +205,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			defer wg.Done()
 			e.log.ToolStart("CertTransparency", "querying CT logs...")
 			start := time.Now()
-			subs, err := e.runCertTransparency(ctx)
+			subs, err := e.runCertTransparency(passiveCtx)
 			if err != nil {
 				e.log.ToolFail("CertTransparency", err)
 				recordToolError("certificate-transparency", err)
@@ -213,6 +222,7 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 	// Wait for all goroutines
 	wg.Wait()
+	passiveCancel()
 
 	// Deduplicate
 	results.Subdomains = e.deduplicate(results.Subdomains)
@@ -272,7 +282,10 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	}
 
 	if len(toolErrors) > 0 {
-		return results, fmt.Errorf("enabled recon tools failed: %w", errors.Join(toolErrors...))
+		e.log.Warnf("Reconnaissance completed partially: %d enabled source(s) failed", len(toolErrors))
+	}
+	if err := ctx.Err(); err != nil {
+		return results, err
 	}
 	return results, nil
 }
@@ -494,6 +507,14 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 	var results []string
 	successfulDomains := 0
 	var requestErrors []error
+	ipv4Transport := http.DefaultTransport.(*http.Transport).Clone()
+	ipv4Transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "tcp4", address)
+	}
+	client := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: ipv4Transport,
+	}
 	for _, domain := range e.cfg.Target.Domains {
 		crtURL := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
 
@@ -503,7 +524,7 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 
 		for attempt := 0; attempt < 3; attempt++ {
 			if attempt > 0 {
-				backoff := time.Duration(attempt*15) * time.Second
+				backoff := time.Duration(attempt*5) * time.Second
 				e.log.Debugf("crt.sh: retry %d after %s", attempt+1, backoff)
 				select {
 				case <-time.After(backoff):
@@ -518,7 +539,6 @@ func (e *Engine) runCertTransparency(ctx context.Context) ([]string, error) {
 				continue
 			}
 
-			client := &http.Client{Timeout: 90 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
 				lastErr = err

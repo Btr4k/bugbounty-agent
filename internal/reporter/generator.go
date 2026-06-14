@@ -59,6 +59,7 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Date**: %s  \n", time.Now().Format("2006-01-02 15:04")))
 	report.WriteString(fmt.Sprintf("**Target**: %s  \n", target))
 	report.WriteString(fmt.Sprintf("**Subdomains Found**: %d  \n", len(reconResults.Subdomains)))
+	report.WriteString(fmt.Sprintf("**Reconnaissance Complete**: %t  \n", reconResults.Complete))
 	report.WriteString(fmt.Sprintf("**Vulnerability Scan Complete**: %t  \n", scanResults.Complete))
 	report.WriteString(fmt.Sprintf("**Confirmed Findings**: %d  \n", len(analysis.ValidatedFindings)))
 	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n\n", len(analysis.ManualReview)))
@@ -83,7 +84,7 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		}
 	}
 	riskLevel := "🟢 Low Risk"
-	if !scanResults.Complete {
+	if !reconResults.Complete || !scanResults.Complete {
 		riskLevel = "⚪ Partial Assessment"
 	} else if riskScore >= 30 {
 		riskLevel = "🔴 Critical Risk"
@@ -99,6 +100,12 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n", analysis.Stats.ManualReview))
 	report.WriteString(fmt.Sprintf("**False Positives Filtered**: %d  \n", analysis.Stats.FalsePositives))
 	report.WriteString(fmt.Sprintf("**Attack Surface**: %d subdomains discovered  \n\n", len(reconResults.Subdomains)))
+	if len(reconResults.FailedTools)+len(scanResults.FailedTools) > 0 {
+		report.WriteString("**Failed Optional Tools**: ")
+		failed := append([]string(nil), reconResults.FailedTools...)
+		failed = append(failed, scanResults.FailedTools...)
+		report.WriteString(strings.Join(failed, ", ") + "  \n\n")
+	}
 
 	if analysis.Stats.Critical > 0 {
 		report.WriteString("> ⚠️ **CRITICAL FINDINGS DETECTED** — Immediate remediation recommended.  \n\n")

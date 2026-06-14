@@ -28,9 +28,10 @@ type Engine struct {
 }
 
 type Results struct {
-	Findings []Finding
-	Stats    ScanStats
-	Complete bool
+	Findings    []Finding
+	Stats       ScanStats
+	Complete    bool
+	FailedTools []string
 }
 
 type Finding struct {
@@ -93,7 +94,9 @@ func (e *Engine) appendNucleiRedactionArgs(args []string) []string {
 
 func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results, error) {
 	results := &Results{
-		Findings: make([]Finding, 0),
+		Findings:    make([]Finding, 0),
+		Complete:    true,
+		FailedTools: make([]string, 0),
 	}
 	policy := scopepolicy.New(e.cfg.Target)
 	reconResults.Subdomains = policy.FilterHosts(reconResults.Subdomains)
@@ -104,6 +107,8 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	recordToolError := func(tool string, err error) {
 		mu.Lock()
 		toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
+		results.Complete = false
+		results.FailedTools = append(results.FailedTools, tool)
 		mu.Unlock()
 	}
 
@@ -427,9 +432,11 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	// Calculate statistics
 	e.calculateStats(results)
 	if len(toolErrors) > 0 {
-		return results, fmt.Errorf("enabled scanner tools failed: %w", errors.Join(toolErrors...))
+		e.log.Warnf("Vulnerability scanning completed partially: %d enabled tool(s) failed", len(toolErrors))
 	}
-	results.Complete = true
+	if err := ctx.Err(); err != nil {
+		return results, err
+	}
 
 	return results, nil
 }
