@@ -268,8 +268,8 @@ func (e *Engine) runFfufOnHost(ctx context.Context, host, wordlistPath string) (
 		"-s",  // Silent
 		"-json",
 		"-timeout", "10",
-		"-rate", "80", // Increased from 50
-		"-t", "15", // More threads per host
+		"-rate", fmt.Sprintf("%d", e.boundedRateLimit(80)),
+		"-t", fmt.Sprintf("%d", e.boundedThreads(15)),
 		"-o", tmpOut.Name(),
 	}
 	args = e.appendHeaderArgs(args, "-H", host)
@@ -541,8 +541,8 @@ func (e *Engine) runFfufVhost(ctx context.Context, liveHosts []string) ([]Findin
 		"-s",
 		"-json",
 		"-timeout", "10",
-		"-rate", "50",
-		"-t", "10",
+		"-rate", fmt.Sprintf("%d", e.boundedRateLimit(50)),
+		"-t", fmt.Sprintf("%d", e.boundedThreads(10)),
 		"-o", tmpOut.Name(),
 	}
 	args = e.appendHeaderArgs(args, "-H", liveHosts...)

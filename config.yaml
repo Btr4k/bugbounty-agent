@@ -72,9 +72,9 @@ recon:
 # Scanning Settings
 scanning:
   enabled: true
-  threads: 75  # Increased for better performance
+  threads: 40  # Balanced default for reliable scans on modest servers
   timeout: 1200  # 20 minutes for high-priority templates
-  rate_limit: 100 # requests per second; lower this to match program rules
+  rate_limit: 50 # Per-tool ceiling; lower this to match program rules
   tools:
     nuclei:
       enabled: true

@@ -1,12 +1,45 @@
 package scanner
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
+
+func TestResolveHttpxBinaryAllowsSlowProjectDiscoveryVersionCheck(t *testing.T) {
+	goPath := t.TempDir()
+	binDir := filepath.Join(goPath, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	httpxPath := filepath.Join(binDir, "httpx")
+	script := "#!/bin/sh\nsleep 4\necho projectdiscovery.io\n"
+	if err := os.WriteFile(httpxPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOPATH", goPath)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+"/bin")
+
+	got, ok := ResolveHttpxBinary()
+	if !ok || got != httpxPath {
+		t.Fatalf("ResolveHttpxBinary() = %q, %v; want %q, true", got, ok, httpxPath)
+	}
+}
+
+func TestBoundedToolLimitsRespectGlobalConfig(t *testing.T) {
+	engine := &Engine{cfg: &config.Config{Scanning: config.ScanningConfig{RateLimit: 12, Threads: 7}}}
+	if got := engine.boundedRateLimit(80); got != 12 {
+		t.Fatalf("boundedRateLimit = %d, want 12", got)
+	}
+	if got := engine.boundedThreads(15); got != 7 {
+		t.Fatalf("boundedThreads = %d, want 7", got)
+	}
+}
 
 func TestAppendHeaderArgsIncludesConfiguredAuthentication(t *testing.T) {
 	engine := &Engine{cfg: &config.Config{

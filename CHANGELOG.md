@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.2.4
+
+- Reliably detect the ProjectDiscovery `httpx` binary when a Python `httpx`
+  command shadows it on `PATH`.
+- Allow enough time for `httpx -version` on slow networks and share the same
+  resolver between preflight checks and the scanner.
+- Do not fall back to blind active scanning when an enabled `httpx` probe
+  fails or confirms no live hosts.
+- Route AI-only JavaScript candidates to manual review and reserve automatic
+  confirmation for deterministic, source-grounded secret patterns.
+- Continue to partial report generation when an AI batch fails.
+- Apply the configured thread and rate ceilings to Nuclei, SQLi, Httpx, and
+  FFUF, with safer defaults for modest servers.
+- Discover tools installed by Go and pipx even when their user-level binary
+  directories are missing from the shell `PATH`.
+
 ## v2.2.3
 
 - Reject untouched placeholder API keys before a scan starts instead of

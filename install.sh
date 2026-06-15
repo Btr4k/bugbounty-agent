@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# HawkEye v2.2.3 — Dependency Installer
+# HawkEye v2.2.4 — Dependency Installer
 # Tested on: Ubuntu 20.04+, Debian 11+, Kali Linux
 # Usage: chmod +x install.sh && ./install.sh
 # ============================================================
@@ -22,7 +22,7 @@ echo "  ███████║███████║██║ █╗ ██�
 echo "  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝  "
 echo "  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝"
-echo -e "                 Dependency Installer v2.2.3${RESET}"
+echo -e "                 Dependency Installer v2.2.4${RESET}"
 echo ""
 
 # ─── Check OS ────────────────────────────────────────────────
@@ -137,7 +137,7 @@ setup_env() {
 
 # ─── Run ─────────────────────────────────────────────────────
 check_go
-export PATH="$PATH:$(go env GOPATH)/bin"
+export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.local/bin"
 install_system_tools
 install_go_tools
 install_python_tools

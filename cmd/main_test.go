@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,5 +49,33 @@ analysis:
 
 	if err := runAgent(nil, nil); err != nil {
 		t.Fatalf("check-config rejected compatible config: %v", err)
+	}
+}
+
+func TestEnsureToolBinsOnPath(t *testing.T) {
+	home := t.TempDir()
+	goPath := filepath.Join(t.TempDir(), "gopath")
+	t.Setenv("HOME", home)
+	t.Setenv("GOPATH", goPath)
+	t.Setenv("PATH", "/usr/bin")
+
+	ensureToolBinsOnPath()
+
+	paths := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
+	for _, expected := range []string{
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".local", "bin"),
+		filepath.Join(goPath, "bin"),
+	} {
+		found := false
+		for _, path := range paths {
+			if path == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("PATH does not contain %q: %v", expected, paths)
+		}
 	}
 }

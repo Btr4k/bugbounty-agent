@@ -65,6 +65,43 @@ func TestAnalyzeJSBatchRequiresGroundedValueAndFile(t *testing.T) {
 	}
 }
 
+func TestAnalyzeRoutesAIOnlyJSFindingsToManualReview(t *testing.T) {
+	log := logger.New(false)
+	defer log.Close()
+	a := &ClaudeAnalyzer{
+		cfg:    &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.85}},
+		log:    log,
+		client: fakeProvider{},
+	}
+	results := &scanner.Results{Findings: []scanner.Finding{
+		{
+			Title:    "AI-only candidate",
+			Type:     "js-analysis",
+			Severity: "high",
+			Evidence: "possible-secret-value",
+			Metadata: map[string]string{"source": "ai-js-analysis"},
+		},
+		{
+			Title:    "Regex-confirmed candidate",
+			Type:     "js-analysis",
+			Severity: "high",
+			Evidence: "confirmed-secret-value",
+			Metadata: map[string]string{"source": "regex-js-scanner"},
+		},
+	}}
+
+	analysis, err := a.Analyze(context.Background(), results)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(analysis.ManualReview) != 1 || analysis.ManualReview[0].Title != "AI-only candidate" {
+		t.Fatalf("AI-only JS finding must require manual review: %#v", analysis.ManualReview)
+	}
+	if len(analysis.ValidatedFindings) != 1 || analysis.ValidatedFindings[0].Title != "Regex-confirmed candidate" {
+		t.Fatalf("regex-grounded JS finding must remain confirmed: %#v", analysis.ValidatedFindings)
+	}
+}
+
 func TestAnalyzeBatchRejectsIncompleteAdjudication(t *testing.T) {
 	a := &ClaudeAnalyzer{
 		cfg:    &config.Config{Analysis: config.AnalysisConfig{MinConfidence: 0.7}},
