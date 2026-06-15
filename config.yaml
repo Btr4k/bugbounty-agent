@@ -79,6 +79,7 @@ scanning:
     nuclei:
       enabled: true
       severity: []  # Empty runs actionable severities: critical, high, medium, low
+      tags: ["exposure", "misconfig", "takeover", "default-login"] # High-signal default profile
       templates_path: "" # Empty uses Nuclei's installed templates
     httpx:
       enabled: true

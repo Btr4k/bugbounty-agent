@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.2.6
+
+- Feed all current Katana crawl URLs into parameter-based scanners when
+  historical URL providers return no data.
+- Run the primary Nuclei profile before the SQLi profile deterministically.
+- Use a high-signal default Nuclei profile focused on exposures,
+  misconfigurations, takeovers, and default credentials so the scan completes
+  instead of timing out across every installed template.
+- Report discovered URL and raw tool-candidate counts, with a prominent warning
+  when an incomplete scan produces no candidates.
+
 ## v2.2.5
 
 - Treat every unsuccessful Nuclei exit as a partial scan failure, even when

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
@@ -93,6 +94,30 @@ func TestParseCertSpotterNames(t *testing.T) {
 func TestParseCertSpotterNamesInvalidJSON(t *testing.T) {
 	if _, err := parseCertSpotterNames([]byte("not json")); err == nil {
 		t.Fatal("expected error on invalid JSON")
+	}
+}
+
+func TestRunKatanaReturnsCrawlURLsAndJSSubset(t *testing.T) {
+	binDir := t.TempDir()
+	writeExecutable(t, filepath.Join(binDir, "katana"), `#!/bin/sh
+echo "https://example.com/search?id=1"
+echo "https://example.com/app.js?v=2"
+echo "https://cdn.example.net/vendor.js"
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	log := logger.New(false)
+	defer log.Close()
+	engine := NewEngine(&config.Config{}, log)
+	urls, jsURLs, err := engine.runKatana(context.Background(), []string{"example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(urls, "https://example.com/search?id=1") {
+		t.Fatalf("crawl URL missing: %v", urls)
+	}
+	if !slices.Contains(jsURLs, "https://example.com/app.js?v=2") {
+		t.Fatalf("JS URL missing: %v", jsURLs)
 	}
 }
 
