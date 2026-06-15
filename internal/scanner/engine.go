@@ -71,6 +71,28 @@ func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
 	}
 }
 
+func (e *Engine) boundedRateLimit(toolMaximum int) int {
+	rate := e.cfg.Scanning.RateLimit
+	if rate <= 0 {
+		rate = 1
+	}
+	if toolMaximum > 0 && rate > toolMaximum {
+		rate = toolMaximum
+	}
+	return rate
+}
+
+func (e *Engine) boundedThreads(toolMaximum int) int {
+	threads := e.cfg.Scanning.Threads
+	if threads <= 0 {
+		threads = 1
+	}
+	if toolMaximum > 0 && threads > toolMaximum {
+		threads = toolMaximum
+	}
+	return threads
+}
+
 func (e *Engine) appendHeaderArgs(args []string, flag string, targets ...string) []string {
 	headers := e.cfg.Authentication.HeaderValuesForTargets(targets...)
 	if e.log != nil && e.cfg.Authentication.Configured() && len(headers) == 0 {
@@ -143,7 +165,12 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			}
 			if attempt < 2 {
 				e.log.Warnf("Httpx attempt %d/2 returned no hosts — retrying in 3s", attempt)
-				time.Sleep(3 * time.Second)
+				select {
+				case <-ctx.Done():
+					httpxCancel()
+					return results, ctx.Err()
+				case <-time.After(3 * time.Second):
+				}
 			}
 		}
 		httpxCancel()
@@ -164,8 +191,10 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		e.log.ToolSkip("Httpx", "disabled in config")
 	}
 
-	// Fallback: if httpx returned no live hosts, use raw subdomains with https:// prefix
-	if len(liveHosts) == 0 {
+	// When httpx is intentionally disabled, raw targets are the user's chosen
+	// input. When it is enabled but finds no live hosts, do not turn that failure
+	// into blind active scanning against every discovered hostname.
+	if len(liveHosts) == 0 && !e.cfg.Scanning.Tools.Httpx.Enabled {
 		for _, sub := range reconResults.Subdomains {
 			if strings.HasPrefix(sub, "http://") || strings.HasPrefix(sub, "https://") {
 				liveHosts = append(liveHosts, sub)
@@ -173,7 +202,9 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 				liveHosts = append(liveHosts, "https://"+sub)
 			}
 		}
-		e.log.PhaseNote("No live hosts from httpx, falling back to raw subdomains")
+		e.log.PhaseNote("Httpx disabled: using raw in-scope subdomains")
+	} else if len(liveHosts) == 0 {
+		e.log.PhaseNote("No live hosts confirmed by httpx; active host scanning will be skipped")
 	}
 
 	// ════════════════════════════════════════════════
@@ -548,13 +579,7 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 
 	args = append(args, "-etags", "dos,fuzz,intrusive,iot")
 
-	concurrency := e.cfg.Scanning.Threads
-	if concurrency < 25 {
-		concurrency = 25
-	}
-	if concurrency > 100 {
-		concurrency = 100
-	}
+	concurrency := e.boundedThreads(100)
 	args = append(args, "-c", fmt.Sprintf("%d", concurrency))
 	args = append(args, "-rl", fmt.Sprintf("%d", e.cfg.Scanning.RateLimit))
 	args = append(args, "-timeout", "10")
@@ -765,11 +790,11 @@ func extractHostname(rawURL string) string {
 	return host
 }
 
-// resolveHttpxBinary finds the ProjectDiscovery httpx binary.
+// ResolveHttpxBinary finds the ProjectDiscovery httpx binary.
 // The system may have a Python-based `httpx` CLI at /usr/local/bin/httpx that
 // conflicts with ProjectDiscovery's httpx. We detect the correct one by
 // preferring Go bin paths, then falling back to PATH resolution.
-func resolveHttpxBinary() string {
+func ResolveHttpxBinary() (string, bool) {
 	// Prefer Go bin locations where projectdiscovery tools are installed
 	candidates := []string{
 		os.Getenv("GOPATH") + "/bin/httpx",
@@ -781,19 +806,27 @@ func resolveHttpxBinary() string {
 		if p == "/bin/httpx" || p == "//bin/httpx" {
 			continue
 		}
-		if _, err := os.Stat(p); err == nil {
-			// Verify it's the ProjectDiscovery version by checking for -l flag support
-			out, _ := exec.Command(p, "-version").CombinedOutput()
-			if strings.Contains(string(out), "projectdiscovery") {
-				return p
-			}
+		if isProjectDiscoveryHttpx(p) {
+			return p, true
 		}
 	}
-	// Fallback to PATH — might be wrong but let it fail naturally
 	if p, err := exec.LookPath("httpx"); err == nil {
-		return p
+		if isProjectDiscoveryHttpx(p) {
+			return p, true
+		}
 	}
-	return "httpx"
+	return "", false
+}
+
+func isProjectDiscoveryHttpx(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
+	return err == nil && strings.Contains(strings.ToLower(string(out)), "projectdiscovery")
 }
 
 func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []string, error) {
@@ -809,7 +842,10 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 	}
 
 	// Resolve the correct httpx binary (ProjectDiscovery, not Python httpx)
-	httpxBin := resolveHttpxBinary()
+	httpxBin, ok := ResolveHttpxBinary()
+	if !ok {
+		return nil, nil, fmt.Errorf("ProjectDiscovery httpx binary not found")
+	}
 	e.log.Debugf("Httpx binary: %s", httpxBin)
 	e.log.Debugf("Httpx scanning %d targets", len(targets))
 
@@ -830,8 +866,8 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 		"-json",
 		"-silent",
 		"-td",
-		"-t", fmt.Sprintf("%d", e.cfg.Scanning.Threads),
-		"-rl", fmt.Sprintf("%d", e.cfg.Scanning.RateLimit),
+		"-t", fmt.Sprintf("%d", e.boundedThreads(100)),
+		"-rl", fmt.Sprintf("%d", e.boundedRateLimit(0)),
 	}
 	if e.cfg.Scanning.Tools.Httpx.StatusCode {
 		args = append(args, "-sc")

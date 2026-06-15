@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const appVersion = "2.2.3"
+const appVersion = "2.2.4"
 
 var (
 	cfgFile      string
@@ -111,7 +111,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	}
 
 	// Validate required tools are installed before wasting time
-	ensureGoBinOnPath()
+	ensureToolBinsOnPath()
 	if err := checkTools(cfg, log); err != nil {
 		return err
 	}
@@ -462,7 +462,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		jsAnalyzer := analyzer.NewEngine(cfg, log)
 		aiFindings, err := jsAnalyzer.AnalyzeJSFiles(ctx, jsInput)
 		if err != nil {
-			return fmt.Errorf("JS AI analysis failed: %w", err)
+			yellow.Printf("  ⚠️  JS AI analysis completed partially: %v\n", err)
+			scanResults.Complete = false
+			scanResults.FailedTools = append(scanResults.FailedTools, "ai-js-analysis")
 		}
 
 		// Merge regex + AI findings (dedup by core secret value, not raw evidence string)
@@ -554,7 +556,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	analyzerEngine := analyzer.NewEngine(cfg, log)
 	analysisResults, err := analyzerEngine.Analyze(ctx, scanResults)
 	if err != nil {
-		return fmt.Errorf("validation pipeline failed: %w", err)
+		yellow.Printf("  ⚠️  Validation pipeline completed partially: %v\n", err)
+		scanResults.Complete = false
+		scanResults.FailedTools = append(scanResults.FailedTools, "ai-validation")
 	}
 
 	analysisDuration := time.Since(phaseStart)
@@ -590,14 +594,17 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func ensureGoBinOnPath() {
+func ensureToolBinsOnPath() {
 	paths := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
 	seen := make(map[string]bool, len(paths))
 	for _, path := range paths {
 		seen[path] = true
 	}
 	home, _ := os.UserHomeDir()
-	candidates := []string{filepath.Join(home, "go", "bin")}
+	candidates := []string{
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".local", "bin"),
+	}
 	if goPath := os.Getenv("GOPATH"); goPath != "" {
 		candidates = append(candidates, filepath.Join(goPath, "bin"))
 	}
@@ -630,7 +637,7 @@ func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{})
 		{"dalfox", runScan && cfg.Scanning.Tools.Dalfox.Enabled, "go install github.com/hahwul/dalfox/v2@latest"},
 		{"ffuf", runScan && cfg.Scanning.Tools.Ffuf.Enabled, "go install github.com/ffuf/ffuf/v2@latest"},
 		{"nmap", runScan && cfg.Scanning.Tools.Nmap.Enabled, "apt install nmap"},
-		{"arjun", runScan && cfg.Scanning.Tools.Arjun.Enabled, "pip3 install arjun"},
+		{"arjun", runScan && cfg.Scanning.Tools.Arjun.Enabled, "pipx install arjun"},
 	}
 
 	missing := []string{}
@@ -655,29 +662,8 @@ func toolAvailable(name string) bool {
 		_, err := exec.LookPath(name)
 		return err == nil
 	}
-
-	home, _ := os.UserHomeDir()
-	candidates := []string{filepath.Join(home, "go", "bin", "httpx")}
-	if goPath := os.Getenv("GOPATH"); goPath != "" {
-		candidates = append(candidates, filepath.Join(goPath, "bin", "httpx"))
-	}
-	if path, err := exec.LookPath("httpx"); err == nil {
-		candidates = append(candidates, path)
-	}
-	seen := make(map[string]bool)
-	for _, candidate := range candidates {
-		if candidate == "" || seen[candidate] {
-			continue
-		}
-		seen[candidate] = true
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		output, err := exec.CommandContext(ctx, candidate, "-version").CombinedOutput()
-		cancel()
-		if err == nil && strings.Contains(strings.ToLower(string(output)), "projectdiscovery") {
-			return true
-		}
-	}
-	return false
+	_, ok := scanner.ResolveHttpxBinary()
+	return ok
 }
 
 // validateDomain checks that the domain only contains valid characters
