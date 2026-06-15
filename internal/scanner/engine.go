@@ -282,6 +282,11 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := runWithRetry(nucleiCtx, e.log, "Nuclei", 3, func(rctx context.Context) ([]Finding, error) {
 				return e.runNucleiDirect(rctx, nucleiTargets)
 			})
+			if len(findings) > 0 {
+				mu.Lock()
+				results.Findings = append(results.Findings, findings...)
+				mu.Unlock()
+			}
 			if err != nil {
 				e.log.ToolFail("Nuclei", err)
 				recordToolError("nuclei", err)
@@ -292,9 +297,6 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			if len(findings) > 0 {
 				e.log.Debugf("Nuclei: found %d total findings (all severities included)", len(findings))
 			}
-			mu.Lock()
-			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
 		}()
 	} else {
 		e.log.ToolSkip("Nuclei", "disabled in config")
@@ -350,6 +352,11 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			defer sqliCancel()
 
 			findings, err := e.runSQLiScan(sqliCtx, liveHosts, reconResults.URLs)
+			if len(findings) > 0 {
+				mu.Lock()
+				results.Findings = append(results.Findings, findings...)
+				mu.Unlock()
+			}
 			if err != nil {
 				e.log.ToolFail("SQLi-Scan", err)
 				recordToolError("sqli", err)
@@ -357,9 +364,6 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			}
 
 			e.log.ToolDone("SQLi-Scan", len(findings), time.Since(start))
-			mu.Lock()
-			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
 		}()
 	}
 
@@ -541,12 +545,14 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 		"-jsonl",
 		"-silent",
 		"-irr",
-		"-stats",
-		"-si", "30",
 		"-fhr", // follow redirects only on the same host
 	}
 	if len(e.cfg.Scanning.Tools.Nuclei.Severity) > 0 {
 		args = append(args, "-severity", strings.Join(e.cfg.Scanning.Tools.Nuclei.Severity, ","))
+	} else {
+		// Informational templates are intentionally excluded from analysis and
+		// reports, so do not spend the scan budget running them by default.
+		args = append(args, "-severity", "critical,high,medium,low")
 	}
 
 	templatesBase := e.cfg.Scanning.Tools.Nuclei.TemplatesPath
@@ -596,10 +602,7 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 
 	output, err := cmd.Output()
 	if err != nil {
-		e.log.Debugf("Nuclei finished with error (might be normal): %v", err)
-		if len(output) == 0 {
-			return nil, fmt.Errorf("nuclei failed: %w: %s", err, e.cfg.Redact(strings.TrimSpace(stderrBuf.String())))
-		}
+		e.log.Debugf("Nuclei finished with error: %v", err)
 	}
 
 	// Parse JSON output (same parsing as runNuclei)
@@ -708,8 +711,18 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 			},
 		})
 	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return findings, fmt.Errorf("failed to parse nuclei output: %w", scanErr)
+	}
 
 	e.log.Debugf("Nuclei parsed %d findings", len(findings))
+	if err != nil {
+		detail := e.cfg.Redact(strings.TrimSpace(stderrBuf.String()))
+		if detail != "" {
+			return findings, fmt.Errorf("nuclei failed after %d partial finding(s): %w: %s", len(findings), err, detail)
+		}
+		return findings, fmt.Errorf("nuclei failed after %d partial finding(s): %w", len(findings), err)
+	}
 	return findings, nil
 }
 
@@ -730,17 +743,21 @@ func runWithRetry(
 	fn func(context.Context) ([]Finding, error),
 ) ([]Finding, error) {
 	var lastErr error
+	var partialFindings []Finding
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return partialFindings, ctx.Err()
 		default:
 		}
 
 		findings, err := fn(ctx)
 		if err == nil {
-			return findings, nil
+			return append(partialFindings, findings...), nil
+		}
+		if len(findings) > 0 {
+			partialFindings = append(partialFindings, findings...)
 		}
 
 		lastErr = err
@@ -755,13 +772,13 @@ func runWithRetry(
 
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return partialFindings, ctx.Err()
 			case <-time.After(wait):
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("%s failed after %d attempts: %w", toolName, maxRetries, lastErr)
+	return partialFindings, fmt.Errorf("%s failed after %d attempts: %w", toolName, maxRetries, lastErr)
 }
 
 // deduplicateURLs deduplicates URLs (case-insensitive)

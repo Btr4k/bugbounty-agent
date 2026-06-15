@@ -1,12 +1,15 @@
 package scanner
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
@@ -38,6 +41,61 @@ func TestBoundedToolLimitsRespectGlobalConfig(t *testing.T) {
 	}
 	if got := engine.boundedThreads(15); got != 7 {
 		t.Fatalf("boundedThreads = %d, want 7", got)
+	}
+}
+
+func TestRunNucleiDirectReturnsErrorWhenCommandWritesNonJSONBeforeTimeout(t *testing.T) {
+	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\necho '[WRN] still running'\nexec sleep 5\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	findings, err := engine.runNucleiDirect(ctx, []string{"https://example.com"})
+	if err == nil {
+		t.Fatal("runNucleiDirect accepted a timed-out nuclei process as successful")
+	}
+	if len(findings) != 0 {
+		t.Fatalf("unexpected findings: %#v", findings)
+	}
+}
+
+func TestRunSQLiScanPreservesPartialFindingsOnFailure(t *testing.T) {
+	output := `{"template-id":"partial-sqli","info":{"name":"Partial SQLi","severity":"high"},"type":"http","host":"example.com","matched-at":"https://example.com/search?id=1"}` + "\n"
+	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\nprintf '%s' '"+output+"'\nexit 1\n")
+
+	findings, err := engine.runSQLiScan(context.Background(), []string{"https://example.com"}, nil)
+	if err == nil {
+		t.Fatal("runSQLiScan accepted a failed nuclei process as successful")
+	}
+	if len(findings) != 1 || findings[0].Title != "Partial SQLi" {
+		t.Fatalf("partial SQLi findings were lost: %#v", findings)
+	}
+}
+
+func TestRunNucleiDirectPreservesPartialFindingsOnFailure(t *testing.T) {
+	output := `{"template-id":"partial-test","info":{"name":"Partial Finding","severity":"high"},"type":"http","host":"example.com","matched-at":"https://example.com/test"}` + "\n"
+	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\nprintf '%s' '"+output+"'\nexit 1\n")
+
+	findings, err := engine.runNucleiDirect(context.Background(), []string{"https://example.com"})
+	if err == nil {
+		t.Fatal("runNucleiDirect accepted a failed nuclei process as successful")
+	}
+	if len(findings) != 1 || findings[0].Title != "Partial Finding" {
+		t.Fatalf("partial findings were lost: %#v", findings)
+	}
+}
+
+func testEngineWithFakeNuclei(t *testing.T, script string) *Engine {
+	t.Helper()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "nuclei"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+"/bin")
+	log := logger.New(false)
+	t.Cleanup(log.Close)
+	return &Engine{
+		cfg: &config.Config{Scanning: config.ScanningConfig{Threads: 1, RateLimit: 1}},
+		log: log,
 	}
 }
 
