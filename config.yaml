@@ -78,7 +78,7 @@ scanning:
   tools:
     nuclei:
       enabled: true
-      severity: []  # No filter - run all templates, findings keep their real severity
+      severity: []  # Empty runs actionable severities: critical, high, medium, low
       templates_path: "" # Empty uses Nuclei's installed templates
     httpx:
       enabled: true

@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.2.5
+
+- Treat every unsuccessful Nuclei exit as a partial scan failure, even when
+  Nuclei writes warnings or progress text to standard output.
+- Preserve and report valid partial Nuclei and SQLi findings captured before a
+  timeout or subprocess failure.
+- Keep Nuclei's JSONL output channel free of unused progress statistics.
+- Skip informational Nuclei templates by default because informational findings
+  are intentionally excluded from analysis and reports.
+
 ## v2.2.4
 
 - Reliably detect the ProjectDiscovery `httpx` binary when a Python `httpx`

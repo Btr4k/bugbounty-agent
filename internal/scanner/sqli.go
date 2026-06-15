@@ -100,11 +100,10 @@ func (e *Engine) runSQLiScan(ctx context.Context, liveHosts []string, allURLs []
 
 	// ── Strategy 1: Nuclei SQLi templates on live hosts ──
 	nucleiFindings, err := e.runNucleiSQLi(ctx, liveHosts)
+	findings = append(findings, nucleiFindings...)
 	if err != nil {
 		e.log.Warnf("Nuclei SQLi scan error: %v", err)
 		scanErrors = append(scanErrors, err)
-	} else {
-		findings = append(findings, nucleiFindings...)
 	}
 
 	// ── Strategy 2: Parameter-targeted nuclei fuzzing ──
@@ -119,11 +118,10 @@ func (e *Engine) runSQLiScan(ctx context.Context, liveHosts []string, allURLs []
 		}
 		e.log.Debugf("SQLi: found %d gf-filtered param URLs to fuzz", len(sqliURLs))
 		paramFindings, err := e.runNucleiSQLiFuzz(ctx, sqliURLs)
+		findings = append(findings, paramFindings...)
 		if err != nil {
 			e.log.Warnf("Nuclei SQLi fuzz error: %v", err)
 			scanErrors = append(scanErrors, err)
-		} else {
-			findings = append(findings, paramFindings...)
 		}
 	} else {
 		e.log.Debugf("SQLi: no SQL-prone parameter URLs found — skipping param fuzzing")
@@ -193,11 +191,12 @@ func (e *Engine) runNucleiSQLi(ctx context.Context, hosts []string) ([]Finding, 
 	cmd.Stderr = &stderrBuf
 
 	output, err := cmd.Output()
-	if err != nil && len(output) == 0 {
-		return nil, fmt.Errorf("nuclei SQLi scan failed: %w", err)
+	findings := e.parseNucleiOutput(output)
+	if err != nil {
+		return findings, fmt.Errorf("nuclei SQLi scan failed after %d partial finding(s): %w", len(findings), err)
 	}
 
-	return e.parseNucleiOutput(output), nil
+	return findings, nil
 }
 
 // runNucleiSQLiFuzz runs nuclei fuzzing templates on gf-filtered parameterized URLs.
@@ -251,11 +250,12 @@ func (e *Engine) runNucleiSQLiFuzz(ctx context.Context, paramURLs []string) ([]F
 	cmd.Stderr = &stderrBuf
 
 	output, err := cmd.Output()
-	if err != nil && len(output) == 0 {
-		return nil, fmt.Errorf("nuclei SQLi fuzz failed: %w", err)
+	findings := e.parseNucleiOutput(output)
+	if err != nil {
+		return findings, fmt.Errorf("nuclei SQLi fuzz failed after %d partial finding(s): %w", len(findings), err)
 	}
 
-	return e.parseNucleiOutput(output), nil
+	return findings, nil
 }
 
 // parseNucleiOutput parses nuclei JSONL output into Finding structs.
