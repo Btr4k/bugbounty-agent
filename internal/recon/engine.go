@@ -168,6 +168,9 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 				return
 			}
 			e.log.ToolDone("WaybackURLs", len(urls), time.Since(start))
+			if len(urls) == 0 {
+				e.log.Warnf("WaybackURLs returned no historical URLs; Katana crawl URLs will be used as the active-scan fallback")
+			}
 			mu.Lock()
 			results.URLs = append(results.URLs, urls...)
 			mu.Unlock()
@@ -248,13 +251,14 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	if e.cfg.Recon.Tools.Katana {
 		e.log.ToolStart("Katana", "crawling for JS files...")
 		start := time.Now()
-		kURLs, err := e.runKatana(ctx, results.Subdomains)
+		kURLs, kJSURLs, err := e.runKatana(ctx, results.Subdomains)
 		if err != nil {
 			e.log.ToolFail("Katana", err)
 			recordToolError("katana", err)
 		} else {
 			e.log.ToolDone("Katana", len(kURLs), time.Since(start))
-			jsURLs = append(jsURLs, kURLs...)
+			results.URLs = append(results.URLs, kURLs...)
+			jsURLs = append(jsURLs, kJSURLs...)
 		}
 	} else {
 		e.log.ToolSkip("Katana", "disabled in config")
@@ -268,6 +272,11 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			jsURLs = append(jsURLs, waybackJS...)
 		}
 	}
+
+	// Katana supplements historical sources with current crawl URLs. This keeps
+	// parameter-based scanners useful when archive providers return no data.
+	results.URLs = e.deduplicate(results.URLs)
+	results.URLs = policy.FilterURLs(results.URLs)
 
 	// Deduplicate JS URLs
 	jsURLs = e.deduplicate(jsURLs)
@@ -673,12 +682,13 @@ func parseCertSpotterNames(body []byte) ([]string, error) {
 // JS File Extraction Functions
 // ═══════════════════════════════════════════════════════════
 
-// runKatana crawls subdomains to discover JavaScript file URLs
-func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, error) {
+// runKatana crawls subdomains and returns all discovered URLs plus the JS subset.
+func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, []string, error) {
 	if !isToolInstalled("katana") {
-		return nil, fmt.Errorf("katana not installed (run: go install github.com/projectdiscovery/katana/cmd/katana@latest)")
+		return nil, nil, fmt.Errorf("katana not installed (run: go install github.com/projectdiscovery/katana/cmd/katana@latest)")
 	}
 
+	var crawlURLs []string
 	var jsURLs []string
 
 	// Limit subdomains for katana (it crawls each one)
@@ -690,7 +700,7 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	// Write targets to temp file
 	tmpFile, err := os.CreateTemp("", "katana-targets-*.txt")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
+		return nil, nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer os.Remove(tmpFile.Name())
 
@@ -730,19 +740,23 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	if err != nil {
 		// Katana might timeout but still produce results
 		if len(output) == 0 {
-			return nil, fmt.Errorf("katana error: %w", err)
+			return nil, nil, fmt.Errorf("katana error: %w", err)
 		}
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
-		url := strings.TrimSpace(scanner.Text())
-		if url != "" && strings.HasSuffix(strings.ToLower(strings.Split(url, "?")[0]), ".js") && !isNoiseJS(url) {
-			jsURLs = append(jsURLs, url)
+		discoveredURL := strings.TrimSpace(scanner.Text())
+		if discoveredURL == "" {
+			continue
+		}
+		crawlURLs = append(crawlURLs, discoveredURL)
+		if strings.HasSuffix(strings.ToLower(strings.Split(discoveredURL, "?")[0]), ".js") && !isNoiseJS(discoveredURL) {
+			jsURLs = append(jsURLs, discoveredURL)
 		}
 	}
 
-	return jsURLs, nil
+	return crawlURLs, jsURLs, nil
 }
 
 // extractJSFromURLs filters JavaScript URLs from a list of discovered URLs

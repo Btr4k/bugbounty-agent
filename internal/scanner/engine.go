@@ -212,18 +212,20 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	// ════════════════════════════════════════════════
 	var wg sync.WaitGroup
 
-	// The main Nuclei scan and the SQLi scan both spawn a nuclei subprocess that
-	// buffers all output in memory. Running them concurrently doubles peak memory
-	// and triggered the OOM killer ("signal: killed") on constrained hosts. This
-	// mutex serializes the two heavy nuclei runs while ffuf/arjun/dalfox still run
-	// in parallel alongside them.
-	var nucleiMu sync.Mutex
+	// Run the primary high-signal Nuclei profile before the narrower SQLi
+	// profile. A mutex allowed SQLi to win the race and consume the first scan
+	// budget, delaying the more useful primary scan.
+	nucleiDone := make(chan struct{})
+	if !e.cfg.Scanning.Tools.Nuclei.Enabled {
+		close(nucleiDone)
+	}
 
 	// Nuclei Scanning — uses full URLs from httpx (preserves ports like :8080, :8443)
 	if e.cfg.Scanning.Tools.Nuclei.Enabled {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer close(nucleiDone)
 
 			// Deduplicate live hosts (full URLs from httpx)
 			nucleiTargets := deduplicateURLs(liveHosts)
@@ -270,10 +272,6 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 			e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d live targets with high-value templates...", len(nucleiTargets)))
 			start := time.Now()
-
-			// Serialize against the SQLi nuclei run to bound peak memory.
-			nucleiMu.Lock()
-			defer nucleiMu.Unlock()
 
 			nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
 			defer nucleiCancel()
@@ -337,15 +335,13 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		go func() {
 			defer wg.Done()
 
+			// Wait for the primary scan before starting another Nuclei process.
+			// The timeout begins after the wait, so SQLi keeps its full budget.
+			<-nucleiDone
 			sqliURLCount := len(filterSQLiProneURLs(reconResults.URLs))
 			e.log.ToolStart("SQLi-Scan",
 				fmt.Sprintf("nuclei sqli templates on %d hosts + %d gf-filtered param URLs...",
 					len(liveHosts), sqliURLCount))
-
-			// Wait for the main nuclei run to finish before starting our own, then
-			// start the timeout budget — so blocking on the lock doesn't eat it.
-			nucleiMu.Lock()
-			defer nucleiMu.Unlock()
 			start := time.Now()
 
 			sqliCtx, sqliCancel := context.WithTimeout(ctx, 12*time.Minute)
@@ -554,6 +550,12 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 		// reports, so do not spend the scan budget running them by default.
 		args = append(args, "-severity", "critical,high,medium,low")
 	}
+	tags := e.cfg.Scanning.Tools.Nuclei.Tags
+	if len(tags) == 0 {
+		tags = []string{"exposure", "misconfig", "takeover", "default-login"}
+	}
+	args = append(args, "-tags", strings.Join(tags, ","))
+	args = append(args, "-pt", "http,ssl,dns")
 
 	templatesBase := e.cfg.Scanning.Tools.Nuclei.TemplatesPath
 	if templatesBase != "" {

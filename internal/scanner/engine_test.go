@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,6 +82,30 @@ func TestRunNucleiDirectPreservesPartialFindingsOnFailure(t *testing.T) {
 	}
 	if len(findings) != 1 || findings[0].Title != "Partial Finding" {
 		t.Fatalf("partial findings were lost: %#v", findings)
+	}
+}
+
+func TestRunNucleiDirectUsesHighSignalDefaultProfile(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "args.txt")
+	t.Setenv("NUCLEI_ARGS_CAPTURE", capture)
+	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$NUCLEI_ARGS_CAPTURE\"\n")
+
+	if _, err := engine.runNucleiDirect(context.Background(), []string{"https://example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(args)
+	for _, expected := range []string{
+		"exposure,misconfig,takeover,default-login",
+		"http,ssl,dns",
+		"critical,high,medium,low",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Errorf("nuclei args missing %q:\n%s", expected, got)
+		}
 	}
 }
 

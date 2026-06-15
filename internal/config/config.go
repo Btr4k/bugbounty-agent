@@ -117,6 +117,7 @@ type SQLiConfig struct {
 type NucleiConfig struct {
 	Enabled       bool     `yaml:"enabled" mapstructure:"enabled"`
 	Severity      []string `yaml:"severity" mapstructure:"severity"`
+	Tags          []string `yaml:"tags" mapstructure:"tags"`
 	TemplatesPath string   `yaml:"templates_path" mapstructure:"templates_path"`
 }
 

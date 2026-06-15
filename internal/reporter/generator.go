@@ -59,8 +59,10 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Date**: %s  \n", time.Now().Format("2006-01-02 15:04")))
 	report.WriteString(fmt.Sprintf("**Target**: %s  \n", target))
 	report.WriteString(fmt.Sprintf("**Subdomains Found**: %d  \n", len(reconResults.Subdomains)))
+	report.WriteString(fmt.Sprintf("**URLs Discovered**: %d  \n", len(reconResults.URLs)))
 	report.WriteString(fmt.Sprintf("**Reconnaissance Complete**: %t  \n", reconResults.Complete))
 	report.WriteString(fmt.Sprintf("**Vulnerability Scan Complete**: %t  \n", scanResults.Complete))
+	report.WriteString(fmt.Sprintf("**Raw Tool Candidates**: %d  \n", len(scanResults.Findings)))
 	report.WriteString(fmt.Sprintf("**Confirmed Findings**: %d  \n", len(analysis.ValidatedFindings)))
 	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n\n", len(analysis.ManualReview)))
 
@@ -100,6 +102,9 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n", analysis.Stats.ManualReview))
 	report.WriteString(fmt.Sprintf("**False Positives Filtered**: %d  \n", analysis.Stats.FalsePositives))
 	report.WriteString(fmt.Sprintf("**Attack Surface**: %d subdomains discovered  \n\n", len(reconResults.Subdomains)))
+	if !scanResults.Complete && len(scanResults.Findings) == 0 {
+		report.WriteString("> ⚠️ **No vulnerability candidates were produced by an incomplete scan.** This is a coverage failure, not evidence that the target is secure.  \n\n")
+	}
 	if len(reconResults.FailedTools)+len(scanResults.FailedTools) > 0 {
 		report.WriteString("**Failed Optional Tools**: ")
 		failed := append([]string(nil), reconResults.FailedTools...)
