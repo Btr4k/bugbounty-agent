@@ -108,7 +108,9 @@ scanning:
       enabled: true      # Uses focused Nuclei SQLi templates and parameter filtering
       max_urls: 50       # Max gf-filtered param URLs to test
     arjun:
-      enabled: true      # Hidden parameter discovery — feeds discovered params into dalfox
+      enabled: false     # DISABLED: too slow to complete (3min/host budget exceeded with no output
+                         # on real targets) and only feeds dalfox. Was adding latency + noise without
+                         # producing results. Re-enable only if you accept the per-host time cost.
       max_targets: 15    # Top N hosts to discover hidden params on
 # AI Analysis
 analysis:

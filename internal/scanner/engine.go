@@ -112,6 +112,29 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		mu.Unlock()
 	}
 
+	// recordTimeout marks the scan partial when a tool was cut short by its own
+	// deadline. This is distinct from a hard failure: partial findings are kept
+	// and the tool is reported honestly as "(timed out)" instead of being silently
+	// presented as a clean completion.
+	recordTimeout := func(tool string) {
+		mu.Lock()
+		toolErrors = append(toolErrors, fmt.Errorf("%s: timed out before finishing (results are partial)", tool))
+		results.Complete = false
+		results.FailedTools = append(results.FailedTools, tool+" (timed out)")
+		mu.Unlock()
+	}
+
+	// timedOut reports whether a tool run ended because its context deadline was
+	// hit — either surfaced as an error, or as a SIGKILL with partial output that
+	// returned no error. Both mean the scan did not finish, not that it is clean.
+	timedOut := func(toolCtx context.Context, err error) bool {
+		if toolCtx.Err() == context.DeadlineExceeded {
+			return true
+		}
+		return err != nil && (errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "signal: killed"))
+	}
+
 	// Show what tools will run
 	totalTargets := len(reconResults.Subdomains)
 	e.log.PhaseNote(fmt.Sprintf("Scanning %d subdomains with enabled tools...", totalTargets))
@@ -251,19 +274,25 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			findings, err := runWithRetry(nucleiCtx, e.log, "Nuclei", 3, func(rctx context.Context) ([]Finding, error) {
 				return e.runNucleiDirect(rctx, nucleiTargets)
 			})
-			if err != nil {
-				e.log.ToolFail("Nuclei", err)
-				recordToolError("nuclei", err)
-				return
-			}
 
-			e.log.ToolDone("Nuclei", len(findings), time.Since(start))
-			if len(findings) > 0 {
-				e.log.Debugf("Nuclei: found %d total findings (all severities included)", len(findings))
-			}
+			// Keep any partial findings produced before a timeout/kill.
 			mu.Lock()
 			results.Findings = append(results.Findings, findings...)
 			mu.Unlock()
+
+			switch {
+			case timedOut(nucleiCtx, err):
+				e.log.Warnf("Nuclei timed out after %s — scan is partial, kept %d findings", time.Since(start).Round(time.Second), len(findings))
+				recordTimeout("nuclei")
+			case err != nil:
+				e.log.ToolFail("Nuclei", err)
+				recordToolError("nuclei", err)
+			default:
+				e.log.ToolDone("Nuclei", len(findings), time.Since(start))
+				if len(findings) > 0 {
+					e.log.Debugf("Nuclei: found %d total findings (all severities included)", len(findings))
+				}
+			}
 		}()
 	} else {
 		e.log.ToolSkip("Nuclei", "disabled in config")
@@ -319,16 +348,23 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			defer sqliCancel()
 
 			findings, err := e.runSQLiScan(sqliCtx, liveHosts, reconResults.URLs)
-			if err != nil {
-				e.log.ToolFail("SQLi-Scan", err)
-				recordToolError("sqli", err)
-				return
-			}
 
-			e.log.ToolDone("SQLi-Scan", len(findings), time.Since(start))
+			// Keep partial findings — e.g. the template scan may have produced hits
+			// even when the optional fuzzing step was cut short by the deadline.
 			mu.Lock()
 			results.Findings = append(results.Findings, findings...)
 			mu.Unlock()
+
+			switch {
+			case timedOut(sqliCtx, err):
+				e.log.Warnf("SQLi-Scan timed out — scan is partial, kept %d findings", len(findings))
+				recordTimeout("sqli")
+			case err != nil:
+				e.log.ToolFail("SQLi-Scan", err)
+				recordToolError("sqli", err)
+			default:
+				e.log.ToolDone("SQLi-Scan", len(findings), time.Since(start))
+			}
 		}()
 	}
 
@@ -415,16 +451,24 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			defer dalfoxCancel()
 
 			findings, err := e.runDalfox(dalfoxCtx, allParamURLs)
-			if err != nil {
-				e.log.ToolFail("Dalfox", err)
-				recordToolError("dalfox", err)
-				return
-			}
 
-			e.log.ToolDone("Dalfox", len(findings), time.Since(start))
+			// Keep partial findings produced before any timeout/kill.
 			mu.Lock()
 			results.Findings = append(results.Findings, findings...)
 			mu.Unlock()
+
+			switch {
+			case timedOut(dalfoxCtx, err):
+				// Dalfox is often SIGKILLed at its deadline with partial output and
+				// no error — report that honestly instead of as a clean completion.
+				e.log.Warnf("Dalfox timed out — scan is partial, kept %d findings", len(findings))
+				recordTimeout("dalfox")
+			case err != nil:
+				e.log.ToolFail("Dalfox", err)
+				recordToolError("dalfox", err)
+			default:
+				e.log.ToolDone("Dalfox", len(findings), time.Since(start))
+			}
 		}()
 	} else {
 		e.log.ToolSkip("Dalfox", "disabled in config")

@@ -119,8 +119,8 @@ func (e *Engine) runArjunOnTarget(ctx context.Context, target string) ([]ArjunRe
 
 	args := []string{
 		"-u", target,
-		"--get",              // Test GET parameters
-		"--post",             // Test POST parameters
+		"-m", "GET", // HTTP method. Newer arjun removed the legacy --get/--post flags
+		// (they now error with "unrecognized arguments"); -m is the supported form.
 		"-oJ", tmpOut.Name(), // JSON output
 		"-t", "5", // Threads (balanced — arjun is already slow)
 		"--stable", // More accurate detection (fewer false positives)
