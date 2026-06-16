@@ -204,6 +204,21 @@ func (a *ClaudeAnalyzer) Analyze(ctx context.Context, scanResults *scanner.Resul
 		if err != nil {
 			a.log.Warnf("Failed to analyze batch %d-%d: %v", i, end, err)
 			batchErrors = append(batchErrors, fmt.Errorf("batch %d-%d: %w", i, end, err))
+			// Do NOT drop the findings: when the AI validator is unreachable
+			// (timeout, rate limit, malformed response), route the batch to
+			// manual review so the user still sees real tool candidates instead
+			// of them vanishing from the report.
+			for _, f := range batch {
+				analysis.ManualReview = append(analysis.ManualReview, ValidatedFinding{
+					Finding:         f,
+					IsValid:         false,
+					Decision:        "manual-review",
+					Confidence:      0.0,
+					EvidenceRefs:    evidenceReferences(f),
+					MissingEvidence: []string{"AI validation did not run (validator unavailable) — confirm this finding manually"},
+					AIAnalysis:      "Tool-reported candidate; the AI validation step failed for this batch, so it was not adjudicated.",
+				})
+			}
 			continue
 		}
 
@@ -404,6 +419,7 @@ func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindin
 			CybersecurityContext: f.CybersecurityContext,
 			BugBountyValue:       f.BugBountyValue,
 		}
+		vf = applyDeterministicReportability(vf)
 
 		gateDecision, gateReason := deterministicValidationDecision(original, f.Confidence, a.cfg.Analysis.MinConfidence)
 		if gateReason != "" {
@@ -429,6 +445,32 @@ func (a *ClaudeAnalyzer) parseValidationResponse(response string, originalFindin
 	}
 
 	return validated, manualReview, rejected, nil
+}
+
+func applyDeterministicReportability(vf ValidatedFinding) ValidatedFinding {
+	if result := preValidProtectedDiagnostic(vf.Finding); result.Outcome == PreValidReject {
+		vf.IsValid = false
+		vf.Decision = "rejected"
+		vf.Confidence = 1.0
+		vf.AIAnalysis = "[Deterministic Validation] " + result.Reason
+		vf.ImpactAssessment = "No exploitable impact was proven because the server denied access."
+		vf.BugBountyValue = "none"
+		return vf
+	}
+
+	if result := preValidSensitiveDebugExposure(vf.Finding); result.Outcome == PreValidDowngrade {
+		vf.Severity = result.NewSeverity
+		if strings.TrimSpace(vf.BugBountyValue) == "" || strings.EqualFold(vf.BugBountyValue, "low") {
+			vf.BugBountyValue = "medium"
+		}
+		if strings.TrimSpace(vf.AIAnalysis) == "" {
+			vf.AIAnalysis = "[Deterministic Validation] " + result.Reason
+		} else if !strings.Contains(vf.AIAnalysis, result.Reason) {
+			vf.AIAnalysis += "\n\n[Deterministic Validation] " + result.Reason
+		}
+	}
+
+	return vf
 }
 
 func evidenceReferences(f scanner.Finding) []string {
@@ -460,6 +502,10 @@ func normalizeDecision(decision string, isValid bool) string {
 }
 
 func deterministicValidationDecision(f scanner.Finding, confidence, configuredThreshold float64) (string, string) {
+	if result := preValidProtectedDiagnostic(f); result.Outcome == PreValidReject {
+		return "rejected", result.Reason
+	}
+
 	threshold := configuredThreshold
 	if threshold < 0.85 {
 		threshold = 0.85

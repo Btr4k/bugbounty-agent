@@ -74,9 +74,10 @@ func TestGenerateIncludesOnlyValidatedFindingsAndUsesPrivatePermissions(t *testi
 	if !strings.Contains(string(content), "curl -H") || !strings.Contains(string(content), "https://example.com") {
 		t.Fatal("redacted tool-captured reproduction command missing from report")
 	}
-	if !strings.Contains(string(content), "Validation Confidence**: 0.95") ||
+	if !strings.Contains(string(content), "**Confidence** | 0.95") ||
 		!strings.Contains(string(content), "Captured Request") ||
 		!strings.Contains(string(content), "Captured Response") ||
+		!strings.Contains(string(content), "Submission Ready Findings") ||
 		!strings.Contains(string(content), "Manual Review Required") ||
 		!strings.Contains(string(content), "Partial Assessment") ||
 		!strings.Contains(string(content), "certificate-transparency") {

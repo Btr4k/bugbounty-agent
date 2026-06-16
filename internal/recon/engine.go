@@ -682,6 +682,33 @@ func parseCertSpotterNames(body []byte) ([]string, error) {
 // JS File Extraction Functions
 // ═══════════════════════════════════════════════════════════
 
+// prioritizeKatanaTargets orders subdomains so the most likely application
+// hosts (api, app, portal, www, and short names) are crawled first when the
+// target list is capped. Sorting is stable, so equal-scored hosts keep order.
+func prioritizeKatanaTargets(subdomains []string) []string {
+	highValue := []string{"www.", "api.", "app.", "portal.", "admin.", "dashboard.", "account.", "my.", "secure.", "auth."}
+	out := append([]string(nil), subdomains...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return katanaScore(out[i], highValue) > katanaScore(out[j], highValue)
+	})
+	return out
+}
+
+func katanaScore(host string, highValue []string) int {
+	lower := strings.ToLower(host)
+	score := 0
+	for _, p := range highValue {
+		if strings.HasPrefix(lower, p) {
+			score += 10
+			break
+		}
+	}
+	if parts := strings.Split(lower, "."); len(parts) <= 3 {
+		score += 3
+	}
+	return score
+}
+
 // runKatana crawls subdomains and returns all discovered URLs plus the JS subset.
 func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, []string, error) {
 	if !isToolInstalled("katana") {
@@ -691,10 +718,12 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	var crawlURLs []string
 	var jsURLs []string
 
-	// Limit subdomains for katana (it crawls each one)
+	// Limit subdomains for katana (it crawls each one). Katana is the single
+	// most expensive recon step, so it is capped tightly — its only job here is
+	// to surface JS files and endpoints, which a shallow crawl already covers.
 	targets := subdomains
-	if len(targets) > 30 {
-		targets = targets[:30]
+	if len(targets) > 20 {
+		targets = prioritizeKatanaTargets(targets)[:20]
 	}
 
 	// Write targets to temp file
@@ -713,10 +742,12 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	}
 	tmpFile.Close()
 
-	// Adaptive timeout: scale based on number of targets, cap at 10 minutes
-	katanaTimeout := 2*time.Minute + time.Duration(len(targets))*15*time.Second
-	if katanaTimeout > 10*time.Minute {
-		katanaTimeout = 10 * time.Minute
+	// Adaptive timeout: scale based on number of targets, cap at 4 minutes.
+	// A depth-1 crawl over 20 hosts surfaces JS/endpoints quickly; the old
+	// depth-2 / 10-minute crawl dominated total runtime (9m+) for little extra.
+	katanaTimeout := 90*time.Second + time.Duration(len(targets))*8*time.Second
+	if katanaTimeout > 4*time.Minute {
+		katanaTimeout = 4 * time.Minute
 	}
 	e.log.Debugf("Katana: %d targets, timeout: %s", len(targets), katanaTimeout)
 	katanaCtx, cancel := context.WithTimeout(ctx, katanaTimeout)
@@ -726,9 +757,9 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 		"-list", tmpFile.Name(),
 		"-jsluice", // extract JS file URLs and inline JS endpoints (v1.1+)
 		"-silent",
-		"-d", "2", // crawl depth
-		"-c", "10", // concurrency
-		"-timeout", "10",
+		"-d", "1", // shallow crawl depth — enough to surface JS files and endpoints
+		"-c", "15", // concurrency
+		"-timeout", "8",
 		"-fs", "fqdn", // never crawl links on a different host
 		// No -em filter: Go-side filter handles .js suffix check,
 		// preserving URLs with query strings like app.js?v=123

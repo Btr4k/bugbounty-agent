@@ -92,26 +92,6 @@ type ScanningToolsConfig struct {
 	Httpx  HttpxConfig  `yaml:"httpx" mapstructure:"httpx"`
 	Nmap   NmapConfig   `yaml:"nmap" mapstructure:"nmap"`
 	Dalfox DalfoxConfig `yaml:"dalfox" mapstructure:"dalfox"`
-	SQLi   SQLiConfig   `yaml:"sqli" mapstructure:"sqli"`
-	Ffuf   FfufConfig   `yaml:"ffuf" mapstructure:"ffuf"`
-	Arjun  ArjunConfig  `yaml:"arjun" mapstructure:"arjun"`
-}
-
-type FfufConfig struct {
-	Enabled      bool   `yaml:"enabled" mapstructure:"enabled"`
-	WordlistPath string `yaml:"wordlist_path" mapstructure:"wordlist_path"`
-	MaxTargets   int    `yaml:"max_targets" mapstructure:"max_targets"`
-	VhostFuzzing bool   `yaml:"vhost_fuzzing" mapstructure:"vhost_fuzzing"`
-}
-
-type ArjunConfig struct {
-	Enabled    bool `yaml:"enabled" mapstructure:"enabled"`
-	MaxTargets int  `yaml:"max_targets" mapstructure:"max_targets"`
-}
-
-type SQLiConfig struct {
-	Enabled bool `yaml:"enabled" mapstructure:"enabled"`
-	MaxURLs int  `yaml:"max_urls" mapstructure:"max_urls"`
 }
 
 type NucleiConfig struct {

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.2.6-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.2.6" /></a>
+  <a href="https://github.com/Btr4k/bugbounty-agent/releases"><img src="https://img.shields.io/badge/version-2.3.0-0d1117?style=for-the-badge&labelColor=0d1117&color=58a6ff" alt="HawkEye version 2.3.0" /></a>
   <a href="https://github.com/Btr4k/bugbounty-agent/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Btr4k/bugbounty-agent/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" /></a>
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go 1.25 or later" />
   <img src="https://img.shields.io/badge/AI-DeepSeek%20%7C%20Claude%20%7C%20OpenAI%20%7C%20OpenRouter-a855f7?style=for-the-badge" alt="Supported AI providers" />
@@ -51,15 +51,14 @@ That's it. HawkEye handles the rest.
                                 │
                                 ▼
   ┌─────────────────────────────────────────────────────────────────┐
-  │  PHASE 2 — SCANNING (parallel)                                  │
+  │  PHASE 2 — SCANNING (sequential, one scanner at a time)         │
   │                                                                 │
-  │  httpx         → live host detection + status codes            │
-  │  nuclei        → CVEs · misconfigs · exposures · takeovers     │
-  │  ffuf          → verified sensitive-file exposure              │
-  │  dalfox        → reflected XSS with PoC                        │
-  │  arjun         → feeds undocumented params into Dalfox         │
-  │  nmap          → opt-in reconnaissance only                    │
-  │  SQLi scanner  → injection via parameter analysis              │
+  │  httpx   → live host detection + status codes                  │
+  │  nuclei  → CVEs · misconfigs · exposures · takeovers (alone)   │
+  │  dalfox  → reflected XSS with PoC                              │
+  │  nmap    → opt-in reconnaissance only                          │
+  │                                                                 │
+  │  Scanners run one at a time to avoid OOM kills on modest hosts. │
   └─────────────────────────────┬───────────────────────────────────┘
                                 │
                                 ▼
@@ -103,12 +102,8 @@ That's it. HawkEye handles the rest.
 | Subdomain Recon | subfinder · assetfinder · crt.sh · C99 | Subdomains |
 | URL Discovery | waybackurls · katana | Endpoints, parameters, JS files |
 | Live Detection | httpx | Live hosts used by downstream scanners |
-| Vulnerability Scan | nuclei (high-value templates) | CVEs, misconfigs, exposures, takeovers |
-| Sensitive File Validation | ffuf + built-in verifier | Accessible files with matching sensitive content |
-| Vhost Discovery (opt-in) | ffuf (Host header) | Recon observations only |
+| Vulnerability Scan | nuclei (high-value templates) | CVEs, misconfigs, exposures, takeovers, SQLi/injection templates |
 | XSS | dalfox | Reflected XSS with PoC |
-| SQLi | nuclei + param filter | SQL injection vectors |
-| Hidden Params | arjun | Feeds discovered parameters into Dalfox; not reported as vulnerabilities |
 | Port Scan (opt-in) | nmap | Recon observations only |
 | JS Analysis | Regex + grounded LLM output | Credentials, keys, and tokens |
 | Validation Pipeline | Deterministic rules + DeepSeek / Claude / GPT-4 | False-positive filtering + evidence review |
@@ -211,17 +206,10 @@ go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
 go install github.com/projectdiscovery/katana/cmd/katana@latest
 go install github.com/tomnomnom/assetfinder@latest
 go install github.com/tomnomnom/waybackurls@latest
-go install github.com/ffuf/ffuf/v2@latest
 go install github.com/hahwul/dalfox/v2@latest
 
-# System tools
+# System tools (optional — nmap port scanning is opt-in)
 sudo apt install -y nmap
-
-# Optional — hidden parameter discovery (isolated Python environment)
-pipx install arjun
-
-# Wordlist for ffuf (strongly recommended)
-sudo apt install seclists
 
 # Nuclei templates
 nuclei -update-templates
@@ -360,27 +348,6 @@ c99:
 
 ---
 
-### Wordlist (ffuf)
-
-For maximum path discovery coverage, install SecLists:
-
-```bash
-sudo apt install seclists
-# Auto-detected at: /usr/share/seclists/Discovery/Web-Content/common.txt
-```
-
-Or specify a custom path in `config.yaml`:
-
-```yaml
-scanning:
-  tools:
-    ffuf:
-      wordlist_path: "/path/to/your/wordlist.txt"
-```
-
-Without SecLists, HawkEye falls back to a built-in list of ~130 high-value paths  
-(.env, .git, admin panels, Spring actuators, swagger, etc.) — functional but limited coverage.
-
 ### Blind XSS
 
 ```yaml
@@ -478,5 +445,5 @@ See [CHANGELOG.md](CHANGELOG.md) for release changes and
 ---
 
 <p align="center">
-  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.2.6
+  Built by <a href="https://x.com/A_cyb3r">@A_cyb3r</a> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; v2.3.0
 </p>

@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/Btr4k/bugbounty-agent/internal/scanner"
@@ -14,7 +15,7 @@ const (
 	PreValidKeep PreValidOutcome = iota
 	// PreValidReject: definite false positive — skip AI entirely.
 	PreValidReject
-	// PreValidDowngrade: reduce severity before passing to AI.
+	// PreValidDowngrade: adjust severity before passing to AI.
 	PreValidDowngrade
 )
 
@@ -31,6 +32,13 @@ type PreValidResult struct {
 //
 // Call this for every non-JS finding before sending to the AI batch.
 func PreValidateFinding(f scanner.Finding) PreValidResult {
+	if result := preValidProtectedDiagnostic(f); result.Outcome != PreValidKeep {
+		return result
+	}
+	if result := preValidSensitiveDebugExposure(f); result.Outcome != PreValidKeep {
+		return result
+	}
+
 	switch f.Type {
 	case "directory-bruteforce":
 		return preValidDirectory(f)
@@ -50,6 +58,58 @@ var diagnosticPaths = []string{
 	"server-status", "server-info",
 	"_debug", "_profiler", "_debugbar",
 	"phpinfo", "phpinfo.php",
+}
+
+func preValidProtectedDiagnostic(f scanner.Finding) PreValidResult {
+	if !isHTTPStatus(f, 401, 403) {
+		return PreValidResult{Outcome: PreValidKeep}
+	}
+
+	combined := findingText(f)
+	for _, p := range diagnosticPaths {
+		if strings.Contains(combined, p) {
+			return PreValidResult{
+				Outcome: PreValidReject,
+				Reason: "Diagnostic endpoint (" + p + ") returned HTTP 401/403, which means access is blocked. " +
+					"This is expected secure behavior and is not reportable without an HTTP 200 response containing sensitive content.",
+			}
+		}
+	}
+
+	return PreValidResult{Outcome: PreValidKeep}
+}
+
+func preValidSensitiveDebugExposure(f scanner.Finding) PreValidResult {
+	if !isHTTPStatus(f, 200) {
+		return PreValidResult{Outcome: PreValidKeep}
+	}
+
+	combined := findingText(f)
+	debugEndpoint := containsAny(combined,
+		"mini-profiler", "miniprofiler", "_profiler", "_debugbar", "debugbar",
+		"phpinfo", "phpinfo()", "error_log", "stack trace", "profiling results",
+	)
+	if !debugEndpoint {
+		return PreValidResult{Outcome: PreValidKeep}
+	}
+
+	sensitiveProof := containsAny(combined,
+		"sql", "select ", "insert ", "update ", "delete ",
+		"stack trace", "exception", "internal server error",
+		"server variables", "environment", "document_root", "script_filename",
+		"profiling results", "startuprofiler", "umbraco", "miniprofiler",
+		"x-powered-by", "asp.net", "php version",
+	)
+	if !sensitiveProof {
+		return PreValidResult{Outcome: PreValidKeep}
+	}
+
+	return PreValidResult{
+		Outcome:     PreValidDowngrade,
+		NewSeverity: "medium",
+		Reason: "HTTP 200 debug/profiling exposure contains sensitive runtime evidence. " +
+			"Treat as Medium-value bug bounty material when the response exposes profiling data, framework internals, SQL context, stack traces, or server runtime details.",
+	}
 }
 
 func preValidDirectory(f scanner.Finding) PreValidResult {
@@ -164,4 +224,45 @@ func preValidSSL(f scanner.Finding) PreValidResult {
 	}
 
 	return PreValidResult{Outcome: PreValidKeep}
+}
+
+func findingText(f scanner.Finding) string {
+	return strings.ToLower(strings.Join([]string{
+		f.Title,
+		f.Description,
+		f.Type,
+		f.Target,
+		f.URL,
+		f.Evidence,
+		f.Request,
+		f.Response,
+		strings.Join(f.Tags, " "),
+	}, " "))
+}
+
+func isHTTPStatus(f scanner.Finding, statuses ...int) bool {
+	combined := findingText(f)
+	for _, status := range statuses {
+		code := strconv.Itoa(status)
+		if strings.Contains(combined, "http/1.1 "+code) ||
+			strings.Contains(combined, "http/2 "+code) ||
+			strings.Contains(combined, "http "+code) ||
+			strings.Contains(combined, "| "+code) ||
+			strings.Contains(combined, code+" |") ||
+			strings.Contains(combined, "status: "+code) ||
+			strings.Contains(combined, "status_code:"+code) ||
+			strings.Contains(combined, "status-code: "+code) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(s string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
