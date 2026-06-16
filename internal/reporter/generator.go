@@ -116,6 +116,26 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		report.WriteString("> ⚠️ **CRITICAL FINDINGS DETECTED** — Immediate remediation recommended.  \n\n")
 	}
 
+	// Scan Coverage — transparency about what was assessed and how completely.
+	report.WriteString("## Scan Coverage\n\n")
+	report.WriteString("| Metric | Value |\n|---|---|\n")
+	report.WriteString(fmt.Sprintf("| Subdomains discovered | %d |\n", len(reconResults.Subdomains)))
+	report.WriteString(fmt.Sprintf("| URLs discovered | %d |\n", len(reconResults.URLs)))
+	report.WriteString(fmt.Sprintf("| JS files analyzed | %d |\n", len(reconResults.JSFiles)))
+	report.WriteString(fmt.Sprintf("| Raw tool candidates | %d |\n", len(scanResults.Findings)))
+	report.WriteString(fmt.Sprintf("| Confirmed findings | %d |\n", analysis.Stats.Validated))
+	report.WriteString(fmt.Sprintf("| Reconnaissance complete | %s |\n", completeMark(reconResults.Complete)))
+	report.WriteString(fmt.Sprintf("| Vulnerability scan complete | %s |\n", completeMark(scanResults.Complete)))
+	failed := append([]string(nil), reconResults.FailedTools...)
+	failed = append(failed, scanResults.FailedTools...)
+	if len(failed) > 0 {
+		report.WriteString(fmt.Sprintf("| Failed / partial tools | %s |\n", strings.Join(failed, ", ")))
+	}
+	report.WriteString("\n")
+	if len(failed) > 0 {
+		report.WriteString("> ⚠️ One or more tools did not complete. Missing coverage is **not** evidence that the target is secure — re-run or investigate the failed tools.\n\n")
+	}
+
 	// Severity Summary
 	report.WriteString("## Summary\n\n")
 	report.WriteString("| Severity | Count |\n")
@@ -134,8 +154,8 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	}
 	report.WriteString("\n")
 
-	// Findings by severity (Critical → High → Medium → Low)
-	// Skip info entirely
+	// Submission-ready findings first. Low-value informational items remain
+	// visible, but they no longer compete with reportable bug bounty material.
 	severities := []struct {
 		name  string
 		emoji string
@@ -143,19 +163,32 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 		{"critical", "🔴"},
 		{"high", "🟠"},
 		{"medium", "🟡"},
-		{"low", "🟢"},
 	}
 
 	findingIndex := 1
-	for _, sev := range severities {
-		filtered := g.filterBySeverity(analysis.ValidatedFindings, sev.name)
-		if len(filtered) == 0 {
-			continue
+	if len(g.filterSubmissionReady(analysis.ValidatedFindings)) > 0 {
+		report.WriteString("## Submission Ready Findings\n\n")
+		report.WriteString("> These findings have captured evidence and enough impact to be considered for a bug bounty submission.\n\n")
+		for _, sev := range severities {
+			filtered := g.filterBySeverity(analysis.ValidatedFindings, sev.name)
+			if len(filtered) == 0 {
+				continue
+			}
+
+			report.WriteString(fmt.Sprintf("### %s %s Severity\n\n", sev.emoji, cases.Title(language.English).String(sev.name)))
+
+			for _, f := range filtered {
+				report.WriteString(g.formatFinding(findingIndex, f))
+				findingIndex++
+			}
 		}
+	}
 
-		report.WriteString(fmt.Sprintf("## %s %s Severity\n\n", sev.emoji, cases.Title(language.English).String(sev.name)))
-
-		for _, f := range filtered {
+	lowValue := g.filterLowValue(analysis.ValidatedFindings)
+	if len(lowValue) > 0 {
+		report.WriteString("## Low Value / Informational\n\n")
+		report.WriteString("> These findings are technically valid but usually need stronger chained impact before submission.\n\n")
+		for _, f := range lowValue {
 			report.WriteString(g.formatFinding(findingIndex, f))
 			findingIndex++
 		}
@@ -168,6 +201,24 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 			report.WriteString(g.formatFinding(findingIndex, finding))
 			findingIndex++
 		}
+	}
+
+	if len(analysis.FalsePositives) > 0 {
+		report.WriteString("## Rejected / Not Reportable\n\n")
+		report.WriteString("> These candidates were rejected by deterministic validation or AI review and should not be submitted as-is.\n\n")
+		report.WriteString("| Candidate | URL | Reason |\n|---|---|---|\n")
+		for _, finding := range analysis.FalsePositives {
+			reason := finding.AIAnalysis
+			if reason == "" {
+				reason = "Rejected during validation"
+			}
+			report.WriteString(fmt.Sprintf("| %s | `%s` | %s |\n",
+				g.escapeTable(g.cfg.Redact(finding.Title)),
+				g.escapeTable(g.cfg.Redact(finding.URL)),
+				g.escapeTable(g.truncate(g.cfg.Redact(reason), 180)),
+			))
+		}
+		report.WriteString("\n")
 	}
 
 	// Subdomains discovered
@@ -193,55 +244,54 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 	emoji := g.getSeverityEmoji(finding.Severity)
 	details.WriteString(fmt.Sprintf("### %d. %s %s\n\n", index, emoji, finding.Title))
 
-	if finding.URL != "" {
-		details.WriteString(fmt.Sprintf("- **URL**: `%s`\n", g.cfg.Redact(finding.URL)))
-	}
-	details.WriteString(fmt.Sprintf("- **Severity**: %s\n", strings.ToUpper(finding.Severity)))
+	// Metadata table — compact, scannable header for the finding.
+	details.WriteString("| Field | Value |\n|---|---|\n")
+	details.WriteString(fmt.Sprintf("| **Severity** | %s |\n", strings.ToUpper(finding.Severity)))
+	details.WriteString(fmt.Sprintf("| **Confidence** | %.2f |\n", finding.Confidence))
 	if finding.Decision != "" {
-		details.WriteString(fmt.Sprintf("- **Decision**: %s\n", finding.Decision))
+		details.WriteString(fmt.Sprintf("| **Decision** | %s |\n", finding.Decision))
 	}
 	if finding.Type != "" {
-		details.WriteString(fmt.Sprintf("- **Type**: %s\n", finding.Type))
+		details.WriteString(fmt.Sprintf("| **Type** | %s |\n", finding.Type))
 	}
-	details.WriteString(fmt.Sprintf("- **Validation Confidence**: %.2f\n", finding.Confidence))
+	if finding.URL != "" {
+		details.WriteString(fmt.Sprintf("| **URL** | `%s` |\n", g.cfg.Redact(finding.URL)))
+	}
 	if finding.CVE != "" {
-		details.WriteString(fmt.Sprintf("- **CVE**: %s\n", finding.CVE))
+		details.WriteString(fmt.Sprintf("| **CVE** | %s |\n", finding.CVE))
 	}
 	if finding.CVSS > 0 {
-		details.WriteString(fmt.Sprintf("- **CVSS**: %.1f\n", finding.CVSS))
+		details.WriteString(fmt.Sprintf("| **CVSS** | %.1f |\n", finding.CVSS))
+	}
+	if finding.CWE != "" {
+		details.WriteString(fmt.Sprintf("| **CWE** | %s |\n", finding.CWE))
+	}
+	if finding.BugBountyValue != "" {
+		details.WriteString(fmt.Sprintf("| **Bug Bounty Value** | %s |\n", finding.BugBountyValue))
 	}
 
-	// Evidence
+	// Narrative sections — the substance of a professional report. These come
+	// from the AI validation pass and were previously discarded.
+	g.writeSection(&details, "Description", finding.Description, 0)
+	g.writeSection(&details, "Analysis", finding.AIAnalysis, 0)
+	g.writeSection(&details, "Impact", finding.ImpactAssessment, 0)
+	g.writeSection(&details, "Security Context", finding.CybersecurityContext, 0)
+	g.writeSection(&details, "Remediation", finding.Remediation, 0)
+
+	// Evidence blocks.
 	if finding.Evidence != "" {
-		evidence := g.cfg.Redact(finding.Evidence)
-		if len(evidence) > 300 {
-			evidence = evidence[:300] + "..."
-		}
+		evidence := g.truncate(g.cfg.Redact(finding.Evidence), 500)
 		details.WriteString(fmt.Sprintf("\n**Evidence**:\n```\n%s\n```\n", evidence))
 	}
 	if finding.Request != "" {
-		request := g.cfg.Redact(finding.Request)
-		if len(request) > 800 {
-			request = request[:800] + "..."
-		}
+		request := g.truncate(g.cfg.Redact(finding.Request), 1500)
 		details.WriteString(fmt.Sprintf("\n**Captured Request**:\n```http\n%s\n```\n", request))
 	}
 	if finding.Response != "" {
-		response := g.cfg.Redact(finding.Response)
-		if len(response) > 800 {
-			response = response[:800] + "..."
-		}
+		response := g.truncate(g.cfg.Redact(finding.Response), 1500)
 		details.WriteString(fmt.Sprintf("\n**Captured Response**:\n```http\n%s\n```\n", response))
 	}
 
-	// AI Analysis (brief)
-	if finding.AIAnalysis != "" {
-		analysis := g.cfg.Redact(finding.AIAnalysis)
-		if len(analysis) > 200 {
-			analysis = analysis[:200] + "..."
-		}
-		details.WriteString(fmt.Sprintf("\n**Analysis**: %s\n", analysis))
-	}
 	if len(finding.EvidenceRefs) > 0 {
 		details.WriteString("\n**Evidence References**:\n")
 		for _, ref := range finding.EvidenceRefs {
@@ -258,15 +308,41 @@ func (g *Generator) formatFinding(index int, finding analyzer.ValidatedFinding) 
 	// Only include a tool-captured reproduction command. An AI-generated command
 	// is guidance, not proof that the vulnerability was reproduced.
 	if g.cfg.Reporting.IncludePOC && finding.Metadata["curl"] != "" {
-		poc := g.cfg.Redact(finding.Metadata["curl"])
-		if len(poc) > 300 {
-			poc = poc[:300] + "..."
+		poc := g.truncate(g.cfg.Redact(finding.Metadata["curl"]), 500)
+		details.WriteString(fmt.Sprintf("\n**PoC (tool-captured)**:\n```\n%s\n```\n", poc))
+	}
+
+	if len(finding.References) > 0 {
+		details.WriteString("\n**References**:\n")
+		for _, ref := range finding.References {
+			details.WriteString(fmt.Sprintf("- %s\n", g.cfg.Redact(ref)))
 		}
-		details.WriteString(fmt.Sprintf("\n**PoC**:\n```\n%s\n```\n", poc))
 	}
 
 	details.WriteString("\n---\n\n")
 	return details.String()
+}
+
+// writeSection writes a bold-labelled paragraph when the body is non-empty.
+// A limit of 0 means no truncation.
+func (g *Generator) writeSection(b *strings.Builder, label, body string, limit int) {
+	body = strings.TrimSpace(g.cfg.Redact(body))
+	if body == "" {
+		return
+	}
+	if limit > 0 {
+		body = g.truncate(body, limit)
+	}
+	b.WriteString(fmt.Sprintf("\n**%s**: %s\n", label, body))
+}
+
+// truncate cuts s to at most n runes, appending an ellipsis when shortened.
+func (g *Generator) truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func (g *Generator) filterBySeverity(findings []analyzer.ValidatedFinding, severity string) []analyzer.ValidatedFinding {
@@ -279,6 +355,37 @@ func (g *Generator) filterBySeverity(findings []analyzer.ValidatedFinding, sever
 	return filtered
 }
 
+func (g *Generator) filterSubmissionReady(findings []analyzer.ValidatedFinding) []analyzer.ValidatedFinding {
+	var filtered []analyzer.ValidatedFinding
+	for _, f := range findings {
+		switch strings.ToLower(f.Severity) {
+		case "critical", "high", "medium":
+			if f.IsValid && g.severityAllowed(f.Severity) {
+				filtered = append(filtered, f)
+			}
+		}
+	}
+	return filtered
+}
+
+func (g *Generator) filterLowValue(findings []analyzer.ValidatedFinding) []analyzer.ValidatedFinding {
+	var filtered []analyzer.ValidatedFinding
+	for _, f := range findings {
+		switch strings.ToLower(f.Severity) {
+		case "low", "info", "informational":
+			if f.IsValid && g.severityAllowed(f.Severity) {
+				filtered = append(filtered, f)
+			}
+		}
+	}
+	return filtered
+}
+
+func (g *Generator) escapeTable(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.ReplaceAll(s, "|", "\\|")
+}
+
 func (g *Generator) severityAllowed(severity string) bool {
 	if len(g.cfg.Reporting.SeverityFilter) == 0 {
 		return true
@@ -289,6 +396,13 @@ func (g *Generator) severityAllowed(severity string) bool {
 		}
 	}
 	return false
+}
+
+func completeMark(complete bool) string {
+	if complete {
+		return "✅ yes"
+	}
+	return "⚠️ partial"
 }
 
 func (g *Generator) getSeverityEmoji(severity string) string {

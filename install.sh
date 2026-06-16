@@ -56,7 +56,6 @@ install_go_tools() {
         ["subfinder"]="github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
         ["httpx"]="github.com/projectdiscovery/httpx/cmd/httpx@latest"
         ["nuclei"]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-        ["ffuf"]="github.com/ffuf/ffuf/v2@latest"
         ["dalfox"]="github.com/hahwul/dalfox/v2@latest"
         ["assetfinder"]="github.com/tomnomnom/assetfinder@latest"
         ["waybackurls"]="github.com/tomnomnom/waybackurls@latest"
@@ -85,27 +84,6 @@ install_system_tools() {
         yum install -y -q nmap 2>/dev/null && success "nmap installed" || warn "nmap failed"
     else
         warn "Package manager not found — install nmap manually"
-    fi
-}
-
-# ─── Install Python tools ────────────────────────────────────
-install_python_tools() {
-    info "Installing Python tools (arjun)..."
-
-    if command -v arjun &>/dev/null; then
-        success "arjun already installed"
-    elif command -v pipx &>/dev/null; then
-        pipx install arjun >/dev/null 2>&1 && success "arjun installed" || warn "arjun failed to install with pipx"
-    elif command -v apt-get &>/dev/null; then
-        info "Installing pipx for isolated Python tools..."
-        apt-get install -y -q pipx >/dev/null 2>&1 &&
-            pipx install arjun >/dev/null 2>&1 &&
-            success "arjun installed" ||
-            warn "arjun failed — install manually with: pipx install arjun"
-    elif command -v pip3 &>/dev/null; then
-        pip3 install --user arjun -q 2>/dev/null && success "arjun installed" || warn "arjun failed — install manually with pipx"
-    else
-        warn "Python package installer not found — install pipx then: pipx install arjun"
     fi
 }
 
@@ -140,7 +118,6 @@ check_go
 export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.local/bin"
 install_system_tools
 install_go_tools
-install_python_tools
 setup_nuclei
 build_hawkeye
 setup_env

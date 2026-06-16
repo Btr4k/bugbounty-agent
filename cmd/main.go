@@ -22,7 +22,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const appVersion = "2.2.6"
+const appVersion = "2.3.0"
 
 var (
 	cfgFile      string
@@ -260,9 +260,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 		if scanResults.Complete {
 			green.Printf("  ✅ Scan completed successfully in %s\n", scanDuration.Round(time.Second))
-		} else {
+		} else if len(scanResults.FailedTools) > 0 {
 			yellow.Printf("  ⚠️  Scan completed partially in %s (failed: %s)\n",
 				scanDuration.Round(time.Second), strings.Join(scanResults.FailedTools, ", "))
+		} else {
+			yellow.Printf("  ⚠️  Scan completed in %s with partial coverage (time-boxed — not every host fully scanned)\n",
+				scanDuration.Round(time.Second))
 		}
 		white.Printf("  📊 Actionable Findings: ")
 		cyan.Printf("%d vulnerabilities (low/medium/high/critical)\n", len(displayFindings))
@@ -633,11 +636,9 @@ func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{})
 		{"waybackurls", runRecon && cfg.Recon.Tools.Wayback, "go install github.com/tomnomnom/waybackurls@latest"},
 		{"katana", runRecon && cfg.Recon.Tools.Katana, "go install github.com/projectdiscovery/katana/cmd/katana@latest"},
 		{"httpx", runScan && cfg.Scanning.Tools.Httpx.Enabled, "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"},
-		{"nuclei", runScan && (cfg.Scanning.Tools.Nuclei.Enabled || cfg.Scanning.Tools.SQLi.Enabled), "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"},
+		{"nuclei", runScan && cfg.Scanning.Tools.Nuclei.Enabled, "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"},
 		{"dalfox", runScan && cfg.Scanning.Tools.Dalfox.Enabled, "go install github.com/hahwul/dalfox/v2@latest"},
-		{"ffuf", runScan && cfg.Scanning.Tools.Ffuf.Enabled, "go install github.com/ffuf/ffuf/v2@latest"},
 		{"nmap", runScan && cfg.Scanning.Tools.Nmap.Enabled, "apt install nmap"},
-		{"arjun", runScan && cfg.Scanning.Tools.Arjun.Enabled, "pipx install arjun"},
 	}
 
 	missing := []string{}

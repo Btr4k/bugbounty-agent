@@ -70,47 +70,39 @@ recon:
     cert_transparency: true
 
 # Scanning Settings
+#
+# Active scanners run SEQUENTIALLY (nuclei → dalfox), never in parallel. Running
+# several heavy scanners at once on a modest host exhausts memory and the OOM
+# killer terminates them mid-scan. One scanner at a time finishes reliably.
 scanning:
   enabled: true
   threads: 40  # Balanced default for reliable scans on modest servers
-  timeout: 1200  # 20 minutes for high-priority templates
-  rate_limit: 50 # Per-tool ceiling; lower this to match program rules
+  timeout: 1200  # 20-minute budget for the nuclei high-value scan (runs alone)
+  # Requests/sec ceiling. At 50 a full scan of ~1300 templates × dozens of hosts
+  # could not finish inside the budget (≈57 min of requests). 150 is Nuclei's own
+  # default and completes the scan with margin. Lower it for strict programs.
+  rate_limit: 150
   tools:
     nuclei:
       enabled: true
       severity: []  # Empty runs actionable severities: critical, high, medium, low
-      tags: ["exposure", "misconfig", "takeover", "default-login"] # High-signal default profile
+      # High-signal profile. "misconfig" (≈800 templates) was dropped: it nearly
+      # doubled request volume without producing confirmed findings here. Add it
+      # back if your host and the program's rate limits allow a longer scan.
+      tags: ["exposure", "takeover", "default-login"]
       templates_path: "" # Empty uses Nuclei's installed templates
     httpx:
       enabled: true
       follow_redirects: true
       status_code: true
+    dalfox:
+      enabled: true
+      blind_url: ""  # Optional: blind XSS callback URL (e.g. https://your-burp-collaborator)
+      max_urls: 75   # Parameterized URLs to fuzz for reflected XSS
     nmap:
       enabled: false # Open ports alone are reconnaissance, not confirmed vulnerabilities
       ports: "21,22,25,53,80,110,143,443,445,993,995,3000,3306,5432,6379,8000,8080,8443,8888,9090,9200,27017"
       fast_scan: true
-    dalfox:
-      enabled: true
-      blind_url: ""  # Optional: blind XSS callback URL (e.g. https://your-burp-collaborator)
-      max_urls: 100  # Increased for better XSS coverage
-    ffuf:
-      enabled: true
-      # Wordlist search order (first found wins):
-      #   1. This value (if set)
-      #   2. /usr/share/seclists/Discovery/Web-Content/common.txt
-      #   3. /usr/share/wordlists/dirb/common.txt
-      #   4. /opt/SecLists/Discovery/Web-Content/common.txt
-      #   5. Built-in ~130 high-value paths (fallback — limited coverage)
-      # Recommended: apt install seclists  OR  set full path below
-      wordlist_path: ""
-      max_targets: 20    # Top N hosts to path-bruteforce (scored by importance)
-      vhost_fuzzing: false # Discovery-only; enable manually when needed
-    sqli:
-      enabled: true      # Uses focused Nuclei SQLi templates and parameter filtering
-      max_urls: 50       # Max gf-filtered param URLs to test
-    arjun:
-      enabled: true      # Hidden parameter discovery — feeds discovered params into dalfox
-      max_targets: 15    # Top N hosts to discover hidden params on
 # AI Analysis
 analysis:
   min_confidence: 0.85 # Findings below this require manual confirmation and are not reported

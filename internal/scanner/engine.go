@@ -208,232 +208,101 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	}
 
 	// ════════════════════════════════════════════════
-	// STAGE 2: Nuclei, Nmap, Dalfox (parallel, using live hosts)
+	// STAGE 2: Active scanners run SEQUENTIALLY, not in parallel.
 	// ════════════════════════════════════════════════
-	var wg sync.WaitGroup
+	// Running multiple heavy scanners (nuclei, dalfox) at once on a modest host
+	// exhausts memory and the OOM killer terminates them mid-scan
+	// ("signal: killed"), wasting the entire budget for zero results. Each
+	// scanner now gets the machine to itself and finishes within its budget.
 
-	// Run the primary high-signal Nuclei profile before the narrower SQLi
-	// profile. A mutex allowed SQLi to win the race and consume the first scan
-	// budget, delaying the more useful primary scan.
-	nucleiDone := make(chan struct{})
-	if !e.cfg.Scanning.Tools.Nuclei.Enabled {
-		close(nucleiDone)
-	}
-
-	// Nuclei Scanning — uses full URLs from httpx (preserves ports like :8080, :8443)
+	// ── Nuclei: the primary value engine (CVEs, misconfigs, exposures, takeovers).
+	// Uses full URLs from httpx (preserves ports like :8080, :8443).
 	if e.cfg.Scanning.Tools.Nuclei.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer close(nucleiDone)
+		// Cap the host count so the full template sweep can actually COMPLETE
+		// within the budget. On targets fronted by slow/WAF-throttled hosts an
+		// uncapped sweep never finishes, and which findings surface before the
+		// deadline becomes luck. Hosts are prioritized, so the cap keeps the
+		// high-value names (api, admin, www, …) and drops CT-log noise.
+		nucleiTargets := prioritizeNucleiTargets(deduplicateURLs(liveHosts), 25)
 
-			// Deduplicate live hosts (full URLs from httpx)
-			nucleiTargets := deduplicateURLs(liveHosts)
-			if len(nucleiTargets) > 100 {
-				// Prioritize by hostname importance
-				hostnames := validateSubdomains(nucleiTargets)
-				hostnames = prioritizeTargets(hostnames)
-				// Map back to full URLs
-				prioritized := make([]string, 0, len(nucleiTargets))
-				hostnameOrder := make(map[string]int)
-				for i, h := range hostnames {
-					hostnameOrder[strings.ToLower(h)] = i
-				}
-				type scored struct {
-					url   string
-					score int
-				}
-				var items []scored
-				for _, u := range nucleiTargets {
-					h := extractHostname(u)
-					s, ok := hostnameOrder[strings.ToLower(h)]
-					if !ok {
-						s = 999
-					}
-					items = append(items, scored{u, s})
-				}
-				sort.SliceStable(items, func(i, j int) bool {
-					return items[i].score < items[j].score
-				})
-				for _, item := range items {
-					prioritized = append(prioritized, item.url)
-				}
-				nucleiTargets = prioritized[:100]
+		e.log.Debugf("Nuclei targets: %d full URLs", len(nucleiTargets))
+		if len(nucleiTargets) > 0 {
+			limit := 5
+			if len(nucleiTargets) < limit {
+				limit = len(nucleiTargets)
 			}
+			e.log.Debugf("Sample targets: %v", nucleiTargets[:limit])
+		}
 
-			e.log.Debugf("Nuclei targets: %d full URLs", len(nucleiTargets))
-			if len(nucleiTargets) > 0 {
-				limit := 5
-				if len(nucleiTargets) < limit {
-					limit = len(nucleiTargets)
-				}
-				e.log.Debugf("Sample targets: %v", nucleiTargets[:limit])
-			}
+		e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d live targets with high-value templates...", len(nucleiTargets)))
+		start := time.Now()
 
-			e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d live targets with high-value templates...", len(nucleiTargets)))
-			start := time.Now()
-
-			nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
-			defer nucleiCancel()
-
-			// Retry nuclei up to 3 times — network/template issues are transient
-			findings, err := runWithRetry(nucleiCtx, e.log, "Nuclei", 3, func(rctx context.Context) ([]Finding, error) {
-				return e.runNucleiDirect(rctx, nucleiTargets)
-			})
-			if len(findings) > 0 {
-				mu.Lock()
-				results.Findings = append(results.Findings, findings...)
-				mu.Unlock()
-			}
-			if err != nil {
-				e.log.ToolFail("Nuclei", err)
-				recordToolError("nuclei", err)
-				return
-			}
-
+		nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
+		// Retry only twice: a hard failure with partial results is usually a
+		// budget issue, not a transient network blip, so endless retries only
+		// burn the remaining budget. Partial findings are always preserved.
+		findings, err := runWithRetry(nucleiCtx, e.log, "Nuclei", 2, func(rctx context.Context) ([]Finding, error) {
+			return e.runNucleiDirect(rctx, nucleiTargets)
+		})
+		timedOut := nucleiCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		nucleiCancel()
+		if len(findings) > 0 {
+			results.Findings = append(results.Findings, findings...)
+		}
+		switch {
+		case err == nil:
 			e.log.ToolDone("Nuclei", len(findings), time.Since(start))
-			if len(findings) > 0 {
-				e.log.Debugf("Nuclei: found %d total findings (all severities included)", len(findings))
-			}
-		}()
+		case timedOut:
+			// The budget expired. Nuclei is time-boxed, NOT failed: it ran fine
+			// and its findings were preserved to the -o file. Treat this as a
+			// coverage limit (partial), not a tool failure — so the report does
+			// not show a scary "❌ failed" while still being honest that not
+			// every host was fully scanned.
+			e.log.Warnf("Nuclei time-boxed at the %s budget — %d finding(s) kept; host coverage is partial", toolTimeout, len(findings))
+			e.log.ToolDone("Nuclei", len(findings), time.Since(start))
+			mu.Lock()
+			results.Complete = false
+			mu.Unlock()
+		default:
+			e.log.ToolFail("Nuclei", err)
+			recordToolError("nuclei", err)
+		}
 	} else {
 		e.log.ToolSkip("Nuclei", "disabled in config")
 	}
 
-	// Nmap Port Scanning — uses live hosts
+	// ── Nmap: opt-in port scanning (disabled by default — recon only).
 	if e.cfg.Scanning.Tools.Nmap.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			nmapCount := len(liveHosts)
-			if nmapCount > 25 {
-				nmapCount = 25
-			}
-			e.log.ToolStart("Nmap", fmt.Sprintf("port scanning %d live targets (ports: %s)...",
-				nmapCount, e.cfg.Scanning.Tools.Nmap.Ports))
-			start := time.Now()
+		nmapCount := len(liveHosts)
+		if nmapCount > 25 {
+			nmapCount = 25
+		}
+		e.log.ToolStart("Nmap", fmt.Sprintf("port scanning %d live targets (ports: %s)...",
+			nmapCount, e.cfg.Scanning.Tools.Nmap.Ports))
+		start := time.Now()
 
-			findings, err := e.runNmap(ctx, liveHosts)
-			if err != nil {
-				e.log.ToolFail("Nmap", err)
-				recordToolError("nmap", err)
-				return
-			}
-
+		findings, err := e.runNmap(ctx, liveHosts)
+		if err != nil {
+			e.log.ToolFail("Nmap", err)
+			recordToolError("nmap", err)
+		} else {
 			e.log.ToolDone("Nmap", len(findings), time.Since(start))
-			mu.Lock()
 			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
-		}()
+		}
 	} else {
 		e.log.ToolSkip("Nmap", "disabled in config")
 	}
 
-	// SQL Injection — nuclei-based (fast, WAF-aware) + gf-style param filtering
-	if e.cfg.Scanning.Tools.SQLi.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			// Wait for the primary scan before starting another Nuclei process.
-			// The timeout begins after the wait, so SQLi keeps its full budget.
-			<-nucleiDone
-			sqliURLCount := len(filterSQLiProneURLs(reconResults.URLs))
-			e.log.ToolStart("SQLi-Scan",
-				fmt.Sprintf("nuclei sqli templates on %d hosts + %d gf-filtered param URLs...",
-					len(liveHosts), sqliURLCount))
-			start := time.Now()
-
-			sqliCtx, sqliCancel := context.WithTimeout(ctx, 12*time.Minute)
-			defer sqliCancel()
-
-			findings, err := e.runSQLiScan(sqliCtx, liveHosts, reconResults.URLs)
-			if len(findings) > 0 {
-				mu.Lock()
-				results.Findings = append(results.Findings, findings...)
-				mu.Unlock()
-			}
-			if err != nil {
-				e.log.ToolFail("SQLi-Scan", err)
-				recordToolError("sqli", err)
-				return
-			}
-
-			e.log.ToolDone("SQLi-Scan", len(findings), time.Since(start))
-		}()
-	}
-
-	// ffuf Directory/File Bruteforce + Vhost — independent of Arjun, start early in parallel
-	if e.cfg.Scanning.Tools.Ffuf.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			e.log.ToolStart("Ffuf", fmt.Sprintf("path bruteforce + vhost fuzzing on %d live targets...", len(liveHosts)))
-			start := time.Now()
-
-			ffufCtx, ffufCancel := context.WithTimeout(ctx, toolTimeout)
-			defer ffufCancel()
-
-			findings, err := e.runFfuf(ffufCtx, liveHosts)
-			if err != nil {
-				e.log.ToolFail("Ffuf", err)
-				recordToolError("ffuf", err)
-				return
-			}
-
-			e.log.ToolDone("Ffuf", len(findings), time.Since(start))
-			mu.Lock()
-			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
-		}()
-	} else {
-		e.log.ToolSkip("Ffuf", "disabled in config")
-	}
-
-	// Arjun is discovery-only. Its output feeds Dalfox, but hidden parameter names
-	// are not vulnerabilities and are intentionally not reported as findings.
-	// FFUF is already launched above and runs in parallel while Arjun works.
-	var arjunParamURLs []string
-	if e.cfg.Scanning.Tools.Arjun.Enabled {
-		arjunCtx, arjunCancel := context.WithTimeout(ctx, 5*time.Minute)
-		e.log.ToolStart("Arjun", fmt.Sprintf("discovering hidden parameters on %d live hosts...", len(liveHosts)))
-		arjunStart := time.Now()
-		_, newURLs, arjunErr := e.runArjun(arjunCtx, liveHosts)
-		arjunCancel()
-		if arjunErr != nil {
-			e.log.ToolFail("Arjun", arjunErr)
-			recordToolError("arjun", arjunErr)
-		} else if len(newURLs) > 0 {
-			e.log.ToolDone("Arjun", len(newURLs), time.Since(arjunStart))
-			e.log.Debugf("Arjun: +%d param URLs added to Dalfox queue", len(newURLs))
-			arjunParamURLs = newURLs
-		} else {
-			e.log.Debugf("Arjun: no hidden parameters found")
-		}
-	} else {
-		e.log.ToolSkip("Arjun", "disabled in config")
-	}
-
-	// Dalfox XSS Parameter Fuzzing — uses Wayback URLs + Arjun-discovered params
+	// ── Dalfox: reflected-XSS fuzzing of parameterized URLs (runs last, alone).
 	if e.cfg.Scanning.Tools.Dalfox.Enabled {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		allParamURLs := deduplicateURLs(extractParameterizedURLs(reconResults.URLs))
 
-			// Merge Wayback URLs + arjun-discovered parameter URLs, then deduplicate
-			allParamURLs := extractParameterizedURLs(reconResults.URLs)
-			allParamURLs = append(allParamURLs, arjunParamURLs...)
-			allParamURLs = deduplicateURLs(allParamURLs)
-
-			if len(allParamURLs) == 0 {
-				e.log.ToolSkip("Dalfox", "no parameterized URLs found")
-				return
-			}
-
+		if len(allParamURLs) == 0 {
+			e.log.ToolSkip("Dalfox", "no parameterized URLs found")
+		} else {
 			maxURLs := e.cfg.Scanning.Tools.Dalfox.MaxURLs
 			if maxURLs <= 0 {
-				maxURLs = 100
+				maxURLs = 75
 			}
 			if len(allParamURLs) > maxURLs {
 				allParamURLs = allParamURLs[:maxURLs]
@@ -443,37 +312,25 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			start := time.Now()
 
 			dalfoxCtx, dalfoxCancel := context.WithTimeout(ctx, 5*time.Minute)
-			defer dalfoxCancel()
-
 			findings, err := e.runDalfox(dalfoxCtx, allParamURLs)
+			dalfoxCancel()
+			if len(findings) > 0 {
+				results.Findings = append(results.Findings, findings...)
+			}
 			if err != nil {
 				e.log.ToolFail("Dalfox", err)
 				recordToolError("dalfox", err)
-				return
+			} else {
+				e.log.ToolDone("Dalfox", len(findings), time.Since(start))
 			}
-
-			e.log.ToolDone("Dalfox", len(findings), time.Since(start))
-			mu.Lock()
-			results.Findings = append(results.Findings, findings...)
-			mu.Unlock()
-		}()
+		}
 	} else {
 		e.log.ToolSkip("Dalfox", "disabled in config")
 	}
 
-	wg.Wait()
-
-	// Deduplicate findings across all tools.
-	//
-	// Two-pass strategy:
-	//   Pass 1 — exact dedup: same title + same URL from the same tool (fast path).
-	//   Pass 2 — cross-tool dedup: different tools that flagged the same URL for the
-	//            same vulnerability class (e.g. nuclei "Codeigniter .env" AND ffuf
-	//            "Environment File Exposed" both pointing at the same /.env URL).
-	//            Keep whichever finding has the higher severity; ties keep the first.
-
-	// Exact dedup only. Broad URL/class dedup can erase distinct vulnerabilities
-	// on the same endpoint, which is worse than retaining a duplicate candidate.
+	// Deduplicate findings (exact match only: same title + same URL). Broad
+	// URL/class dedup can erase distinct vulnerabilities on the same endpoint,
+	// which is worse than retaining a duplicate candidate for the AI pass.
 	results.Findings = deduplicateFindings(policy, results.Findings)
 
 	// Calculate statistics
@@ -552,7 +409,7 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	}
 	tags := e.cfg.Scanning.Tools.Nuclei.Tags
 	if len(tags) == 0 {
-		tags = []string{"exposure", "misconfig", "takeover", "default-login"}
+		tags = []string{"exposure", "takeover", "default-login"}
 	}
 	args = append(args, "-tags", strings.Join(tags, ","))
 	args = append(args, "-pt", "http,ssl,dns")
@@ -590,21 +447,49 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	concurrency := e.boundedThreads(100)
 	args = append(args, "-c", fmt.Sprintf("%d", concurrency))
 	args = append(args, "-rl", fmt.Sprintf("%d", e.cfg.Scanning.RateLimit))
-	args = append(args, "-timeout", "10")
-	args = append(args, "-retries", "2")
+	// Tight per-request budget: the bottleneck is slow / WAF-throttled hosts
+	// holding connections open. A short timeout + a single retry keeps wasted
+	// time on dead hosts low so the rate-limited scan finishes inside its budget.
+	// Per-request budget kept modest so slow hosts don't stall the scan, but not
+	// so short that a large legitimate response (e.g. a 100 KB phpinfo page) is
+	// cut off. No -mhe: it abandons a host after N errors, but the vulnerable
+	// hosts on real targets are often the slow/erroring ones, so dropping them
+	// throws away exactly the findings we want.
+	args = append(args, "-timeout", "7")
+	args = append(args, "-retries", "1")
 	args = append(args, "-bulk-size", "25")
+
+	// Capture findings two ways and use whichever has data. Nuclei prints results
+	// to stdout AND (with -o) to a file; depending on version/buffering, one or
+	// the other is what survives a deadline SIGKILL. Reading both makes partial
+	// results robust instead of silently lost.
+	outFile, ferr := os.CreateTemp("", "nuclei-out-*.jsonl")
+	if ferr != nil {
+		return nil, fmt.Errorf("failed to create nuclei output file: %w", ferr)
+	}
+	outFile.Close()
+	defer os.Remove(outFile.Name())
+	args = append(args, "-o", outFile.Name())
+
 	args = e.appendHeaderArgs(args, "-H", targets...)
 	args = e.appendNucleiRedactionArgs(args)
 
 	e.log.Debugf("Nuclei: scanning %d full URLs", len(targets))
 
 	cmd := exec.CommandContext(ctx, "nuclei", args...)
-	var stderrBuf bytes.Buffer
+	var stderrBuf, stdoutBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
+	cmd.Stdout = &stdoutBuf
 
-	output, err := cmd.Output()
+	err = cmd.Run()
 	if err != nil {
 		e.log.Debugf("Nuclei finished with error: %v", err)
+	}
+
+	// Prefer the -o file; fall back to captured stdout when the file is empty.
+	output, _ := os.ReadFile(outFile.Name())
+	if len(bytes.TrimSpace(output)) == 0 {
+		output = stdoutBuf.Bytes()
 	}
 
 	// Parse JSON output (same parsing as runNuclei)
@@ -1128,6 +1013,40 @@ func prioritizeTargets(targets []string) []string {
 	})
 
 	return targets
+}
+
+// prioritizeNucleiTargets returns deduplicated full URLs ordered by hostname
+// importance and capped at max. When the target count is already within budget
+// the slice is returned unchanged.
+func prioritizeNucleiTargets(targets []string, max int) []string {
+	if max <= 0 || len(targets) <= max {
+		return targets
+	}
+	hostnames := prioritizeTargets(validateSubdomains(targets))
+	order := make(map[string]int, len(hostnames))
+	for i, h := range hostnames {
+		order[strings.ToLower(h)] = i
+	}
+	type scored struct {
+		url   string
+		score int
+	}
+	items := make([]scored, 0, len(targets))
+	for _, u := range targets {
+		s, ok := order[strings.ToLower(extractHostname(u))]
+		if !ok {
+			s = 999
+		}
+		items = append(items, scored{u, s})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].score < items[j].score
+	})
+	prioritized := make([]string, 0, max)
+	for _, item := range items {
+		prioritized = append(prioritized, item.url)
+	}
+	return prioritized[:max]
 }
 
 func subdomainScore(subdomain string, highValuePrefixes []string) int {

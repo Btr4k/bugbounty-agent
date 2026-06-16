@@ -1,5 +1,48 @@
 # Changelog
 
+## v2.3.0
+
+- **Removed the SQLi, FFUF, and Arjun modules.** In practice they produced no
+  confirmed findings while consuming most of the scan budget: Arjun failed on
+  every target, the nuclei-based SQLi pass was a redundant second nuclei run
+  that was always OOM-killed, and FFUF added minutes for zero results without a
+  wordlist. Their config sections and dependencies were dropped.
+- **Active scanners now run sequentially (nuclei → dalfox), never in parallel.**
+  Running several heavy scanners at once exhausted memory and the OOM killer
+  terminated them mid-scan ("signal: killed"). One scanner at a time finishes
+  reliably within budget.
+- **Fixed nuclei reporting zero findings on slow targets.** The root cause was
+  that a full ~1700-template sweep cannot finish on hosts that are
+  slow/WAF-throttled, so the run was killed at the deadline before reaching the
+  templates that match — and which findings surfaced first was essentially luck
+  (one run found 3, the next found 0). Fixes:
+  - **Cap the scan at the 25 highest-priority hosts** so the full template sweep
+    actually completes within budget (clean exit = nothing lost), keeping the
+    valuable names and dropping Certificate-Transparency noise.
+  - **Capture results from both the `-o` file and stdout**, so partial findings
+    survive a deadline stop regardless of how Nuclei buffers output.
+  - **Treat a budget time-out as partial coverage, not a tool failure** — no more
+    "❌ failed" when findings were captured; the report's Scan Coverage section
+    states the coverage was time-boxed.
+- Dropped the bulky low-signal `misconfig` tag (~800 templates, no confirmed
+  findings here) and raised the default `rate_limit` to 150. Default nuclei
+  budget is 20 minutes.
+- **Stopped losing findings when AI validation is unavailable.** If the AI
+  validator timed out or rate-limited, the whole batch of tool candidates was
+  silently dropped (e.g. 6 candidates → only 1 in the report). Failed batches are
+  now routed to **Manual Review** with their captured evidence intact, so every
+  real candidate still reaches the report when the validator is degraded.
+- **Improved reportability triage.** Protected diagnostic endpoints such as
+  `Trace.axd` returning 401/403 are now rejected as not reportable, while exposed
+  debug/profiling pages such as MiniProfiler/phpinfo/error logs are promoted to
+  medium-value findings when the captured HTTP 200 response contains runtime,
+  framework, SQL, or server-internal evidence.
+- Made Katana much faster: shallow depth-1 crawl, 20 prioritized targets, and a
+  4-minute cap (down from a depth-2 crawl that dominated runtime at 9+ minutes).
+- **Richer, more professional reports.** Findings now include the AI-generated
+  impact assessment, remediation, security context, description, CWE, and
+  references — all previously discarded — plus a new Scan Coverage section.
+
 ## v2.2.6
 
 - Feed all current Katana crawl URLs into parameter-based scanners when

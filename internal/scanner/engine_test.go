@@ -59,22 +59,12 @@ func TestRunNucleiDirectReturnsErrorWhenCommandWritesNonJSONBeforeTimeout(t *tes
 	}
 }
 
-func TestRunSQLiScanPreservesPartialFindingsOnFailure(t *testing.T) {
-	output := `{"template-id":"partial-sqli","info":{"name":"Partial SQLi","severity":"high"},"type":"http","host":"example.com","matched-at":"https://example.com/search?id=1"}` + "\n"
-	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\nprintf '%s' '"+output+"'\nexit 1\n")
-
-	findings, err := engine.runSQLiScan(context.Background(), []string{"https://example.com"}, nil)
-	if err == nil {
-		t.Fatal("runSQLiScan accepted a failed nuclei process as successful")
-	}
-	if len(findings) != 1 || findings[0].Title != "Partial SQLi" {
-		t.Fatalf("partial SQLi findings were lost: %#v", findings)
-	}
-}
-
 func TestRunNucleiDirectPreservesPartialFindingsOnFailure(t *testing.T) {
 	output := `{"template-id":"partial-test","info":{"name":"Partial Finding","severity":"high"},"type":"http","host":"example.com","matched-at":"https://example.com/test"}` + "\n"
-	engine := testEngineWithFakeNuclei(t, "#!/bin/sh\nprintf '%s' '"+output+"'\nexit 1\n")
+	// Nuclei writes findings to the file passed via -o; the fake must do the same
+	// so the test exercises the file-based parsing that survives a SIGKILL.
+	script := "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  [ \"$1\" = \"-o\" ] && out=\"$2\"\n  shift\ndone\nprintf '%s' '" + output + "' > \"$out\"\nexit 1\n"
+	engine := testEngineWithFakeNuclei(t, script)
 
 	findings, err := engine.runNucleiDirect(context.Background(), []string{"https://example.com"})
 	if err == nil {
@@ -99,7 +89,7 @@ func TestRunNucleiDirectUsesHighSignalDefaultProfile(t *testing.T) {
 	}
 	got := string(args)
 	for _, expected := range []string{
-		"exposure,misconfig,takeover,default-login",
+		"exposure,takeover,default-login",
 		"http,ssl,dns",
 		"critical,high,medium,low",
 	} {
@@ -168,25 +158,5 @@ func TestDeduplicateFindingsKeepsDistinctIssuesOnSameURL(t *testing.T) {
 	got := deduplicateFindings(policy, findings)
 	if len(got) != 2 {
 		t.Fatalf("deduplicateFindings returned %d findings, want 2: %#v", len(got), got)
-	}
-}
-
-func TestClassifyFfufSeverityRejectsWeakDiscoveries(t *testing.T) {
-	for _, tc := range []struct {
-		path   string
-		status int
-	}{
-		{"admin", 200},
-		{".env", 302},
-		{"server-status", 403},
-		{"api/v1", 200},
-		{"anything", 500},
-	} {
-		if got := classifyFfufSeverity(tc.path, tc.status); got != "" {
-			t.Errorf("classifyFfufSeverity(%q, %d) = %q, want empty", tc.path, tc.status, got)
-		}
-	}
-	if got := classifyFfufSeverity(".env", 200); got != "critical" {
-		t.Errorf("expected accessible .env candidate to remain critical, got %q", got)
 	}
 }
