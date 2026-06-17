@@ -94,3 +94,59 @@ func TestGenerateIncludesOnlyValidatedFindingsAndUsesPrivatePermissions(t *testi
 		t.Fatalf("report permissions = %o, want 600", info.Mode().Perm())
 	}
 }
+
+func TestGenerateLabelsZeroFindingsWithLimitedCoverage(t *testing.T) {
+	log := logger.New(false)
+	defer log.Close()
+	cfg := &config.Config{
+		Target:    config.TargetConfig{Domains: []string{"example.com"}},
+		Reporting: config.ReportingConfig{OutputDir: t.TempDir()},
+	}
+
+	reconResults := &recon.Results{
+		Subdomains: make([]string, 62),
+		URLs: []string{
+			"https://example.com/",
+			"https://example.com/search?q=test",
+			"https://api.example.com/users",
+		},
+		JSFiles:  make([]recon.JSFile, 11),
+		Complete: true,
+	}
+	for i := range reconResults.Subdomains {
+		reconResults.Subdomains[i] = "sub.example.com"
+	}
+
+	path, err := NewGenerator(cfg, log).Generate(
+		reconResults,
+		&scanner.Results{Complete: true},
+		&analyzer.Analysis{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(content)
+	if !strings.Contains(report, "No Confirmed Findings (Limited Coverage)") ||
+		!strings.Contains(report, "**Coverage Grade**: Limited") ||
+		!strings.Contains(report, "**Negative Result Confidence**: low") ||
+		!strings.Contains(report, "Parameterized URLs discovered | 1") ||
+		!strings.Contains(report, "not proof that the target is secure") {
+		t.Fatalf("limited zero-finding report did not communicate coverage uncertainty:\n%s", report)
+	}
+}
+
+func TestCountParameterizedURLsDeduplicatesFragments(t *testing.T) {
+	urls := []string{
+		"https://example.com/search?q=one#top",
+		"https://example.com/search?q=one#bottom",
+		"https://example.com/static/app.js?v=1",
+		"https://example.com/no-query",
+	}
+	if got := countParameterizedURLs(urls); got != 2 {
+		t.Fatalf("countParameterizedURLs() = %d, want 2", got)
+	}
+}

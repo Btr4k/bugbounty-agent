@@ -37,6 +37,10 @@
   debug/profiling pages such as MiniProfiler/phpinfo/error logs are promoted to
   medium-value findings when the captured HTTP 200 response contains runtime,
   framework, SQL, or server-internal evidence.
+- **Added coverage-quality scoring.** Reports now show Coverage Grade,
+  parameterized URL counts, and negative-result confidence so a clean scan with
+  shallow URL discovery is reported as limited coverage rather than proof of low
+  risk.
 - Made Katana much faster: shallow depth-1 crawl, 20 prioritized targets, and a
   4-minute cap (down from a depth-2 crawl that dominated runtime at 9+ minutes).
 - **Richer, more professional reports.** Findings now include the AI-generated

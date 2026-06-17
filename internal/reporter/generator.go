@@ -53,6 +53,7 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	var report strings.Builder
 
 	target := strings.Join(g.cfg.Target.Domains, ", ")
+	coverage := assessCoverage(reconResults, scanResults, analysis)
 
 	// Header
 	report.WriteString(fmt.Sprintf("# Bug Bounty Report — %s\n\n", target))
@@ -64,7 +65,9 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Vulnerability Scan Complete**: %t  \n", scanResults.Complete))
 	report.WriteString(fmt.Sprintf("**Raw Tool Candidates**: %d  \n", len(scanResults.Findings)))
 	report.WriteString(fmt.Sprintf("**Confirmed Findings**: %d  \n", len(analysis.ValidatedFindings)))
-	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n\n", len(analysis.ManualReview)))
+	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n", len(analysis.ManualReview)))
+	report.WriteString(fmt.Sprintf("**Coverage Grade**: %s  \n", coverage.Grade))
+	report.WriteString(fmt.Sprintf("**Negative Result Confidence**: %s  \n\n", coverage.NegativeConfidence))
 
 	// Executive Summary with Risk Score
 	// Weight JS-analysis-only findings at 50% to prevent inflated scores.
@@ -88,6 +91,8 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	riskLevel := "🟢 Low Risk"
 	if !reconResults.Complete || !scanResults.Complete {
 		riskLevel = "⚪ Partial Assessment"
+	} else if riskScore == 0 && len(analysis.ValidatedFindings) == 0 {
+		riskLevel = coverage.ZeroFindingRiskLevel
 	} else if riskScore >= 30 {
 		riskLevel = "🔴 Critical Risk"
 	} else if riskScore >= 15 {
@@ -102,6 +107,9 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString(fmt.Sprintf("**Manual Review Candidates**: %d  \n", analysis.Stats.ManualReview))
 	report.WriteString(fmt.Sprintf("**False Positives Filtered**: %d  \n", analysis.Stats.FalsePositives))
 	report.WriteString(fmt.Sprintf("**Attack Surface**: %d subdomains discovered  \n\n", len(reconResults.Subdomains)))
+	if len(analysis.ValidatedFindings) == 0 && coverage.NegativeConfidence != "high" {
+		report.WriteString(fmt.Sprintf("> ⚠️ **No confirmed findings were observed, but coverage is %s.** Treat this as a limited negative result, not proof that the target is secure.  \n\n", strings.ToLower(coverage.Grade)))
+	}
 	if !scanResults.Complete && len(scanResults.Findings) == 0 {
 		report.WriteString("> ⚠️ **No vulnerability candidates were produced by an incomplete scan.** This is a coverage failure, not evidence that the target is secure.  \n\n")
 	}
@@ -121,9 +129,12 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString("| Metric | Value |\n|---|---|\n")
 	report.WriteString(fmt.Sprintf("| Subdomains discovered | %d |\n", len(reconResults.Subdomains)))
 	report.WriteString(fmt.Sprintf("| URLs discovered | %d |\n", len(reconResults.URLs)))
+	report.WriteString(fmt.Sprintf("| Parameterized URLs discovered | %d |\n", coverage.ParameterizedURLs))
 	report.WriteString(fmt.Sprintf("| JS files analyzed | %d |\n", len(reconResults.JSFiles)))
 	report.WriteString(fmt.Sprintf("| Raw tool candidates | %d |\n", len(scanResults.Findings)))
 	report.WriteString(fmt.Sprintf("| Confirmed findings | %d |\n", analysis.Stats.Validated))
+	report.WriteString(fmt.Sprintf("| Coverage grade | %s |\n", coverage.Grade))
+	report.WriteString(fmt.Sprintf("| Negative-result confidence | %s |\n", coverage.NegativeConfidence))
 	report.WriteString(fmt.Sprintf("| Reconnaissance complete | %s |\n", completeMark(reconResults.Complete)))
 	report.WriteString(fmt.Sprintf("| Vulnerability scan complete | %s |\n", completeMark(scanResults.Complete)))
 	failed := append([]string(nil), reconResults.FailedTools...)
@@ -134,6 +145,13 @@ func (g *Generator) generateMarkdownReport(reconResults *recon.Results, scanResu
 	report.WriteString("\n")
 	if len(failed) > 0 {
 		report.WriteString("> ⚠️ One or more tools did not complete. Missing coverage is **not** evidence that the target is secure — re-run or investigate the failed tools.\n\n")
+	}
+	if len(coverage.Notes) > 0 {
+		report.WriteString("**Coverage Notes**:\n")
+		for _, note := range coverage.Notes {
+			report.WriteString(fmt.Sprintf("- %s\n", note))
+		}
+		report.WriteString("\n")
 	}
 
 	// Severity Summary
@@ -403,6 +421,119 @@ func completeMark(complete bool) string {
 		return "✅ yes"
 	}
 	return "⚠️ partial"
+}
+
+type coverageAssessment struct {
+	Grade                string
+	NegativeConfidence   string
+	ZeroFindingRiskLevel string
+	ParameterizedURLs    int
+	Notes                []string
+}
+
+func assessCoverage(reconResults *recon.Results, scanResults *scanner.Results, analysis *analyzer.Analysis) coverageAssessment {
+	paramURLs := countParameterizedURLs(reconResults.URLs)
+	score := 0
+	notes := make([]string, 0)
+
+	switch {
+	case len(reconResults.Subdomains) >= 100:
+		score += 2
+	case len(reconResults.Subdomains) >= 25:
+		score++
+	}
+
+	switch {
+	case len(reconResults.URLs) >= 1000:
+		score += 3
+	case len(reconResults.URLs) >= 250:
+		score += 2
+	case len(reconResults.URLs) >= 75:
+		score++
+	default:
+		notes = append(notes, "URL discovery is shallow; endpoint and parameter coverage may be incomplete.")
+	}
+
+	switch {
+	case paramURLs >= 100:
+		score += 2
+	case paramURLs >= 25:
+		score++
+	default:
+		notes = append(notes, "Few or no parameterized URLs were discovered, limiting injection and reflected-XSS coverage.")
+	}
+
+	switch {
+	case len(reconResults.JSFiles) >= 20:
+		score += 2
+	case len(reconResults.JSFiles) >= 5:
+		score++
+	default:
+		notes = append(notes, "JavaScript coverage is low; client-side endpoints and secrets may be under-sampled.")
+	}
+
+	if reconResults.Complete && scanResults.Complete && len(reconResults.FailedTools)+len(scanResults.FailedTools) == 0 {
+		score++
+	} else {
+		score -= 2
+		notes = append(notes, "One or more enabled tools did not complete, so negative results have reduced confidence.")
+	}
+
+	grade := "Insufficient"
+	switch {
+	case score >= 8:
+		grade = "Deep"
+	case score >= 5:
+		grade = "Moderate"
+	case score >= 3:
+		grade = "Limited"
+	}
+
+	negativeConfidence := "n/a"
+	zeroFindingRisk := "🟢 Low Risk"
+	if len(analysis.ValidatedFindings) == 0 {
+		switch grade {
+		case "Deep":
+			negativeConfidence = "high"
+			zeroFindingRisk = "🟢 Low Observed Risk"
+		case "Moderate":
+			negativeConfidence = "medium"
+			zeroFindingRisk = "🟢 No Confirmed Findings (Moderate Coverage)"
+		default:
+			negativeConfidence = "low"
+			zeroFindingRisk = "⚪ No Confirmed Findings (Limited Coverage)"
+		}
+	}
+
+	return coverageAssessment{
+		Grade:                grade,
+		NegativeConfidence:   negativeConfidence,
+		ZeroFindingRiskLevel: zeroFindingRisk,
+		ParameterizedURLs:    paramURLs,
+		Notes:                notes,
+	}
+}
+
+func countParameterizedURLs(urls []string) int {
+	count := 0
+	seen := make(map[string]bool)
+	for _, rawURL := range urls {
+		if !strings.Contains(rawURL, "?") {
+			continue
+		}
+		base := rawURL
+		if idx := strings.Index(base, "#"); idx >= 0 {
+			base = base[:idx]
+		}
+		if idx := strings.Index(base, "?"); idx >= 0 && idx < len(base)-1 {
+			if seen[base] {
+				continue
+			}
+			seen[base] = true
+			count++
+		}
+	}
+	return count
 }
 
 func (g *Generator) getSeverityEmoji(severity string) string {
