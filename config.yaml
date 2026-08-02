@@ -5,11 +5,13 @@
 # Supported: claude | deepseek | openai | openrouter | custom
 # ═══════════════════════════════════════════════════════
 ai:
-  provider: "auto"                  # auto = detect from .env (claude/deepseek/openai/openrouter)
+  provider: "deepseek"              # Forced to DeepSeek (auto would pick Claude while ANTHROPIC_API_KEY is set).
+                                    # Requires DEEPSEEK_API_KEY in .env.
   api_key: ""                       # Leave empty — key is read from .env automatically
-  model: ""                         # Leave empty for provider default
-  max_tokens: 2000
-  base_url: ""                     # Only needed for openrouter/custom
+  model: "deepseek-v4-flash"        # DeepSeek-V4-Flash-0731. 1M context, tool-calls, thinking mode (default ON).
+  max_tokens: 8000                  # Thinking mode + a 5-finding batch (PoC+impact+remediation) needs headroom;
+                                    # thinking tokens count toward output. 2000 truncated JSON and lost batches.
+  base_url: ""                      # Empty -> https://api.deepseek.com/v1 (set in code). OpenAI-compatible.
   timeout: 300                      # Per-request HTTP timeout (seconds). Raise for slow providers/large JS batches
 
 # Provider presets (just change 'provider' and 'api_key'):
@@ -22,6 +24,13 @@ ai:
 # │ openrouter  │ deepseek/deepseek-chat   │ OPENROUTER_API_KEY         │ varies       │
 # │ custom      │ (must specify)           │ AI_API_KEY                 │ varies       │
 # └─────────────┴──────────────────────────┴────────────────────────────┴──────────────┘
+#
+# DeepSeek model choices (set ai.model to override the default):
+#   • deepseek-chat      → auto-points to DeepSeek's LATEST chat model (V-series). Fast + cheapest.
+#   • deepseek-reasoner  → reasoning model. STRONGEST for security logic / validation. Slower, pricier,
+#                          and REQUIRES max_tokens >= 8000. Recommended for the analysis/triage phase.
+#   • To pin a specific published version (e.g. a dated V4 snapshot), paste its exact API id here —
+#     no code change needed; any OpenAI-compatible model string works.
 
 # Legacy Claude config (backward compatibility - used if ai.api_key is empty)
 claude:
@@ -113,3 +122,13 @@ reporting:
   include_poc: true
   severity_filter: []  # Optional actionable severities: critical, high, medium, low
   output_dir: "./reports"
+
+# Phase 1 — AI Attack-Surface Hunter (hypothesis engine)
+# Reasons over the recon-derived surface to produce ranked attack LEADS
+# (IDOR, access control, business logic, SSRF, injection, auth bypass) that
+# signature scanners cannot find. It NEVER sends a request to the target —
+# every hypothesis is a lead for manual verification.
+hunter:
+  enabled: true
+  max_hypotheses: 40   # cap on ranked leads returned/saved
+  max_endpoints: 120   # cap on surface entries sent to the model (parameterized URLs prioritized)

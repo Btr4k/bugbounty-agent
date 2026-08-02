@@ -23,6 +23,7 @@ type Config struct {
 	Scanning       ScanningConfig       `yaml:"scanning" mapstructure:"scanning"`
 	Analysis       AnalysisConfig       `yaml:"analysis" mapstructure:"analysis"`
 	Reporting      ReportingConfig      `yaml:"reporting" mapstructure:"reporting"`
+	Hunter         HunterConfig         `yaml:"hunter" mapstructure:"hunter"`
 }
 
 // AIConfig unified AI provider configuration
@@ -130,6 +131,16 @@ type ReportingConfig struct {
 	OutputDir      string   `yaml:"output_dir" mapstructure:"output_dir"`
 }
 
+// HunterConfig controls the Phase-1 AI hypothesis engine. It reasons about the
+// recon-derived attack surface to produce ranked attack leads (IDOR, access
+// control, business logic, SSRF, injection, ...) that signature scanners miss.
+// Phase 1 NEVER sends a request to the target — every hypothesis is a lead only.
+type HunterConfig struct {
+	Enabled       bool `yaml:"enabled" mapstructure:"enabled"`
+	MaxHypotheses int  `yaml:"max_hypotheses" mapstructure:"max_hypotheses"` // cap on ranked leads returned
+	MaxEndpoints  int  `yaml:"max_endpoints" mapstructure:"max_endpoints"`   // cap on surface entries sent to the model
+}
+
 // loadEnvFile loads environment variables from .env file if it exists.
 // Rules: system env vars take precedence over .env; within .env, last value wins.
 func loadEnvFile() {
@@ -180,7 +191,7 @@ func Load(filename string) (*Config, error) {
 
 	// Set defaults
 	viper.SetDefault("ai.provider", "deepseek")
-	viper.SetDefault("ai.max_tokens", 2000)
+	viper.SetDefault("ai.max_tokens", 4000)
 	viper.SetDefault("claude.model", "claude-sonnet-4-20250514")
 	viper.SetDefault("claude.max_tokens", 4000)
 	viper.SetDefault("recon.timeout", 300)
@@ -192,6 +203,9 @@ func Load(filename string) (*Config, error) {
 	viper.SetDefault("ai.timeout", 300)
 	viper.SetDefault("analysis.min_confidence", 0.85)
 	viper.SetDefault("c99.enabled", false)
+	viper.SetDefault("hunter.enabled", true)
+	viper.SetDefault("hunter.max_hypotheses", 40)
+	viper.SetDefault("hunter.max_endpoints", 120)
 
 	// Read config file
 	viper.SetConfigFile(filename)
@@ -346,7 +360,7 @@ func (c *Config) ResolveAIConfig() {
 				c.AI.Model = "claude-sonnet-4-20250514"
 			}
 		case "deepseek":
-			c.AI.Model = "deepseek-chat"
+			c.AI.Model = "deepseek-v4-flash"
 		case "openai":
 			c.AI.Model = "gpt-4o-mini"
 		case "openrouter":
@@ -358,7 +372,10 @@ func (c *Config) ResolveAIConfig() {
 		if c.Claude.MaxTokens > 0 {
 			c.AI.MaxTokens = c.Claude.MaxTokens
 		} else {
-			c.AI.MaxTokens = 2000
+			// A validation batch is 5 findings, each returning PoC + impact +
+			// remediation + context. 2000 truncated the JSON array mid-object,
+			// failing the parse and dropping the whole batch to manual-review.
+			c.AI.MaxTokens = 4000
 		}
 	}
 

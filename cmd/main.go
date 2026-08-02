@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Btr4k/bugbounty-agent/internal/analyzer"
 	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/hunter"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	"github.com/Btr4k/bugbounty-agent/internal/recon"
 	"github.com/Btr4k/bugbounty-agent/internal/reporter"
@@ -553,6 +555,68 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// ═══════════════════════════════════════
 	// Phase 3: AI Analysis
 	// ═══════════════════════════════════════
+	// Phase 2.7: AI Attack-Surface Hunter (hypotheses only — no requests sent)
+	// ═══════════════════════════════════════
+	if cfg.Hunter.Enabled && reconResults != nil {
+		printPhaseHeader("2.7", "AI ATTACK-SURFACE HUNTER", "🧠")
+		phaseStart = time.Now()
+
+		hunterEngine := hunter.NewEngine(cfg, log)
+		hyps, herr := hunterEngine.Generate(ctx, reconResults)
+		if herr != nil {
+			yellow.Printf("  ⚠️  Hunter skipped: %v\n", herr)
+		} else {
+			green.Printf("  ✅ Completed in %s\n", time.Since(phaseStart).Round(time.Second))
+			var observed, inferred []hunter.Hypothesis
+			for _, h := range hyps {
+				if h.Grounding == "observed" {
+					observed = append(observed, h)
+				} else {
+					inferred = append(inferred, h)
+				}
+			}
+			fmt.Printf("  └── 🧠 Attack hypotheses: %s total  (🔬 %s observed · 💭 %s inferred)\n",
+				white.Sprintf("%d", len(hyps)), white.Sprintf("%d", len(observed)), white.Sprintf("%d", len(inferred)))
+			if len(hyps) > 0 {
+				printLead := func(n int, h hunter.Hypothesis) {
+					dim.Printf("     %2d. ", n)
+					fmt.Printf("[%s/%s] %s", strings.ToUpper(h.Severity), h.Class, h.Target)
+					if h.Parameter != "" {
+						fmt.Printf("  (param: %s)", h.Parameter)
+					}
+					fmt.Printf("  — conf %.2f\n", h.Confidence)
+				}
+				if len(observed) > 0 {
+					fmt.Println()
+					green.Println("  🔬 Grounded leads (parameter/path seen in recon — verify manually):")
+					for i, h := range observed {
+						if i >= 10 {
+							break
+						}
+						printLead(i+1, h)
+					}
+				}
+				if len(inferred) > 0 {
+					fmt.Println()
+					yellow.Println("  💭 Inferred leads (guessed from naming — confirm the endpoint EXISTS first):")
+					for i, h := range inferred {
+						if i >= 10 {
+							break
+						}
+						printLead(i+1, h)
+					}
+				}
+				if path, werr := saveHypotheses(cfg.Reporting.OutputDir, targetDomain, hyps); werr != nil {
+					yellow.Printf("  ⚠️  Could not save hypotheses file: %v\n", werr)
+				} else {
+					fmt.Printf("  └── 📄 Hypotheses: %s\n", cyan.Sprintf("%s", path))
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	// ═══════════════════════════════════════
 	printPhaseHeader("3", "AI-POWERED ANALYSIS", "🤖")
 	phaseStart = time.Now()
 
@@ -595,6 +659,25 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		len(analysisResults.ValidatedFindings), reconResults.Complete && scanResults.Complete)
 
 	return nil
+}
+
+func saveHypotheses(outputDir, target string, hyps []hunter.Hypothesis) (string, error) {
+	if outputDir == "" {
+		outputDir = "./reports"
+	}
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return "", err
+	}
+	safe := regexp.MustCompile(`[^a-zA-Z0-9._-]+`).ReplaceAllString(target, "_")
+	path := filepath.Join(outputDir, fmt.Sprintf("hypotheses-%s-%s.json", safe, time.Now().Format("20060102-150405")))
+	data, err := json.MarshalIndent(hyps, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func ensureToolBinsOnPath() {
