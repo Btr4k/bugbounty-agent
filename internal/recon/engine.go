@@ -288,6 +288,19 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		start := time.Now()
 		results.JSFiles = e.downloadJSFiles(ctx, jsURLs)
 		e.log.ToolDone("JS Download", len(results.JSFiles), time.Since(start))
+
+		// Mine endpoints/parameters out of the downloaded JS. This is what turns a
+		// subdomain-only surface into one with real, observed endpoints — enabling
+		// dalfox and letting the hunter ground its leads instead of guessing.
+		if mined := mineJSEndpoints(results.JSFiles); len(mined) > 0 {
+			before := len(results.URLs)
+			results.URLs = append(results.URLs, mined...)
+			results.URLs = e.deduplicate(results.URLs)
+			results.URLs = policy.FilterURLs(results.URLs)
+			if added := len(results.URLs) - before; added > 0 {
+				e.log.PhaseNote(fmt.Sprintf("Mined %d in-scope endpoint(s) from JS", added))
+			}
+		}
 	}
 
 	if len(toolErrors) > 0 {
