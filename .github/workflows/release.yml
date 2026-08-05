@@ -22,8 +22,33 @@ jobs:
           go-version: "1.25.x"
           cache: true
 
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal evals)"
+
+      - name: Verify modules
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+      - name: Verify tag matches application version
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_version="$(sed -n 's/^const appVersion = "\([^"]*\)"/\1/p' cmd/main.go)"
+          test -n "$app_version"
+          test "$GITHUB_REF_NAME" = "v${app_version}"
 
       - name: Build release archives
         shell: bash

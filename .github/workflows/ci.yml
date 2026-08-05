@@ -25,7 +25,7 @@ jobs:
           cache: true
 
       - name: Check formatting
-        run: test -z "$(gofmt -l cmd internal)"
+        run: test -z "$(gofmt -l cmd internal evals)"
 
       - name: Verify modules
         run: |
@@ -33,10 +33,10 @@ jobs:
           git diff --exit-code -- go.mod go.sum
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Race test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       - name: Vet
         run: go vet ./...
