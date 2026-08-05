@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -19,13 +21,62 @@ import (
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	"github.com/Btr4k/bugbounty-agent/internal/recon"
+	"github.com/Btr4k/bugbounty-agent/internal/redaction"
 	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
-type Engine struct {
-	cfg *config.Config
-	log *logger.Logger
+const (
+	toolStdoutLimit = 16 << 20 // 16 MiB of machine-readable output
+	toolStderrLimit = 64 << 10 // 64 KiB of diagnostics
+	toolLineLimit   = 1 << 20  // 1 MiB per result record
+)
+
+// boundedCapture implements io.Writer without allowing a noisy or compromised
+// subprocess to grow the agent's memory without bound. Write always reports the
+// input as consumed so os/exec can continue draining the child process after
+// the retained prefix reaches the configured limit.
+type boundedCapture struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
 }
+
+func newBoundedCapture(limit int) *boundedCapture {
+	return &boundedCapture{limit: limit}
+}
+
+func (capture *boundedCapture) Write(input []byte) (int, error) {
+	originalLength := len(input)
+	remaining := capture.limit - capture.buffer.Len()
+	if remaining > 0 {
+		if remaining > len(input) {
+			remaining = len(input)
+		}
+		_, _ = capture.buffer.Write(input[:remaining])
+	}
+	if remaining < len(input) {
+		capture.truncated = true
+	}
+	return originalLength, nil
+}
+
+func (capture *boundedCapture) Bytes() []byte  { return capture.buffer.Bytes() }
+func (capture *boundedCapture) String() string { return capture.buffer.String() }
+func (capture *boundedCapture) Len() int       { return capture.buffer.Len() }
+func (capture *boundedCapture) Truncated() bool {
+	return capture.truncated
+}
+
+type Engine struct {
+	cfg                     *config.Config
+	log                     *logger.Logger
+	authWarningOnce         sync.Once
+	externalTargetValidator externalTargetValidator
+}
+
+type externalTargetValidator func(context.Context, string) error
+
+var errExternalTargetRejected = errors.New("external target rejected")
 
 type Results struct {
 	Findings    []Finding
@@ -55,13 +106,23 @@ type Finding struct {
 }
 
 type ScanStats struct {
-	TotalScanned  int
-	TotalFindings int
-	Critical      int
-	High          int
-	Medium        int
-	Low           int
-	Info          int
+	// Coverage counters are tool-target work items. A target scanned by two
+	// enabled tools contributes two attempted/scanned items. This preserves the
+	// distinction between host coverage and the number of unique hosts.
+	TotalAttempted       int
+	TotalScanned         int
+	TotalSkipped         int
+	TotalFailed          int
+	SubstantiveAttempted int
+	SubstantiveScanned   int
+	SubstantiveSkipped   int
+	SubstantiveFailed    int
+	TotalFindings        int
+	Critical             int
+	High                 int
+	Medium               int
+	Low                  int
+	Info                 int
 }
 
 func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
@@ -69,6 +130,205 @@ func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
 		cfg: cfg,
 		log: log,
 	}
+}
+
+// externalTargetGuard returns the injected test/runtime guard when present.
+// Production callers otherwise get the same scope and public-address checks as
+// the guarded in-process HTTP client. The child tools still resolve hostnames
+// independently, so this narrows their DNS-rebinding window but cannot pin the
+// address they ultimately connect to.
+func (e *Engine) externalTargetGuard() externalTargetValidator {
+	if e != nil && e.externalTargetValidator != nil {
+		return e.externalTargetValidator
+	}
+	if e == nil || e.cfg == nil {
+		return func(context.Context, string) error {
+			return errors.New("scanner configuration is unavailable")
+		}
+	}
+	policy := scopepolicy.New(e.cfg.Target)
+	policyErr := policy.ValidationError()
+	return func(ctx context.Context, rawTarget string) error {
+		if policyErr != nil {
+			return policyErr
+		}
+
+		trimmed := strings.TrimSpace(rawTarget)
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "https://"):
+			return policy.ValidateURL(ctx, trimmed)
+		case strings.Contains(lower, "://"):
+			return errors.New("unsupported target scheme")
+		default:
+			_, err := policy.ResolveAndValidateHost(ctx, trimmed)
+			return err
+		}
+	}
+}
+
+// externalTargetHost returns a diagnostic label that cannot contain URL paths,
+// query values, fragments, or userinfo. Validation failures must never echo the
+// raw target because discovered URLs can contain opaque credentials.
+func externalTargetHost(rawTarget string) string {
+	trimmed := strings.TrimSpace(rawTarget)
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Hostname() != "" {
+		return strings.ToLower(parsed.Hostname())
+	}
+	if host, _, err := net.SplitHostPort(trimmed); err == nil {
+		trimmed = host
+	}
+	trimmed = strings.Trim(strings.ToLower(trimmed), ".")
+	if trimmed == "" || len(trimmed) > 253 || strings.Contains(trimmed, "..") || !validDomainRegex.MatchString(trimmed) {
+		return "<invalid>"
+	}
+	return trimmed
+}
+
+func validateExternalTargetWith(
+	ctx context.Context,
+	validator externalTargetValidator,
+	rawTarget string,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validator(ctx, rawTarget); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("%w: host %q failed scope/public-address validation", errExternalTargetRejected, externalTargetHost(rawTarget))
+	}
+	return nil
+}
+
+// partitionExternalTargets preserves safe work while rejecting targets that do
+// not resolve exclusively to public addresses. It deliberately reports only a
+// count and hostname label, never a raw URL or query string.
+func (e *Engine) partitionExternalTargets(ctx context.Context, targets []string) ([]string, int, error) {
+	validator := e.externalTargetGuard()
+	safe := make([]string, 0, len(targets))
+	rejected := 0
+	firstRejectedHost := ""
+	for index, target := range targets {
+		if err := validateExternalTargetWith(ctx, validator, target); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				rejected += len(targets) - index
+				return safe, rejected, err
+			}
+			rejected++
+			if firstRejectedHost == "" {
+				firstRejectedHost = externalTargetHost(target)
+			}
+			continue
+		}
+		safe = append(safe, target)
+	}
+	if rejected > 0 {
+		return safe, rejected, fmt.Errorf("%w: %d of %d target(s) failed scope/public-address validation; first host %q", errExternalTargetRejected, rejected, len(targets), firstRejectedHost)
+	}
+	return safe, 0, nil
+}
+
+// ensureExternalTargets is the second, immediate pre-exec boundary. A changed
+// DNS answer fails the invocation closed; orchestration already partitioned the
+// initial list so stable safe targets are still executed independently of the
+// initially rejected targets.
+func (e *Engine) ensureExternalTargets(ctx context.Context, targets []string) error {
+	_, rejected, err := e.partitionExternalTargets(ctx, targets)
+	if err != nil {
+		return err
+	}
+	if rejected != 0 {
+		return fmt.Errorf("%w: %d target(s) rejected immediately before execution", errExternalTargetRejected, rejected)
+	}
+	return nil
+}
+
+// safeToolDiagnostic removes configured and discovered credentials and folds
+// control characters before subprocess-controlled text reaches logs or errors.
+func (e *Engine) safeToolDiagnostic(value string) string {
+	if e.cfg != nil {
+		value = e.cfg.Redact(value)
+	}
+	value = redaction.SanitizeURLsInText(value)
+	return strings.TrimSpace(redaction.Mask(value))
+}
+
+func truncateToolField(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maximum {
+		return value
+	}
+	return string(runes[:maximum]) + "…"
+}
+
+func (e *Engine) safeFindingField(value string, maximum int) string {
+	value = redaction.SanitizeURLsInText(value)
+	if e.cfg != nil {
+		value = e.cfg.Redact(value)
+	}
+	return truncateToolField(redaction.Mask(value), maximum)
+}
+
+func (e *Engine) safeFindingBlock(value string, maximum int) string {
+	value = redaction.SanitizeURLsInText(value)
+	if e.cfg != nil {
+		value = e.cfg.Redact(value)
+	}
+	return truncateToolField(redaction.MaskMultiline(value), maximum)
+}
+
+func (e *Engine) safeFindingURL(value string) string {
+	value = redaction.SanitizeURL(value)
+	if e.cfg != nil {
+		value = e.cfg.Redact(value)
+	}
+	return truncateToolField(redaction.Mask(value), 4096)
+}
+
+func safeStringSlice(values []string, maximumItems int, sanitize func(string) string) []string {
+	if len(values) > maximumItems {
+		values = values[:maximumItems]
+	}
+	safe := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = sanitize(value); value != "" {
+			safe = append(safe, value)
+		}
+	}
+	return safe
+}
+
+// writeTargetLines makes a subprocess input file complete-or-error. Ignoring a
+// short write, buffered flush, or close error can make a tool scan an empty or
+// partial target list while orchestration incorrectly records full coverage.
+func writeTargetLines(file io.WriteCloser, targets []string) error {
+	if file == nil {
+		return errors.New("target file is unavailable")
+	}
+	writer := bufio.NewWriter(file)
+	for _, target := range targets {
+		if _, err := writer.WriteString(target); err != nil {
+			_ = file.Close()
+			return errors.New("target file write failed")
+		}
+		if err := writer.WriteByte('\n'); err != nil {
+			_ = file.Close()
+			return errors.New("target file write failed")
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		_ = file.Close()
+		return errors.New("target file flush failed")
+	}
+	if err := file.Close(); err != nil {
+		return errors.New("target file close failed")
+	}
+	return nil
 }
 
 func (e *Engine) boundedRateLimit(toolMaximum int) int {
@@ -93,13 +353,54 @@ func (e *Engine) boundedThreads(toolMaximum int) int {
 	return threads
 }
 
-func (e *Engine) appendHeaderArgs(args []string, flag string, targets ...string) []string {
-	headers := e.cfg.Authentication.HeaderValuesForTargets(targets...)
-	if e.log != nil && e.cfg.Authentication.Configured() && len(headers) == 0 {
-		e.log.Debugf("Authentication not injected: one or more targets are not in authentication.allowed_hosts")
+// conservativeConcurrency keeps in-flight work at or below both the configured
+// thread ceiling and request-rate ceiling. A low rate limit must never be
+// undermined by dozens of concurrent workers waiting to burst requests.
+func (e *Engine) conservativeConcurrency(toolMaximum int) int {
+	workers := e.boundedThreads(toolMaximum)
+	rate := e.boundedRateLimit(0)
+	if workers > rate {
+		workers = rate
 	}
-	for name, value := range headers {
-		args = append(args, flag, name+": "+value)
+	if workers < 1 {
+		return 1
+	}
+	return workers
+}
+
+// dalfoxDelayMillis translates the global requests/second ceiling into a
+// conservative per-worker delay. Rounding up avoids exceeding the requested
+// rate due to integer truncation.
+func dalfoxDelayMillis(workers, rate int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	if rate < 1 {
+		rate = 1
+	}
+	delay := (1000*workers + rate - 1) / rate
+	if delay < 1 {
+		return 1
+	}
+	return delay
+}
+
+func addCoverage(stats *ScanStats, attempted, scanned, skipped, failed int) {
+	stats.TotalAttempted += attempted
+	stats.TotalScanned += scanned
+	stats.TotalSkipped += skipped
+	stats.TotalFailed += failed
+}
+
+// withoutExternalToolAuth intentionally leaves authentication credentials out
+// of subprocess arguments. Command lines are observable through process
+// inspection and CI/runtime telemetry, so even allowlisted credentials belong
+// only in the guarded in-process HTTPS client.
+func (e *Engine) withoutExternalToolAuth(args []string) []string {
+	if e.cfg.Authentication.Configured() && e.log != nil {
+		e.authWarningOnce.Do(func() {
+			e.log.Warn("Authentication credentials are not passed to external scanner processes; authenticated requests require the guarded internal HTTPS client")
+		})
 	}
 	return args
 }
@@ -120,18 +421,54 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		Complete:    true,
 		FailedTools: make([]string, 0),
 	}
+	if reconResults == nil {
+		results.Complete = false
+		results.FailedTools = append(results.FailedTools, "recon-input")
+		return results, errors.New("scan requires non-nil reconnaissance results")
+	}
 	policy := scopepolicy.New(e.cfg.Target)
+	if err := policy.ValidationError(); err != nil {
+		results.Complete = false
+		results.FailedTools = append(results.FailedTools, "scope")
+		return results, fmt.Errorf("invalid scan scope: %w", err)
+	}
 	reconResults.Subdomains = policy.FilterHosts(reconResults.Subdomains)
 	reconResults.URLs = policy.FilterURLs(reconResults.URLs)
 
 	mu := &sync.Mutex{}
 	var toolErrors []error
+	failedToolSet := make(map[string]bool)
 	recordToolError := func(tool string, err error) {
 		mu.Lock()
-		toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
 		results.Complete = false
-		results.FailedTools = append(results.FailedTools, tool)
+		if !failedToolSet[tool] {
+			failedToolSet[tool] = true
+			toolErrors = append(toolErrors, fmt.Errorf("%s: %w", tool, err))
+			results.FailedTools = append(results.FailedTools, tool)
+		}
 		mu.Unlock()
+	}
+	filterExternalTargets := func(tool string, toolCtx context.Context, targets []string, substantive bool) []string {
+		safe, rejected, validationErr := e.partitionExternalTargets(toolCtx, targets)
+		if rejected > 0 {
+			results.Stats.TotalFailed += rejected
+			if substantive {
+				results.Stats.SubstantiveFailed += rejected
+			}
+			e.log.Warnf("%s public-address validation rejected %d target(s); safe targets will continue and coverage is partial", tool, rejected)
+		}
+		if validationErr != nil {
+			recordToolError(strings.ToLower(tool), validationErr)
+		}
+		return safe
+	}
+	recordCap := func(tool string, skipped int) {
+		if skipped <= 0 {
+			return
+		}
+		results.Stats.TotalSkipped += skipped
+		results.Complete = false
+		e.log.Warnf("%s target cap skipped %d eligible target(s); coverage is partial", tool, skipped)
 	}
 
 	// Show what tools will run
@@ -140,7 +477,7 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 	// Per-tool timeout (default: scanning timeout from config)
 	toolTimeout := time.Duration(e.cfg.Scanning.Timeout) * time.Second
-	if toolTimeout == 0 {
+	if toolTimeout <= 0 {
 		toolTimeout = 5 * time.Minute
 	}
 
@@ -149,26 +486,37 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	// ════════════════════════════════════════════════
 	var liveHosts []string
 	if e.cfg.Scanning.Tools.Httpx.Enabled {
-		e.log.ToolStart("Httpx", fmt.Sprintf("probing %d targets for live hosts...", len(reconResults.Subdomains)))
+		httpxTargets := append([]string(nil), reconResults.Subdomains...)
+		results.Stats.TotalAttempted += len(httpxTargets)
+		httpxCtx, httpxCancel := context.WithTimeout(ctx, toolTimeout)
+		httpxTargets = filterExternalTargets("Httpx", httpxCtx, httpxTargets, false)
+		e.log.ToolStart("Httpx", fmt.Sprintf("probing %d public-address-validated targets for live hosts...", len(httpxTargets)))
 		start := time.Now()
 
-		httpxCtx, httpxCancel := context.WithTimeout(ctx, 7*time.Minute)
 		var hosts []string
 		var findings []Finding
 		var err error
 
-		// Retry httpx up to 2 times — it sometimes fails on first attempt
+		// Retry once only after a real tool error. A successful zero-live-host
+		// result is valid and must not double the target's request volume.
 		for attempt := 1; attempt <= 2; attempt++ {
-			findings, hosts, err = e.runHttpx(httpxCtx, reconResults.Subdomains)
-			if err == nil && len(hosts) > 0 {
+			attemptFindings, attemptHosts, attemptErr := e.runHttpx(httpxCtx, httpxTargets)
+			findings = append(findings, attemptFindings...)
+			hosts = deduplicateURLs(append(hosts, attemptHosts...))
+			err = attemptErr
+			if err == nil {
+				break
+			}
+			if errors.Is(err, errExternalTargetRejected) {
 				break
 			}
 			if attempt < 2 {
-				e.log.Warnf("Httpx attempt %d/2 returned no hosts — retrying in 3s", attempt)
+				e.log.Warnf("Httpx attempt %d/2 failed — retrying in 3s", attempt)
 				select {
-				case <-ctx.Done():
+				case <-httpxCtx.Done():
 					httpxCancel()
-					return results, ctx.Err()
+					err = httpxCtx.Err()
+					attempt = 2
 				case <-time.After(3 * time.Second):
 				}
 			}
@@ -176,9 +524,12 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		httpxCancel()
 
 		if err != nil {
+			confirmed := countMatchedHostTargets(httpxTargets, policy.FilterURLs(hosts))
+			addCoverage(&results.Stats, 0, confirmed, 0, len(httpxTargets)-confirmed)
 			e.log.ToolFail("Httpx", err)
 			recordToolError("httpx", err)
 		} else {
+			results.Stats.TotalScanned += len(httpxTargets)
 			e.log.ToolDone("Httpx", len(hosts), time.Since(start))
 			e.log.PhaseNote(fmt.Sprintf("Live hosts: %d / %d subdomains respond", len(hosts), totalTargets))
 			liveHosts = hosts
@@ -223,7 +574,15 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		// uncapped sweep never finishes, and which findings surface before the
 		// deadline becomes luck. Hosts are prioritized, so the cap keeps the
 		// high-value names (api, admin, www, …) and drops CT-log noise.
-		nucleiTargets := prioritizeNucleiTargets(deduplicateURLs(liveHosts), 25)
+		allNucleiTargets := deduplicateURLs(liveHosts)
+		nucleiTargets := prioritizeNucleiTargets(allNucleiTargets, 25)
+		nucleiSkipped := len(allNucleiTargets) - len(nucleiTargets)
+		recordCap("Nuclei", nucleiSkipped)
+		results.Stats.SubstantiveSkipped += nucleiSkipped
+		results.Stats.TotalAttempted += len(nucleiTargets)
+		results.Stats.SubstantiveAttempted += len(nucleiTargets)
+		nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
+		nucleiTargets = filterExternalTargets("Nuclei", nucleiCtx, nucleiTargets, true)
 
 		e.log.Debugf("Nuclei targets: %d full URLs", len(nucleiTargets))
 		if len(nucleiTargets) > 0 {
@@ -231,13 +590,16 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			if len(nucleiTargets) < limit {
 				limit = len(nucleiTargets)
 			}
-			e.log.Debugf("Sample targets: %v", nucleiTargets[:limit])
+			hosts := make([]string, 0, limit)
+			for _, target := range nucleiTargets[:limit] {
+				hosts = append(hosts, externalTargetHost(target))
+			}
+			e.log.Debugf("Sample target hosts: %v", hosts)
 		}
 
-		e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d live targets with high-value templates...", len(nucleiTargets)))
+		e.log.ToolStart("Nuclei", fmt.Sprintf("scanning %d public-address-validated live targets with high-value templates...", len(nucleiTargets)))
 		start := time.Now()
 
-		nucleiCtx, nucleiCancel := context.WithTimeout(ctx, toolTimeout)
 		// Retry only twice: a hard failure with partial results is usually a
 		// budget issue, not a transient network blip, so endless retries only
 		// burn the remaining budget. Partial findings are always preserved.
@@ -251,19 +613,23 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 		}
 		switch {
 		case err == nil:
+			results.Stats.TotalScanned += len(nucleiTargets)
+			results.Stats.SubstantiveScanned += len(nucleiTargets)
 			e.log.ToolDone("Nuclei", len(findings), time.Since(start))
 		case timedOut:
-			// The budget expired. Nuclei is time-boxed, NOT failed: it ran fine
-			// and its findings were preserved to the -o file. Treat this as a
+			// The budget expired. Nuclei is time-boxed, NOT failed: it ran and
+			// findings already emitted to the bounded stdout stream were kept. Treat this as a
 			// coverage limit (partial), not a tool failure — so the report does
 			// not show a scary "❌ failed" while still being honest that not
 			// every host was fully scanned.
 			e.log.Warnf("Nuclei time-boxed at the %s budget — %d finding(s) kept; host coverage is partial", toolTimeout, len(findings))
 			e.log.ToolDone("Nuclei", len(findings), time.Since(start))
-			mu.Lock()
+			results.Stats.TotalFailed += len(nucleiTargets)
+			results.Stats.SubstantiveFailed += len(nucleiTargets)
 			results.Complete = false
-			mu.Unlock()
 		default:
+			results.Stats.TotalFailed += len(nucleiTargets)
+			results.Stats.SubstantiveFailed += len(nucleiTargets)
 			e.log.ToolFail("Nuclei", err)
 			recordToolError("nuclei", err)
 		}
@@ -273,21 +639,30 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 
 	// ── Nmap: opt-in port scanning (disabled by default — recon only).
 	if e.cfg.Scanning.Tools.Nmap.Enabled {
-		nmapCount := len(liveHosts)
-		if nmapCount > 25 {
-			nmapCount = 25
+		nmapCandidates := prioritizeTargets(validateSubdomains(liveHosts))
+		nmapTargets := nmapCandidates
+		if len(nmapTargets) > 25 {
+			nmapTargets = nmapTargets[:25]
 		}
-		e.log.ToolStart("Nmap", fmt.Sprintf("port scanning %d live targets (ports: %s)...",
-			nmapCount, e.cfg.Scanning.Tools.Nmap.Ports))
+		recordCap("Nmap", len(nmapCandidates)-len(nmapTargets))
+		results.Stats.TotalAttempted += len(nmapTargets)
+		nmapCtx, nmapCancel := context.WithTimeout(ctx, toolTimeout)
+		nmapTargets = filterExternalTargets("Nmap", nmapCtx, nmapTargets, false)
+		e.log.ToolStart("Nmap", fmt.Sprintf("port scanning %d public-address-validated live targets (ports: %s)...",
+			len(nmapTargets), e.cfg.Scanning.Tools.Nmap.Ports))
 		start := time.Now()
 
-		findings, err := e.runNmap(ctx, liveHosts)
+		findings, scanned, failed, err := e.runNmapWithStats(nmapCtx, nmapTargets)
+		nmapCancel()
+		addCoverage(&results.Stats, 0, scanned, 0, failed)
+		if len(findings) > 0 {
+			results.Findings = append(results.Findings, findings...)
+		}
 		if err != nil {
 			e.log.ToolFail("Nmap", err)
 			recordToolError("nmap", err)
 		} else {
 			e.log.ToolDone("Nmap", len(findings), time.Since(start))
-			results.Findings = append(results.Findings, findings...)
 		}
 	} else {
 		e.log.ToolSkip("Nmap", "disabled in config")
@@ -296,6 +671,13 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 	// ── Dalfox: reflected-XSS fuzzing of parameterized URLs (runs last, alone).
 	if e.cfg.Scanning.Tools.Dalfox.Enabled {
 		allParamURLs := deduplicateURLs(extractParameterizedURLs(reconResults.URLs))
+		sort.Slice(allParamURLs, func(i, j int) bool {
+			left, right := strings.ToLower(allParamURLs[i]), strings.ToLower(allParamURLs[j])
+			if left != right {
+				return left < right
+			}
+			return allParamURLs[i] < allParamURLs[j]
+		})
 
 		if len(allParamURLs) == 0 {
 			e.log.ToolSkip("Dalfox", "no parameterized URLs found")
@@ -304,23 +686,38 @@ func (e *Engine) Run(ctx context.Context, reconResults *recon.Results) (*Results
 			if maxURLs <= 0 {
 				maxURLs = 75
 			}
-			if len(allParamURLs) > maxURLs {
+			eligibleCount := len(allParamURLs)
+			if eligibleCount > maxURLs {
 				allParamURLs = allParamURLs[:maxURLs]
 			}
+			dalfoxSkipped := eligibleCount - len(allParamURLs)
+			recordCap("Dalfox", dalfoxSkipped)
+			results.Stats.SubstantiveSkipped += dalfoxSkipped
+			results.Stats.TotalAttempted += len(allParamURLs)
+			results.Stats.SubstantiveAttempted += len(allParamURLs)
 
-			e.log.ToolStart("Dalfox", fmt.Sprintf("XSS fuzzing %d parameterized URLs...", len(allParamURLs)))
+			dalfoxTimeout := toolTimeout
+			if dalfoxTimeout > 5*time.Minute {
+				dalfoxTimeout = 5 * time.Minute
+			}
+			dalfoxCtx, dalfoxCancel := context.WithTimeout(ctx, dalfoxTimeout)
+			allParamURLs = filterExternalTargets("Dalfox", dalfoxCtx, allParamURLs, true)
+			e.log.ToolStart("Dalfox", fmt.Sprintf("XSS fuzzing %d public-address-validated parameterized URLs...", len(allParamURLs)))
 			start := time.Now()
 
-			dalfoxCtx, dalfoxCancel := context.WithTimeout(ctx, 5*time.Minute)
 			findings, err := e.runDalfox(dalfoxCtx, allParamURLs)
 			dalfoxCancel()
 			if len(findings) > 0 {
 				results.Findings = append(results.Findings, findings...)
 			}
 			if err != nil {
+				results.Stats.TotalFailed += len(allParamURLs)
+				results.Stats.SubstantiveFailed += len(allParamURLs)
 				e.log.ToolFail("Dalfox", err)
 				recordToolError("dalfox", err)
 			} else {
+				results.Stats.TotalScanned += len(allParamURLs)
+				results.Stats.SubstantiveScanned += len(allParamURLs)
 				e.log.ToolDone("Dalfox", len(findings), time.Since(start))
 			}
 		}
@@ -360,6 +757,13 @@ func deduplicateFindings(policy *scopepolicy.Policy, findings []Finding) []Findi
 			continue
 		}
 		key := strings.ToLower(finding.Title + "|" + finding.URL)
+		if port, ok := nmapPortIdentity(finding); ok {
+			key = "nmap|" + strings.ToLower(finding.Target) + "|" + port
+		} else if finding.URL == "" {
+			// Host-oriented findings (notably Nmap) have no URL. Include the
+			// target and evidence so distinct observations are not collapsed.
+			key = strings.ToLower(finding.Title + "|" + finding.Target + "|" + finding.Evidence)
+		}
 		if exactSeen[key] {
 			continue
 		}
@@ -367,6 +771,47 @@ func deduplicateFindings(policy *scopepolicy.Policy, findings []Finding) []Findi
 		deduped = append(deduped, finding)
 	}
 	return deduped
+}
+
+// nmapPortIdentity returns the stable host-local service identity used for
+// deduplication. Service banners may vary between observations, but the same
+// host and port/protocol still represent one open-port finding.
+func nmapPortIdentity(finding Finding) (string, bool) {
+	if finding.ID != "nmap-open-port" && finding.Type != "port-scan" {
+		return "", false
+	}
+	fields := strings.Fields(finding.Evidence)
+	if len(fields) == 0 {
+		return "", false
+	}
+	parts := strings.SplitN(strings.ToLower(fields[0]), "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+	for _, digit := range parts[0] {
+		if digit < '0' || digit > '9' {
+			return "", false
+		}
+	}
+	return parts[0] + "/" + parts[1], true
+}
+
+// countMatchedHostTargets conservatively counts only requested hosts for which
+// httpx emitted a result. Extra output, redirects to another in-scope host, or
+// repeated scheme/port variants must not make incomplete coverage look full.
+func countMatchedHostTargets(targets, liveHosts []string) int {
+	requested := make(map[string]bool)
+	for _, target := range validateSubdomains(targets) {
+		requested[strings.ToLower(target)] = true
+	}
+	matched := make(map[string]bool)
+	for _, host := range validateSubdomains(liveHosts) {
+		host = strings.ToLower(host)
+		if requested[host] {
+			matched[host] = true
+		}
+	}
+	return len(matched)
 }
 
 // runNucleiDirect runs Nuclei with full URLs directly (preserves ports from httpx)
@@ -383,14 +828,17 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	}
 	defer os.Remove(tmpFile.Name())
 
+	targetLines := make([]string, 0, len(targets))
 	for _, target := range targets {
 		// Ensure protocol prefix
 		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 			target = "https://" + target
 		}
-		fmt.Fprintln(tmpFile, target)
+		targetLines = append(targetLines, target)
 	}
-	tmpFile.Close()
+	if err := writeTargetLines(tmpFile, targetLines); err != nil {
+		return nil, fmt.Errorf("nuclei %w", err)
+	}
 
 	// Reuse existing Nuclei command builder logic
 	args := []string{
@@ -403,8 +851,8 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	if len(e.cfg.Scanning.Tools.Nuclei.Severity) > 0 {
 		args = append(args, "-severity", strings.Join(e.cfg.Scanning.Tools.Nuclei.Severity, ","))
 	} else {
-		// Informational templates are intentionally excluded from analysis and
-		// reports, so do not spend the scan budget running them by default.
+		// Do not spend the default scan budget on informational templates. If an
+		// operator enables them explicitly, the analyzer still accounts for them.
 		args = append(args, "-severity", "critical,high,medium,low")
 	}
 	tags := e.cfg.Scanning.Tools.Nuclei.Tags
@@ -444,9 +892,11 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 
 	args = append(args, "-etags", "dos,fuzz,intrusive,iot")
 
-	concurrency := e.boundedThreads(100)
+	concurrency := e.conservativeConcurrency(100)
+	rateLimit := e.boundedRateLimit(0)
+	bulkSize := e.conservativeConcurrency(25)
 	args = append(args, "-c", fmt.Sprintf("%d", concurrency))
-	args = append(args, "-rl", fmt.Sprintf("%d", e.cfg.Scanning.RateLimit))
+	args = append(args, "-rl", fmt.Sprintf("%d", rateLimit))
 	// Tight per-request budget: the bottleneck is slow / WAF-throttled hosts
 	// holding connections open. A short timeout + a single retry keeps wasted
 	// time on dead hosts low so the rate-limited scan finishes inside its budget.
@@ -457,47 +907,42 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 	// throws away exactly the findings we want.
 	args = append(args, "-timeout", "7")
 	args = append(args, "-retries", "1")
-	args = append(args, "-bulk-size", "25")
+	args = append(args, "-bulk-size", fmt.Sprintf("%d", bulkSize))
 
-	// Capture findings two ways and use whichever has data. Nuclei prints results
-	// to stdout AND (with -o) to a file; depending on version/buffering, one or
-	// the other is what survives a deadline SIGKILL. Reading both makes partial
-	// results robust instead of silently lost.
-	outFile, ferr := os.CreateTemp("", "nuclei-out-*.jsonl")
-	if ferr != nil {
-		return nil, fmt.Errorf("failed to create nuclei output file: %w", ferr)
-	}
-	outFile.Close()
-	defer os.Remove(outFile.Name())
-	args = append(args, "-o", outFile.Name())
-
-	args = e.appendHeaderArgs(args, "-H", targets...)
+	args = e.withoutExternalToolAuth(args)
 	args = e.appendNucleiRedactionArgs(args)
 
 	e.log.Debugf("Nuclei: scanning %d full URLs", len(targets))
 
 	cmd := exec.CommandContext(ctx, "nuclei", args...)
-	var stderrBuf, stdoutBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-	cmd.Stdout = &stdoutBuf
+	cmd.Env = config.ExternalToolEnvironment()
+	stderrBuf := newBoundedCapture(toolStderrLimit)
+	stdoutBuf := newBoundedCapture(toolStdoutLimit)
+	cmd.Stderr = stderrBuf
+	cmd.Stdout = stdoutBuf
 
-	err = cmd.Run()
+	if validationErr := e.ensureExternalTargets(ctx, targets); validationErr != nil {
+		return nil, fmt.Errorf("nuclei pre-execution target validation: %w", validationErr)
+	}
+	err = runExternalCommand(cmd)
 	if err != nil {
 		e.log.Debugf("Nuclei finished with error: %v", err)
 	}
 
-	// Prefer the -o file; fall back to captured stdout when the file is empty.
-	output, _ := os.ReadFile(outFile.Name())
-	if len(bytes.TrimSpace(output)) == 0 {
-		output = stdoutBuf.Bytes()
-	}
+	// Keep exactly one bounded result stream. Passing -o would let a compromised
+	// or noisy child grow an output file without limit while the process runs.
+	// boundedCapture continues draining after the retained prefix is full, and
+	// truncation is surfaced below as an integrity/coverage error.
+	output := stdoutBuf.Bytes()
+	outputTruncated := stdoutBuf.Truncated()
 
 	// Parse JSON output (same parsing as runNuclei)
 	var findings []Finding
+	malformedLines := 0
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), toolLineLimit)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -517,6 +962,12 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 		}
 
 		if err := json.Unmarshal([]byte(line), &nucleiResult); err != nil {
+			malformedLines++
+			continue
+		}
+		if strings.TrimSpace(nucleiResult.TemplateID) == "" ||
+			(strings.TrimSpace(nucleiResult.MatchedAt) == "" && strings.TrimSpace(nucleiResult.Host) == "") {
+			malformedLines++
 			continue
 		}
 
@@ -527,7 +978,10 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 		var references []string
 
 		if info, ok := nucleiResult.Info["severity"].(string); ok {
-			severity = strings.ToLower(info)
+			switch strings.ToLower(strings.TrimSpace(info)) {
+			case "critical", "high", "medium", "low":
+				severity = strings.ToLower(strings.TrimSpace(info))
+			}
 		}
 		if name, ok := nucleiResult.Info["name"].(string); ok {
 			title = name
@@ -576,41 +1030,53 @@ func (e *Engine) runNucleiDirect(ctx context.Context, targets []string) ([]Findi
 			}
 		}
 
+		safeTags := safeStringSlice(tags, 50, func(value string) string { return e.safeFindingField(value, 128) })
+		safeReferences := safeStringSlice(references, 50, func(value string) string { return e.safeFindingField(value, 2048) })
 		findings = append(findings, Finding{
-			ID:          nucleiResult.TemplateID,
-			Title:       title,
-			Description: description,
+			ID:          e.safeFindingField(nucleiResult.TemplateID, 256),
+			Title:       e.safeFindingField(title, 500),
+			Description: e.safeFindingBlock(description, 4000),
 			Severity:    severity,
-			Type:        nucleiResult.Type,
-			Target:      nucleiResult.Host,
-			URL:         nucleiResult.MatchedAt,
-			Evidence:    e.cfg.Redact(strings.Join(nucleiResult.ExtractedResults, ", ")),
-			Request:     e.cfg.Redact(nucleiResult.Request),
-			Response:    e.cfg.Redact(nucleiResult.Response),
-			CVE:         cve,
-			Tags:        tags,
-			References:  references,
-			Timestamp:   nucleiResult.Timestamp,
+			Type:        e.safeFindingField(nucleiResult.Type, 80),
+			Target:      e.safeFindingField(nucleiResult.Host, 500),
+			URL:         e.safeFindingURL(nucleiResult.MatchedAt),
+			Evidence:    e.safeFindingBlock(strings.Join(nucleiResult.ExtractedResults, ", "), 32<<10),
+			Request:     e.safeFindingBlock(nucleiResult.Request, 256<<10),
+			Response:    e.safeFindingBlock(nucleiResult.Response, 256<<10),
+			CVE:         e.safeFindingField(cve, 80),
+			Tags:        safeTags,
+			References:  safeReferences,
+			Timestamp:   e.safeFindingField(nucleiResult.Timestamp, 80),
 			Metadata: map[string]string{
-				"matcher": nucleiResult.MatcherName,
-				"curl":    e.cfg.Redact(nucleiResult.CURLCommand),
+				"matcher": e.safeFindingField(nucleiResult.MatcherName, 256),
+				"curl":    e.safeFindingBlock(nucleiResult.CURLCommand, 16<<10),
 				"tool":    "nuclei",
 			},
 		})
 	}
-	if scanErr := scanner.Err(); scanErr != nil {
-		return findings, fmt.Errorf("failed to parse nuclei output: %w", scanErr)
-	}
-
 	e.log.Debugf("Nuclei parsed %d findings", len(findings))
-	if err != nil {
-		detail := e.cfg.Redact(strings.TrimSpace(stderrBuf.String()))
-		if detail != "" {
-			return findings, fmt.Errorf("nuclei failed after %d partial finding(s): %w: %s", len(findings), err, detail)
-		}
-		return findings, fmt.Errorf("nuclei failed after %d partial finding(s): %w", len(findings), err)
+	var outputErrors []error
+	if scanErr := scanner.Err(); scanErr != nil {
+		outputErrors = append(outputErrors, fmt.Errorf("failed to parse nuclei output: %w", scanErr))
 	}
-	return findings, nil
+	if malformedLines > 0 {
+		outputErrors = append(outputErrors, fmt.Errorf("nuclei emitted %d malformed JSON result line(s)", malformedLines))
+	}
+	if outputTruncated {
+		outputErrors = append(outputErrors, fmt.Errorf("nuclei result output exceeded the %d-byte capture limit", toolStdoutLimit))
+	}
+	if stderrBuf.Truncated() {
+		outputErrors = append(outputErrors, fmt.Errorf("nuclei diagnostic output exceeded the %d-byte capture limit", toolStderrLimit))
+	}
+	if err != nil {
+		detail := e.safeToolDiagnostic(stderrBuf.String())
+		if detail != "" {
+			outputErrors = append(outputErrors, fmt.Errorf("nuclei failed after %d partial finding(s): %w: %s", len(findings), err, detail))
+		} else {
+			outputErrors = append(outputErrors, fmt.Errorf("nuclei failed after %d partial finding(s): %w", len(findings), err))
+		}
+	}
+	return findings, errors.Join(outputErrors...)
 }
 
 // runWithRetry executes a tool function with exponential backoff retry.
@@ -648,6 +1114,11 @@ func runWithRetry(
 		}
 
 		lastErr = err
+		// A target that failed scope/public-address validation must not become
+		// eligible merely because a retry observes a different DNS answer.
+		if errors.Is(err, errExternalTargetRejected) {
+			return partialFindings, err
+		}
 
 		if attempt < maxRetries {
 			// Exponential backoff: 2s, 4s, 8s...
@@ -729,8 +1200,13 @@ func isProjectDiscoveryHttpx(path string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "-version").CombinedOutput()
-	return err == nil && strings.Contains(strings.ToLower(string(out)), "projectdiscovery")
+	cmd := exec.CommandContext(ctx, path, "-version")
+	cmd.Env = config.ExternalToolEnvironment()
+	stdout := newBoundedCapture(toolStderrLimit)
+	cmd.Stdout = stdout
+	cmd.Stderr = io.Discard
+	err = runExternalCommand(cmd)
+	return err == nil && !stdout.Truncated() && strings.Contains(strings.ToLower(stdout.String()), "projectdiscovery")
 }
 
 func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []string, error) {
@@ -760,17 +1236,16 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 	}
 	defer os.Remove(tmpFile.Name())
 
-	for _, target := range targets {
-		fmt.Fprintln(tmpFile, target)
+	if err := writeTargetLines(tmpFile, targets); err != nil {
+		return nil, nil, fmt.Errorf("httpx %w", err)
 	}
-	tmpFile.Close()
 
 	args := []string{
 		"-l", tmpFile.Name(),
 		"-json",
 		"-silent",
 		"-td",
-		"-t", fmt.Sprintf("%d", e.boundedThreads(100)),
+		"-t", fmt.Sprintf("%d", e.conservativeConcurrency(100)),
 		"-rl", fmt.Sprintf("%d", e.boundedRateLimit(0)),
 	}
 	if e.cfg.Scanning.Tools.Httpx.StatusCode {
@@ -779,30 +1254,34 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 	if e.cfg.Scanning.Tools.Httpx.FollowRedirects {
 		args = append(args, "-fhr")
 	}
-	args = e.appendHeaderArgs(args, "-H", targets...)
+	args = e.withoutExternalToolAuth(args)
 
 	cmd := exec.CommandContext(ctx, httpxBin, args...)
+	cmd.Env = config.ExternalToolEnvironment()
 
-	// Capture stderr for debugging
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := newBoundedCapture(toolStdoutLimit)
+	stderrBuf := newBoundedCapture(toolStderrLimit)
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
-	output, err := cmd.Output()
+	if validationErr := e.ensureExternalTargets(ctx, targets); validationErr != nil {
+		return nil, nil, fmt.Errorf("httpx pre-execution target validation: %w", validationErr)
+	}
+	err = runExternalCommand(cmd)
 	if err != nil {
 		e.log.Debugf("Httpx finished with error: %v", err)
 		if stderrBuf.Len() > 0 {
-			e.log.Debugf("Httpx stderr: %s", e.cfg.Redact(stderrBuf.String()))
-		}
-		if len(output) == 0 {
-			return nil, nil, fmt.Errorf("httpx failed: %w", err)
+			e.log.Debugf("Httpx stderr: %s", e.safeToolDiagnostic(stderrBuf.String()))
 		}
 	}
 
 	// Parse results
 	seen := make(map[string]bool) // deduplicate live hosts
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+	malformedLines := 0
+	scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+	scanner.Buffer(make([]byte, 64*1024), toolLineLimit)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -816,46 +1295,77 @@ func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []s
 		}
 
 		if err := json.Unmarshal([]byte(line), &httpxResult); err != nil {
+			malformedLines++
+			continue
+		}
+		if strings.TrimSpace(httpxResult.URL) == "" {
+			malformedLines++
 			continue
 		}
 
 		// Collect live host URL (any HTTP response = live)
-		if httpxResult.URL != "" && !seen[httpxResult.URL] {
-			seen[httpxResult.URL] = true
-			liveHosts = append(liveHosts, httpxResult.URL)
+		if safeURL := e.safeFindingURL(httpxResult.URL); safeURL != "" && !seen[safeURL] {
+			seen[safeURL] = true
+			liveHosts = append(liveHosts, safeURL)
 		}
 
 		// httpx is a discovery/fingerprinting input. Status codes and technology
 		// names alone are not vulnerabilities and must not enter the report.
 	}
 
-	return findings, liveHosts, nil
+	var outputErrors []error
+	if err != nil {
+		detail := e.safeToolDiagnostic(stderrBuf.String())
+		if detail != "" {
+			outputErrors = append(outputErrors, fmt.Errorf("httpx failed: %w: %s", err, detail))
+		} else {
+			outputErrors = append(outputErrors, fmt.Errorf("httpx failed: %w", err))
+		}
+	}
+	if parseErr := scanner.Err(); parseErr != nil {
+		outputErrors = append(outputErrors, fmt.Errorf("failed to parse httpx output: %w", parseErr))
+	}
+	if malformedLines > 0 {
+		outputErrors = append(outputErrors, fmt.Errorf("httpx emitted %d malformed JSON result line(s)", malformedLines))
+	}
+	if stdoutBuf.Truncated() {
+		outputErrors = append(outputErrors, fmt.Errorf("httpx result output exceeded the %d-byte capture limit", toolStdoutLimit))
+	}
+	if stderrBuf.Truncated() {
+		outputErrors = append(outputErrors, fmt.Errorf("httpx diagnostic output exceeded the %d-byte capture limit", toolStderrLimit))
+	}
+	return findings, liveHosts, errors.Join(outputErrors...)
 }
 
 func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, error) {
+	findings, _, _, err := e.runNmapWithStats(ctx, targets)
+	return findings, err
+}
+
+func (e *Engine) runNmapWithStats(ctx context.Context, targets []string) ([]Finding, int, int, error) {
 
 	var findings []Finding
 	var scanErrors []error
+	scanned := 0
+	failed := 0
 
 	// Validate and filter targets
 	targets = validateSubdomains(targets)
 
-	// Prioritize meaningful subdomains for Nmap (it's resource-intensive)
-	targets = prioritizeTargets(targets)
-
-	// Limit targets (increased from 10 since we now pass live hosts)
-	if len(targets) > 25 {
-		targets = targets[:25]
-	}
-
 	if len(targets) == 0 {
 		e.log.Debug("Nmap: no valid targets after filtering")
-		return findings, nil
+		return findings, scanned, failed, nil
 	}
 
 	e.log.Debugf("Nmap scanning %d targets", len(targets))
 
-	for _, target := range targets {
+	for i, target := range targets {
+		if err := ctx.Err(); err != nil {
+			remaining := len(targets) - i
+			failed += remaining
+			scanErrors = append(scanErrors, fmt.Errorf("%d nmap target(s) not scanned: %w", remaining, err))
+			break
+		}
 		var args []string
 
 		// Fix: -F and -p are mutually exclusive in nmap
@@ -865,26 +1375,42 @@ func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, erro
 			args = append(args, "-F")
 		}
 
-		args = append(args, "--open", "-T4", target)
+		args = append(args,
+			"--open",
+			"-T3",
+			"--max-rate", fmt.Sprintf("%d", e.boundedRateLimit(0)),
+			"--max-parallelism", fmt.Sprintf("%d", e.conservativeConcurrency(32)),
+			target,
+		)
 
 		cmd := exec.CommandContext(ctx, "nmap", args...)
-		var stderrBuf bytes.Buffer
-		cmd.Stderr = &stderrBuf
+		cmd.Env = config.ExternalToolEnvironment()
+		stdoutBuf := newBoundedCapture(toolStdoutLimit)
+		stderrBuf := newBoundedCapture(toolStderrLimit)
+		cmd.Stdout = stdoutBuf
+		cmd.Stderr = stderrBuf
 
-		output, err := cmd.Output()
-		if err != nil {
-			errMsg := stderrBuf.String()
-			if errMsg != "" {
-				e.log.Debugf("Nmap scan failed for %s: %v (stderr: %s)", target, err, errMsg)
-			} else {
-				e.log.Debugf("Nmap scan failed for %s: %v", target, err)
-			}
-			scanErrors = append(scanErrors, fmt.Errorf("%s: %w", target, err))
+		if validationErr := e.ensureExternalTargets(ctx, []string{target}); validationErr != nil {
+			failed++
+			scanErrors = append(scanErrors, fmt.Errorf("host %q: nmap pre-execution target validation: %w", externalTargetHost(target), validationErr))
 			continue
+		}
+		commandErr := runExternalCommand(cmd)
+		var targetErrors []error
+		if commandErr != nil {
+			detail := e.safeToolDiagnostic(stderrBuf.String())
+			if detail != "" {
+				e.log.Debugf("Nmap scan failed for %s: %v (stderr: %s)", target, commandErr, detail)
+				targetErrors = append(targetErrors, fmt.Errorf("command failed: %w: %s", commandErr, detail))
+			} else {
+				e.log.Debugf("Nmap scan failed for %s: %v", target, commandErr)
+				targetErrors = append(targetErrors, fmt.Errorf("command failed: %w", commandErr))
+			}
 		}
 
 		// Parse open ports
-		scanner := bufio.NewScanner(strings.NewReader(string(output)))
+		scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+		scanner.Buffer(make([]byte, 64*1024), toolLineLimit)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if strings.Contains(line, "open") && !strings.Contains(line, "Nmap") {
@@ -895,16 +1421,31 @@ func (e *Engine) runNmap(ctx context.Context, targets []string) ([]Finding, erro
 					Severity:    "info",
 					Type:        "port-scan",
 					Target:      target,
-					Evidence:    line,
+					Evidence:    e.safeToolDiagnostic(line),
 				})
 			}
 		}
+		if scanErr := scanner.Err(); scanErr != nil {
+			targetErrors = append(targetErrors, fmt.Errorf("failed to parse nmap output: %w", scanErr))
+		}
+		if stdoutBuf.Truncated() {
+			targetErrors = append(targetErrors, fmt.Errorf("result output exceeded the %d-byte capture limit", toolStdoutLimit))
+		}
+		if stderrBuf.Truncated() {
+			targetErrors = append(targetErrors, fmt.Errorf("diagnostic output exceeded the %d-byte capture limit", toolStderrLimit))
+		}
+		if len(targetErrors) > 0 {
+			failed++
+			scanErrors = append(scanErrors, fmt.Errorf("%s: %w", target, errors.Join(targetErrors...)))
+			continue
+		}
+		scanned++
 	}
 	if len(scanErrors) > 0 {
-		return findings, errors.Join(scanErrors...)
+		return findings, scanned, failed, errors.Join(scanErrors...)
 	}
 
-	return findings, nil
+	return findings, scanned, failed, nil
 }
 
 func (e *Engine) calculateStats(results *Results) {
@@ -1196,7 +1737,7 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 
 	// Check if dalfox is installed
 	if _, err := exec.LookPath("dalfox"); err != nil {
-		return nil, fmt.Errorf("dalfox not installed (run: go install github.com/hahwul/dalfox/v2@latest)")
+		return nil, fmt.Errorf("dalfox not installed (run ./install.sh)")
 	}
 
 	// Write URLs to temp file
@@ -1206,55 +1747,66 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 	}
 	defer os.Remove(tmpFile.Name())
 
-	for _, u := range urls {
-		fmt.Fprintln(tmpFile, u)
+	if err := writeTargetLines(tmpFile, urls); err != nil {
+		return nil, fmt.Errorf("dalfox %w", err)
 	}
-	tmpFile.Close()
 
 	e.log.Debugf("Dalfox scanning %d parameterized URLs", len(urls))
 
-	// Build dalfox command
+	workers := e.conservativeConcurrency(10)
+	rateLimit := e.boundedRateLimit(0)
+	delayMillis := dalfoxDelayMillis(workers, rateLimit)
+
+	// Dalfox has no requests/second flag. Bound its worker pool and derive a
+	// per-worker delay whose aggregate upper bound respects scanning.rate_limit.
 	args := []string{
 		"file", tmpFile.Name(),
 		"--silence",
 		"--no-color",
 		"--format", "json",
 		"--timeout", "10",
-		"--delay", "100",
-		"--worker", "5",
+		"--delay", fmt.Sprintf("%d", delayMillis),
+		"--worker", fmt.Sprintf("%d", workers),
 		"--only-poc", "r", // Only report reflected XSS PoC
 	}
 
 	// Add blind XSS callback if configured
 	if e.cfg.Scanning.Tools.Dalfox.BlindURL != "" {
+		if err := validateBlindCallbackForExecution(ctx, e.cfg.Scanning.Tools.Dalfox.BlindURL, scopepolicy.PublicOriginOptions{}); err != nil {
+			return nil, err
+		}
 		args = append(args, "-b", e.cfg.Scanning.Tools.Dalfox.BlindURL)
 	}
-	args = e.appendHeaderArgs(args, "--header", urls...)
+	args = e.withoutExternalToolAuth(args)
 
 	cmd := exec.CommandContext(ctx, "dalfox", args...)
+	cmd.Env = config.ExternalToolEnvironment()
 
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := newBoundedCapture(toolStdoutLimit)
+	stderrBuf := newBoundedCapture(toolStderrLimit)
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
-	output, err := cmd.Output()
+	if validationErr := e.ensureExternalTargets(ctx, urls); validationErr != nil {
+		return nil, fmt.Errorf("dalfox pre-execution target validation: %w", validationErr)
+	}
+	err = runExternalCommand(cmd)
 	if err != nil {
 		// Dalfox may return non-zero even with results
 		e.log.Debugf("Dalfox finished with error (may be normal): %v", err)
 		if stderrBuf.Len() > 0 {
-			e.log.Debugf("Dalfox stderr: %s", stderrBuf.String())
-		}
-		if len(output) == 0 {
-			return nil, fmt.Errorf("dalfox failed: %w", err)
+			e.log.Debugf("Dalfox stderr: %s", e.safeToolDiagnostic(stderrBuf.String()))
 		}
 	}
 
 	// Parse JSON output (one JSON object per line)
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+	malformedLines := 0
+	scanner := bufio.NewScanner(strings.NewReader(stdoutBuf.String()))
+	scanner.Buffer(make([]byte, 64*1024), toolLineLimit)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || !strings.HasPrefix(line, "{") {
+		if line == "" {
 			continue
 		}
 
@@ -1270,7 +1822,7 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		}
 
 		if err := json.Unmarshal([]byte(line), &dalfoxResult); err != nil {
-			e.log.Debugf("Dalfox: skipping non-JSON line: %s", line)
+			malformedLines++
 			continue
 		}
 
@@ -1291,28 +1843,32 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 		}
 
 		// Build finding
+		safeParam := e.safeFindingField(dalfoxResult.Param, 120)
+		safeInjectType := e.safeFindingField(dalfoxResult.InjectType, 120)
+		safePOCType := e.safeFindingField(dalfoxResult.PoCType, 80)
+		safePOCURL := e.safeFindingURL(dalfoxResult.PoCURL)
 		title := "XSS"
-		if dalfoxResult.InjectType != "" {
-			title = fmt.Sprintf("XSS (%s)", dalfoxResult.InjectType)
+		if safeInjectType != "" {
+			title = fmt.Sprintf("XSS (%s)", safeInjectType)
 		}
-		if dalfoxResult.Param != "" {
-			title = fmt.Sprintf("%s in param '%s'", title, dalfoxResult.Param)
+		if safeParam != "" {
+			title = fmt.Sprintf("%s in param '%s'", title, safeParam)
 		}
 
 		finding := Finding{
-			ID:          fmt.Sprintf("dalfox-xss-%s", dalfoxResult.Param),
-			Title:       title,
-			Description: fmt.Sprintf("Reflected XSS vulnerability found by parameter fuzzing. Parameter: %s", dalfoxResult.Param),
+			ID:          truncateToolField(fmt.Sprintf("dalfox-xss-%s", safeParam), 256),
+			Title:       truncateToolField(title, 500),
+			Description: fmt.Sprintf("Reflected XSS vulnerability found by parameter fuzzing. Parameter: %s", safeParam),
 			Severity:    severity,
 			Type:        "xss",
-			URL:         dalfoxResult.PoCURL,
-			Evidence:    dalfoxResult.PoCURL,
+			URL:         safePOCURL,
+			Evidence:    safePOCURL,
 			CWE:         "CWE-79",
 			Tags:        []string{"xss", "dalfox", "parameter-fuzzing"},
 			Metadata: map[string]string{
-				"inject_type": dalfoxResult.InjectType,
-				"param":       dalfoxResult.Param,
-				"poc_type":    dalfoxResult.PoCType,
+				"inject_type": safeInjectType,
+				"param":       safeParam,
+				"poc_type":    safePOCType,
 				"tool":        "dalfox",
 			},
 			Timestamp: time.Now().Format(time.RFC3339),
@@ -1320,6 +1876,46 @@ func (e *Engine) runDalfox(ctx context.Context, urls []string) ([]Finding, error
 
 		findings = append(findings, finding)
 	}
+	var outputErrors []error
+	if scanErr := scanner.Err(); scanErr != nil {
+		outputErrors = append(outputErrors, fmt.Errorf("failed to parse dalfox output: %w", scanErr))
+	}
+	if malformedLines > 0 {
+		outputErrors = append(outputErrors, fmt.Errorf("dalfox emitted %d malformed JSON result line(s)", malformedLines))
+	}
+	if stdoutBuf.Truncated() {
+		outputErrors = append(outputErrors, fmt.Errorf("dalfox result output exceeded the %d-byte capture limit", toolStdoutLimit))
+	}
+	if stderrBuf.Truncated() {
+		outputErrors = append(outputErrors, fmt.Errorf("dalfox diagnostic output exceeded the %d-byte capture limit", toolStderrLimit))
+	}
+	if err != nil {
+		detail := e.safeToolDiagnostic(stderrBuf.String())
+		if detail != "" {
+			outputErrors = append(outputErrors, fmt.Errorf("dalfox failed after %d partial finding(s): %w: %s", len(findings), err, detail))
+		} else {
+			outputErrors = append(outputErrors, fmt.Errorf("dalfox failed after %d partial finding(s): %w", len(findings), err))
+		}
+	}
 
-	return findings, nil
+	return findings, errors.Join(outputErrors...)
+}
+
+// validateBlindCallbackForExecution performs a fresh all-answer DNS check just
+// before Dalfox receives the callback. It never reflects the configured URL in
+// diagnostics. This cannot control how a remote target later resolves the
+// callback, so restrictive egress and explicit OAST authorization remain
+// required.
+func validateBlindCallbackForExecution(ctx context.Context, raw string, options scopepolicy.PublicOriginOptions) error {
+	policy, err := scopepolicy.NewPublicOriginPolicy(raw, options)
+	if err != nil {
+		return errors.New("dalfox blind callback failed public-origin validation")
+	}
+	if err := policy.ValidateURL(ctx, raw); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+		return errors.New("dalfox blind callback failed public DNS validation")
+	}
+	return nil
 }

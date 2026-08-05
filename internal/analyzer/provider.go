@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
+
+const maxAIResponseBytes = 4 << 20
 
 // AIProvider is the interface all AI providers must implement
 type AIProvider interface {
@@ -16,6 +19,22 @@ type AIProvider interface {
 	CompleteWithRetry(ctx context.Context, systemPrompt, userPrompt string, maxRetries int) (string, error)
 	ProviderName() string
 }
+
+// unavailableAIProvider is a fail-closed implementation used when a caller
+// bypasses config.Load/Validate and asks the exported analyzer constructors for
+// an unknown provider. Falling back to a real vendor here could send another
+// vendor's API key and prompt data to the wrong endpoint.
+type unavailableAIProvider struct{}
+
+func (unavailableAIProvider) Complete(context.Context, string, string) (string, error) {
+	return "", fmt.Errorf("AI provider is unavailable because its configuration was not validated")
+}
+
+func (unavailableAIProvider) CompleteWithRetry(context.Context, string, string, int) (string, error) {
+	return "", fmt.Errorf("AI provider is unavailable because its configuration was not validated")
+}
+
+func (unavailableAIProvider) ProviderName() string { return "unavailable" }
 
 // ═══════════════════════════════════════════════════════════
 // OpenAI-Compatible Provider (covers DeepSeek, OpenAI, OpenRouter, Groq, etc.)
@@ -28,13 +47,19 @@ type OpenAIProvider struct {
 	baseURL    string
 	provider   string
 	httpClient *http.Client
+	initErr    error
 }
 
 type openAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openAIMessage `json:"messages"`
-	MaxTokens   int             `json:"max_tokens"`
-	Temperature float64         `json:"temperature"`
+	Model          string                `json:"model"`
+	Messages       []openAIMessage       `json:"messages"`
+	MaxTokens      int                   `json:"max_tokens"`
+	Temperature    float64               `json:"temperature"`
+	ResponseFormat *openAIResponseFormat `json:"response_format,omitempty"`
+}
+
+type openAIResponseFormat struct {
+	Type string `json:"type"`
 }
 
 type openAIMessage struct {
@@ -58,14 +83,6 @@ type openAIResponse struct {
 	} `json:"usage"`
 }
 
-type openAIError struct {
-	Error struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code"`
-	} `json:"error"`
-}
-
 func NewOpenAIProvider(apiKey, model string, maxTokens int, baseURL, provider string, timeoutSeconds int) *OpenAIProvider {
 	// Large prompts (JS batches up to ~60KB) on slower providers like DeepSeek
 	// can take well over 2 minutes to generate + stream a full response. A short
@@ -73,15 +90,20 @@ func NewOpenAIProvider(apiKey, model string, maxTokens int, baseURL, provider st
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 300
 	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	resolvedBaseURL, endpointErr := reviewedProviderBaseURL(provider, baseURL)
+	client, clientErr := newGuardedAIHTTPClient(resolvedBaseURL, timeoutSeconds)
+	if endpointErr != nil {
+		clientErr = endpointErr
+	}
 	return &OpenAIProvider{
-		apiKey:    apiKey,
-		model:     model,
-		maxTokens: maxTokens,
-		baseURL:   baseURL,
-		provider:  provider,
-		httpClient: &http.Client{
-			Timeout: time.Duration(timeoutSeconds) * time.Second,
-		},
+		apiKey:     apiKey,
+		model:      model,
+		maxTokens:  maxTokens,
+		baseURL:    resolvedBaseURL,
+		provider:   provider,
+		httpClient: client,
+		initErr:    clientErr,
 	}
 }
 
@@ -90,6 +112,9 @@ func (p *OpenAIProvider) ProviderName() string {
 }
 
 func (p *OpenAIProvider) Complete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	if p == nil || p.initErr != nil || p.httpClient == nil {
+		return "", errUnsafeAIEndpoint
+	}
 	messages := []openAIMessage{
 		{Role: "user", Content: userPrompt},
 	}
@@ -103,13 +128,19 @@ func (p *OpenAIProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 		MaxTokens:   p.maxTokens,
 		Temperature: 0.1,
 	}
+	// Known hosted providers support the OpenAI JSON-object response contract.
+	// Keep it disabled for arbitrary custom endpoints so existing compatible-but-
+	// minimal servers are not broken by an unsupported optional request field.
+	if supportsJSONResponseFormat(p.provider) {
+		reqBody.ResponseFormat = &openAIResponseFormat{Type: "json_object"}
+	}
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	endpoint := p.baseURL + "/chat/completions"
+	endpoint := strings.TrimRight(p.baseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
@@ -126,21 +157,22 @@ func (p *OpenAIProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
+		return "", safeAIRequestFailure(ctx, err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
+	if len(body) > maxAIResponseBytes {
+		return "", fmt.Errorf("AI response exceeded %d bytes", maxAIResponseBytes)
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp openAIError
-		if err := json.Unmarshal(body, &errResp); err != nil {
-			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-		}
-		return "", fmt.Errorf("API error [%s]: %s", errResp.Error.Type, errResp.Error.Message)
+		// The response body is remote-controlled and may echo prompt content or
+		// credentials. Status is sufficient for retry classification and support.
+		return "", fmt.Errorf("API error (status %d)", resp.StatusCode)
 	}
 
 	var result openAIResponse
@@ -151,8 +183,21 @@ func (p *OpenAIProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("empty response from %s", p.provider)
 	}
+	finishReason := result.Choices[0].FinishReason
+	if finishReason != "stop" {
+		return "", fmt.Errorf("incomplete response from %s (unexpected finish reason)", p.provider)
+	}
 
 	return result.Choices[0].Message.Content, nil
+}
+
+func supportsJSONResponseFormat(provider string) bool {
+	switch provider {
+	case "openai", "deepseek", "openrouter":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *OpenAIProvider) CompleteWithRetry(ctx context.Context, systemPrompt, userPrompt string, maxRetries int) (string, error) {

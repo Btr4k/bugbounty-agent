@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
-# HawkEye v2.2.6 — Dependency Installer
+# HawkEye v2.3.0 — Reproducible Dependency Installer
 # Tested on: Ubuntu 20.04+, Debian 11+, Kali Linux
 # Usage: chmod +x install.sh && ./install.sh
 # ============================================================
 
-set -e
+set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -22,7 +22,7 @@ echo "  ███████║███████║██║ █╗ ██�
 echo "  ██╔══██║██╔══██║██║███╗██║██╔═██╗ ██╔══╝    ╚██╔╝  ██╔══╝  "
 echo "  ██║  ██║██║  ██║╚███╔███╔╝██║  ██╗███████╗   ██║   ███████╗"
 echo "  ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝"
-echo -e "                 Dependency Installer v2.2.6${RESET}"
+echo -e "                 Dependency Installer v2.3.0${RESET}"
 echo ""
 
 # ─── Check OS ────────────────────────────────────────────────
@@ -52,25 +52,21 @@ check_go() {
 install_go_tools() {
     info "Installing Go-based security tools..."
 
+    # Versions are intentionally pinned. Upgrade them in a reviewed change so
+    # two HawkEye installations run the same scanner code.
     declare -A GO_TOOLS=(
-        ["subfinder"]="github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
-        ["httpx"]="github.com/projectdiscovery/httpx/cmd/httpx@latest"
-        ["nuclei"]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-        ["dalfox"]="github.com/hahwul/dalfox/v2@latest"
-        ["assetfinder"]="github.com/tomnomnom/assetfinder@latest"
-        ["waybackurls"]="github.com/tomnomnom/waybackurls@latest"
-        ["katana"]="github.com/projectdiscovery/katana/cmd/katana@latest"
+        ["subfinder"]="github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.12.0"
+        ["httpx"]="github.com/projectdiscovery/httpx/cmd/httpx@v1.9.0"
+        ["nuclei"]="github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.7.0"
+        ["dalfox"]="github.com/hahwul/dalfox/v2@v2.12.0"
+        ["assetfinder"]="github.com/tomnomnom/assetfinder@v0.1.1"
+        ["waybackurls"]="github.com/tomnomnom/waybackurls@v0.1.0"
+        ["katana"]="github.com/projectdiscovery/katana/cmd/katana@v1.4.0"
     )
 
     for tool in "${!GO_TOOLS[@]}"; do
-        if [[ "$tool" == "httpx" ]] && "$HOME/go/bin/httpx" -version 2>&1 | grep -qi projectdiscovery; then
-            success "$tool already installed (ProjectDiscovery)"
-        elif [[ "$tool" != "httpx" ]] && command -v "$tool" &>/dev/null; then
-            success "$tool already installed"
-        else
-            info "Installing $tool..."
-            go install "${GO_TOOLS[$tool]}" 2>/dev/null && success "$tool installed" || warn "$tool failed to install"
-        fi
+        info "Installing pinned $tool..."
+        go install "${GO_TOOLS[$tool]}" || error "$tool failed to install"
     done
 }
 
@@ -89,9 +85,11 @@ install_system_tools() {
 
 # ─── Download nuclei templates ───────────────────────────────
 setup_nuclei() {
-    if command -v nuclei &>/dev/null; then
+    if [[ "${HAWKEYE_UPDATE_TEMPLATES:-0}" == "1" ]] && command -v nuclei &>/dev/null; then
         info "Updating nuclei templates..."
-        nuclei -update-templates -silent 2>/dev/null && success "Nuclei templates updated" || warn "Template update failed"
+        nuclei -update-templates -silent && success "Nuclei templates updated" || error "Template update failed"
+    else
+        info "Skipping mutable Nuclei template update (set HAWKEYE_UPDATE_TEMPLATES=1 to opt in)"
     fi
 }
 
@@ -109,18 +107,32 @@ setup_env() {
         warn "Created .env from template — edit it and add your API keys:"
         warn "  nano .env"
     else
+        chmod 600 .env
+        success "Restricted existing .env permissions to 0600"
         success ".env already exists"
     fi
 }
 
+# ─── Setup private report directory ─────────────────────────
+setup_reports() {
+    if [[ -L "reports" ]] || [[ -e "reports" && ! -d "reports" ]]; then
+        error "reports must be a real directory, not a symlink or file"
+    fi
+    mkdir -p reports
+    chmod 700 reports
+    success "Report directory permissions set to 0700"
+}
+
 # ─── Run ─────────────────────────────────────────────────────
 check_go
-export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.local/bin"
+hawkeye_tool_bin="${GOBIN:-$(go env GOPATH)/bin}"
+export PATH="$hawkeye_tool_bin:$HOME/.local/bin:$PATH"
 install_system_tools
 install_go_tools
 setup_nuclei
 build_hawkeye
 setup_env
+setup_reports
 
 echo ""
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════${RESET}"
@@ -129,7 +141,8 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo ""
 echo -e "  Next steps:"
 echo -e "  1. Edit ${CYAN}.env${RESET} and add your AI API key"
-echo -e "  2. Run: ${CYAN}./hawkeye --target example.com --verbose${RESET}"
+echo -e "  2. Exact-host safe default: ${CYAN}./hawkeye --target your-authorized-host.example --verbose${RESET}"
+echo -e "     Authorized apex + subdomains: ${CYAN}./hawkeye --target your-authorized-host.example --include-subdomains --verbose${RESET}"
 echo ""
 echo -e "  Docs: ${CYAN}https://github.com/Btr4k/bugbounty-agent${RESET}"
 echo ""

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,10 +15,13 @@ import (
 
 	"github.com/Btr4k/bugbounty-agent/internal/analyzer"
 	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/hunter"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	"github.com/Btr4k/bugbounty-agent/internal/recon"
+	"github.com/Btr4k/bugbounty-agent/internal/redaction"
 	"github.com/Btr4k/bugbounty-agent/internal/reporter"
 	"github.com/Btr4k/bugbounty-agent/internal/scanner"
+	"github.com/Btr4k/bugbounty-agent/internal/scope"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
@@ -35,15 +39,19 @@ var (
 	skipScan     bool
 	jsOnly       bool
 	checkConfig  bool
+	includeSubs  bool
 )
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:     "hawkeye",
-		Short:   "HawkEye - AI-Powered Bug Bounty Hunting Tool",
-		Long:    banner(),
-		Version: appVersion,
-		RunE:    runAgent,
+		Use:           "hawkeye",
+		Short:         "HawkEye - AI-Powered Bug Bounty Hunting Tool",
+		Long:          banner(),
+		Version:       appVersion,
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE:          runAgent,
 	}
 
 	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "config.yaml", "Config file")
@@ -51,15 +59,16 @@ func main() {
 	rootCmd.Flags().StringVarP(&targetDomain, "domain", "d", "", "Target domain (alias for -t/--target)")
 	rootCmd.Flags().StringVarP(&outputDir, "output", "o", "./reports", "Output directory")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
-	rootCmd.Flags().StringVar(&aiProvider, "ai-provider", "", "AI provider: claude, deepseek, openai, openrouter, custom")
-	rootCmd.Flags().StringVar(&aiModel, "ai-model", "", "AI model name (e.g. deepseek-chat, gpt-4o-mini, claude-sonnet-4-20250514)")
+	rootCmd.Flags().StringVar(&aiProvider, "ai-provider", "", "AI provider override: auto, claude, deepseek, openai, openrouter (configure custom endpoints in YAML)")
+	rootCmd.Flags().StringVar(&aiModel, "ai-model", "", "AI model name (e.g. deepseek-v4-flash, gpt-4o-mini, claude-sonnet-5)")
 	rootCmd.Flags().BoolVar(&skipRecon, "skip-recon", false, "Skip the reconnaissance phase")
 	rootCmd.Flags().BoolVar(&skipScan, "skip-scan", false, "Skip the vulnerability scanning phase")
 	rootCmd.Flags().BoolVar(&jsOnly, "js-only", false, "Run JS file analysis only (skips vulnerability scanning)")
 	rootCmd.Flags().BoolVar(&checkConfig, "check-config", false, "Validate the config file and exit")
+	rootCmd.Flags().BoolVar(&includeSubs, "include-subdomains", false, "Explicitly authorize discovered subdomains of the target")
 
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %s\n", terminalSafe(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -68,7 +77,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	printBanner()
 
 	if checkConfig {
-		if _, err := config.Load(cfgFile); err != nil {
+		if _, err := config.LoadWithAIOverrides(cfgFile, aiProvider, aiModel); err != nil {
 			return fmt.Errorf("failed to load config: %w", err)
 		}
 		fmt.Printf("Configuration is valid and compatible with HawkEye v%s\n", appVersion)
@@ -85,24 +94,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	defer log.Close()
 
 	// Load config
-	cfg, err := config.Load(cfgFile)
+	cfg, err := config.LoadWithAIOverrides(cfgFile, aiProvider, aiModel)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
-	}
-
-	// Override AI provider/model from CLI flags
-	if aiProvider != "" {
-		cfg.AI.Provider = aiProvider
-		// Re-resolve config for the new provider (API key, base URL, default model)
-		cfg.AI.APIKey = ""  // Reset to trigger re-resolution
-		cfg.AI.BaseURL = "" // Reset to trigger auto-detection
-		if aiModel == "" {
-			cfg.AI.Model = "" // Reset to trigger default model for new provider
-		}
-		cfg.ResolveAIConfig()
-	}
-	if aiModel != "" {
-		cfg.AI.Model = aiModel
 	}
 
 	// Validate target domain (prevent command injection)
@@ -110,15 +104,29 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid target domain: %w", err)
 	}
 
+	// Add target authorization before planning required tools. A wildcard rule
+	// alone excludes the apex; the CLI flag intentionally authorizes both.
+	cfg.Target.Domains = configuredTargetRules(targetDomain, includeSubs)
+	cfg.Reporting.OutputDir = outputDir
+	targetPolicy := scope.New(cfg.Target)
+	if err := targetPolicy.ValidationError(); err != nil {
+		return fmt.Errorf("invalid target scope: %w", err)
+	}
+	if !targetPolicy.AllowsHost(targetDomain) {
+		return fmt.Errorf("target %q is excluded or outside the configured scope", targetDomain)
+	}
+	if jsOnly && (skipRecon || !cfg.Recon.Enabled) {
+		return fmt.Errorf("--js-only requires reconnaissance to discover JavaScript files")
+	}
+	if jsOnly && !cfg.Analysis.JSAnalysis {
+		return fmt.Errorf("--js-only requires analysis.js_analysis to be enabled")
+	}
+
 	// Validate required tools are installed before wasting time
 	ensureToolBinsOnPath()
 	if err := checkTools(cfg, log); err != nil {
 		return err
 	}
-
-	// Add target domain to config
-	cfg.Target.Domains = []string{targetDomain}
-	cfg.Reporting.OutputDir = outputDir
 
 	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -151,9 +159,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	// AI Provider info
 	white.Printf("  🤖 AI Provider: ")
-	cyan.Printf("%s\n", strings.ToUpper(cfg.AI.Provider))
+	cyan.Printf("%s\n", terminalConfigSafe(cfg, strings.ToUpper(cfg.AI.Provider)))
 	white.Printf("  📦 AI Model:    ")
-	cyan.Printf("%s\n", cfg.AI.Model)
+	cyan.Printf("%s\n", terminalConfigSafe(cfg, cfg.AI.Model))
 	white.Printf("  🔑 API Key:     ")
 	dim.Printf("[configured]\n")
 	fmt.Println()
@@ -167,7 +175,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	if skipRecon || !cfg.Recon.Enabled {
 		dim.Println("  ⏭️  Skipping reconnaissance phase (--skip-recon)")
 		reconResults = &recon.Results{
-			Subdomains: cfg.Target.Domains,
+			Subdomains: []string{targetDomain},
 			URLs:       make([]string, 0),
 			Endpoints:  make([]string, 0),
 			IPs:        make([]string, 0),
@@ -208,7 +216,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			}
 			for i := 0; i < limit; i++ {
 				dim.Printf("     %2d. ", i+1)
-				fmt.Printf("%s\n", reconResults.Subdomains[i])
+				fmt.Printf("%s\n", terminalConfigSafe(cfg, reconResults.Subdomains[i]))
 			}
 			if len(reconResults.Subdomains) > limit {
 				dim.Printf("     ... and %d more\n", len(reconResults.Subdomains)-limit)
@@ -267,8 +275,8 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			yellow.Printf("  ⚠️  Scan completed in %s with partial coverage (time-boxed — not every host fully scanned)\n",
 				scanDuration.Round(time.Second))
 		}
-		white.Printf("  📊 Actionable Findings: ")
-		cyan.Printf("%d vulnerabilities (low/medium/high/critical)\n", len(displayFindings))
+		white.Printf("  📊 Scanner candidates awaiting validation: ")
+		cyan.Printf("%d candidates (low/medium/high/critical)\n", len(displayFindings))
 		if info > 0 {
 			dim.Printf("  ℹ️  %d informational findings hidden from display\n", info)
 		}
@@ -279,7 +287,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	if len(displayFindings) > 0 {
 		white.Println("  ┌─────────────────────────────────────────────┐")
 		white.Printf("  │")
-		cyan.Printf("  📊 Severity Distribution (Actionable)")
+		cyan.Printf("  📊 Candidate Severity Distribution")
 		fmt.Print("       ")
 		white.Println("│")
 		white.Println("  ├─────────────────────────────────────────────┤")
@@ -288,7 +296,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			red.Printf("🔴 CRITICAL")
 			fmt.Printf("  → ")
 			red.Printf("%-3d", critical)
-			fmt.Print(" vulnerabilities         ")
+			fmt.Print(" candidates              ")
 			white.Println("│")
 		}
 		if high > 0 {
@@ -296,7 +304,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			color.New(color.FgHiRed).Printf("🟠 HIGH")
 			fmt.Printf("      → ")
 			color.New(color.FgHiRed).Printf("%-3d", high)
-			fmt.Print(" vulnerabilities         ")
+			fmt.Print(" candidates              ")
 			white.Println("│")
 		}
 		if medium > 0 {
@@ -304,7 +312,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			yellow.Printf("🟡 MEDIUM")
 			fmt.Printf("    → ")
 			yellow.Printf("%-3d", medium)
-			fmt.Print(" vulnerabilities         ")
+			fmt.Print(" candidates              ")
 			white.Println("│")
 		}
 		if low > 0 {
@@ -312,7 +320,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			green.Printf("🟢 LOW")
 			fmt.Printf("       → ")
 			green.Printf("%-3d", low)
-			fmt.Print(" vulnerabilities         ")
+			fmt.Print(" candidates              ")
 			white.Println("│")
 		}
 		white.Println("  └─────────────────────────────────────────────┘")
@@ -322,7 +330,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		white.Printf("  ")
 		cyan.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		white.Printf("  ")
-		yellow.Println("🔍 DETAILED VULNERABILITY REPORT (Actionable Only)")
+		yellow.Println("🔍 UNVALIDATED SCANNER CANDIDATES (NOT CONFIRMED)")
 		white.Printf("  ")
 		cyan.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 		fmt.Println()
@@ -354,29 +362,25 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			fmt.Println()
 			white.Printf("  └─ ")
 			cyan.Printf("Title: ")
-			white.Printf("%s\n", f.Title)
+			white.Printf("%s\n", terminalConfigSafe(cfg, f.Title))
 			if f.Target != "" {
 				white.Printf("     ")
 				cyan.Printf("Target: ")
-				dim.Printf("%s\n", f.Target)
+				dim.Printf("%s\n", terminalConfigSafe(cfg, f.Target))
 			}
 			if f.URL != "" {
 				white.Printf("     ")
 				cyan.Printf("URL: ")
-				dim.Printf("%s\n", f.URL)
+				dim.Printf("%s\n", terminalConfigSafe(cfg, f.URL))
 			}
 			if f.Evidence != "" {
-				evidenceTrunc := f.Evidence
-				if len(evidenceTrunc) > 120 {
-					evidenceTrunc = evidenceTrunc[:120] + "..."
-				}
 				white.Printf("     ")
 				cyan.Printf("Evidence: ")
-				dim.Printf("%s\n", evidenceTrunc)
+				dim.Printf("%s\n", evidenceSummary(f.Evidence))
 			}
 			if f.CVE != "" {
 				white.Printf("     ")
-				red.Printf("CVE: %s", f.CVE)
+				red.Printf("CVE: %s", terminalConfigSafe(cfg, f.CVE))
 				fmt.Println()
 			}
 			if i < len(displayFindings)-1 {
@@ -384,10 +388,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 			}
 		}
 		fmt.Println()
-		// Note about filtered info findings
+		// Informational candidates stay out of the noisy terminal list. The
+		// analyzer still adjudicates non-inventory info candidates; explicit port
+		// inventory is retained as a rejected/non-vulnerability observation.
 		if info > 0 {
 			dim.Printf("  💡 Note: %d informational findings were hidden from display\n", info)
-			dim.Println("     (Recon observations are not sent to AI or included in the vulnerability report)")
+			dim.Println("     (They remain accounted for by the validation/reporting pipeline)")
 			fmt.Println()
 		}
 		white.Printf("  ")
@@ -446,13 +452,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 					sevIcon = "🟢"
 				}
 				sevColor.Printf("     %s [%s] ", sevIcon, strings.ToUpper(rf.Severity))
-				white.Printf("%s\n", rf.Title)
+				white.Printf("%s\n", terminalConfigSafe(cfg, rf.Title))
 				if rf.Evidence != "" {
-					evidenceTrunc := rf.Evidence
-					if len(evidenceTrunc) > 80 {
-						evidenceTrunc = evidenceTrunc[:80] + "..."
-					}
-					dim.Printf("        Value: %s\n", evidenceTrunc)
+					dim.Printf("        Evidence: %s\n", evidenceSummary(rf.Evidence))
 				}
 			}
 		} else {
@@ -465,42 +467,22 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		jsAnalyzer := analyzer.NewEngine(cfg, log)
 		aiFindings, err := jsAnalyzer.AnalyzeJSFiles(ctx, jsInput)
 		if err != nil {
-			yellow.Printf("  ⚠️  JS AI analysis completed partially: %v\n", err)
+			yellow.Printf("  ⚠️  JS AI analysis completed partially: %s\n", terminalConfigSafe(cfg, err.Error()))
 			scanResults.Complete = false
 			scanResults.FailedTools = append(scanResults.FailedTools, "ai-js-analysis")
 		}
 
-		// Merge regex + AI findings (dedup by core secret value, not raw evidence string)
-		allJSFindings := regexFindings
-		seenEvidence := make(map[string]bool)
-		for _, rf := range regexFindings {
-			seenEvidence[rf.Evidence] = true
-			// Also register the core secret (e.g. the API key itself, stripped of context)
-			seenEvidence[analyzer.ExtractCoreSecret(rf.Evidence)] = true
-		}
-		for _, af := range aiFindings {
-			core := analyzer.ExtractCoreSecret(af.Evidence)
-			if seenEvidence[af.Evidence] || seenEvidence[core] {
-				continue
-			}
-			// Substring check: skip if the AI evidence is contained in any regex evidence or vice versa
-			isDuplicate := false
-			for _, rf := range regexFindings {
-				if strings.Contains(rf.Evidence, af.Evidence) || strings.Contains(af.Evidence, rf.Evidence) {
-					isDuplicate = true
-					break
-				}
-			}
-			if isDuplicate {
-				continue
-			}
-			allJSFindings = append(allJSFindings, af)
-			seenEvidence[af.Evidence] = true
-			seenEvidence[core] = true
-		}
+		// Locally detected values are masked before leaving the regex scanner, so
+		// downstream deduplication must never compare redaction markers as if they
+		// were the underlying secrets. Each detector already deduplicates against
+		// raw values while those values are still local; merge only safe records.
+		allJSFindings := append([]scanner.Finding(nil), regexFindings...)
+		allJSFindings = append(allJSFindings, aiFindings...)
 
 		jsDuration := time.Since(phaseStart)
-		green.Printf("  ✅ Completed in %s\n", jsDuration.Round(time.Second))
+		if err == nil {
+			green.Printf("  ✅ Completed in %s\n", jsDuration.Round(time.Second))
+		}
 
 		if len(allJSFindings) > 0 {
 			fmt.Printf("  └── 🔍 JS Findings: %s (Regex: %d, AI: %d)\n",
@@ -526,16 +508,12 @@ func runAgent(cmd *cobra.Command, args []string) error {
 					sevIcon = "🟢"
 				}
 				sevColor.Printf("     %s [%s] ", sevIcon, strings.ToUpper(jf.Severity))
-				white.Printf("%s\n", jf.Title)
+				white.Printf("%s\n", terminalConfigSafe(cfg, jf.Title))
 				if jf.Evidence != "" {
-					evidenceTrunc := jf.Evidence
-					if len(evidenceTrunc) > 80 {
-						evidenceTrunc = evidenceTrunc[:80] + "..."
-					}
-					dim.Printf("        Value: %s\n", evidenceTrunc)
+					dim.Printf("        Evidence: %s\n", evidenceSummary(jf.Evidence))
 				}
 				if jf.Description != "" {
-					dim.Printf("        Info:  %s\n", jf.Description)
+					dim.Printf("        Info:  %s\n", terminalConfigSafe(cfg, jf.Description))
 				}
 			}
 
@@ -553,21 +531,89 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	// ═══════════════════════════════════════
 	// Phase 3: AI Analysis
 	// ═══════════════════════════════════════
+	// Phase 2.7: AI Attack-Surface Hunter (hypotheses only — no requests sent)
+	// ═══════════════════════════════════════
+	if cfg.Hunter.Enabled && !jsOnly && reconResults != nil {
+		printPhaseHeader("2.7", "AI ATTACK-SURFACE HUNTER", "🧠")
+		phaseStart = time.Now()
+
+		hunterEngine := hunter.NewEngine(cfg, log)
+		hyps, herr := hunterEngine.Generate(ctx, reconResults)
+		if herr != nil {
+			yellow.Printf("  ⚠️  Hunter skipped: %s\n", terminalConfigSafe(cfg, herr.Error()))
+		} else {
+			green.Printf("  ✅ Completed in %s\n", time.Since(phaseStart).Round(time.Second))
+			var observed, inferred []hunter.Hypothesis
+			for _, h := range hyps {
+				if h.Grounding == "observed" {
+					observed = append(observed, h)
+				} else {
+					inferred = append(inferred, h)
+				}
+			}
+			fmt.Printf("  └── 🧠 Attack hypotheses: %s total  (🔬 %s observed · 💭 %s inferred)\n",
+				white.Sprintf("%d", len(hyps)), white.Sprintf("%d", len(observed)), white.Sprintf("%d", len(inferred)))
+			if len(hyps) > 0 {
+				printLead := func(n int, h hunter.Hypothesis) {
+					dim.Printf("     %2d. ", n)
+					fmt.Printf("[%s/%s] %s",
+						terminalConfigSafe(cfg, strings.ToUpper(h.Severity)),
+						terminalConfigSafe(cfg, h.Class),
+						terminalConfigSafe(cfg, h.Target))
+					if h.Parameter != "" {
+						fmt.Printf("  (param: %s)", terminalConfigSafe(cfg, h.Parameter))
+					}
+					fmt.Printf("  — conf %.2f\n", h.Confidence)
+				}
+				if len(observed) > 0 {
+					fmt.Println()
+					green.Println("  🔬 Grounded leads (parameter/path seen in recon — verify manually):")
+					for i, h := range observed {
+						if i >= 10 {
+							break
+						}
+						printLead(i+1, h)
+					}
+				}
+				if len(inferred) > 0 {
+					fmt.Println()
+					yellow.Println("  💭 Inferred leads (guessed from naming — confirm the endpoint EXISTS first):")
+					for i, h := range inferred {
+						if i >= 10 {
+							break
+						}
+						printLead(i+1, h)
+					}
+				}
+				if path, werr := saveHypotheses(cfg.Reporting.OutputDir, targetDomain, hyps); werr != nil {
+					yellow.Printf("  ⚠️  Could not save hypotheses file: %s\n", terminalConfigSafe(cfg, werr.Error()))
+				} else {
+					fmt.Printf("  └── 📄 Hypotheses: %s\n", cyan.Sprintf("%s", terminalConfigSafe(cfg, path)))
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	// ═══════════════════════════════════════
 	printPhaseHeader("3", "AI-POWERED ANALYSIS", "🤖")
 	phaseStart = time.Now()
 
 	analyzerEngine := analyzer.NewEngine(cfg, log)
 	analysisResults, err := analyzerEngine.Analyze(ctx, scanResults)
 	if err != nil {
-		yellow.Printf("  ⚠️  Validation pipeline completed partially: %v\n", err)
+		yellow.Printf("  ⚠️  Validation pipeline completed partially: %s\n", terminalConfigSafe(cfg, err.Error()))
 		scanResults.Complete = false
 		scanResults.FailedTools = append(scanResults.FailedTools, "ai-validation")
 	}
 
 	analysisDuration := time.Since(phaseStart)
-	green.Printf("  ✅ Completed in %s\n", analysisDuration.Round(time.Second))
-	fmt.Printf("  ├── ✓ Pipeline accepted: %s\n", white.Sprintf("%d", len(analysisResults.ValidatedFindings)))
-	fmt.Printf("  └── ✗ False Positives: %s\n", white.Sprintf("%d", len(analysisResults.FalsePositives)))
+	if err == nil {
+		green.Printf("  ✅ Completed in %s\n", analysisDuration.Round(time.Second))
+	}
+	fmt.Printf("  ├── ✓ Confirmed by evidence gates: %s\n", white.Sprintf("%d", countConfirmedFindings(analysisResults)))
+	fmt.Printf("  ├── ? Manual review required: %s\n", white.Sprintf("%d", len(analysisResults.ManualReview)))
+	fmt.Printf("  └── ✗ Rejected candidates: %s\n", white.Sprintf("%d", len(analysisResults.FalsePositives)))
 	fmt.Println()
 
 	// ═══════════════════════════════════════
@@ -584,40 +630,106 @@ func runAgent(cmd *cobra.Command, args []string) error {
 
 	reportDuration := time.Since(phaseStart)
 	green.Printf("  ✅ Completed in %s\n", reportDuration.Round(time.Second))
-	fmt.Printf("  └── 📄 Report: %s\n", cyan.Sprintf("%s", reportPath))
+	fmt.Printf("  └── 📄 Report: %s\n", cyan.Sprintf("%s", terminalConfigSafe(cfg, reportPath)))
 	fmt.Println()
 
 	duration := time.Since(startTime)
 
 	// Print final summary
-	printSummary(duration, critical, high, medium, low, info, reportPath,
-		len(reconResults.Subdomains), len(scanResults.Findings),
-		len(analysisResults.ValidatedFindings), reconResults.Complete && scanResults.Complete)
+	printSummary(duration, reportPath, len(reconResults.Subdomains),
+		len(scanResults.Findings), analysisResults,
+		supportsNegativeConclusion(reconResults, scanResults, analysisResults))
 
 	return nil
 }
 
+func configuredTargetRules(domain string, includeSubdomains bool) []string {
+	if includeSubdomains {
+		return []string{domain, "*." + domain}
+	}
+	return []string{domain}
+}
+
+func saveHypotheses(outputDir, target string, hyps []hunter.Hypothesis) (string, error) {
+	if outputDir == "" {
+		outputDir = "./reports"
+	}
+	if err := reporter.EnsurePrivateDirectory(outputDir); err != nil {
+		return "", err
+	}
+	safe := regexp.MustCompile(`[^a-zA-Z0-9._-]+`).ReplaceAllString(target, "_")
+	path := filepath.Join(outputDir, fmt.Sprintf("hypotheses-%s-%s.json", safe, time.Now().UTC().Format("20060102-150405.000000000")))
+	data, err := json.MarshalIndent(hyps, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := reporter.WritePrivateFileAtomic(path, data); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// evidenceSummary keeps all raw evidence out of terminal/CI logs. The shared
+// redactor is still run so recognized credential metadata can be counted
+// without exposing the captured value or creating hashes for low-entropy data.
+func evidenceSummary(value string) string {
+	result := redaction.MaskWithMetadata(value)
+	if len(result.Matches) == 0 {
+		return "[captured; withheld from terminal]"
+	}
+	return fmt.Sprintf("[captured; withheld from terminal; credentials-redacted:%d]", len(result.Matches))
+}
+
+// terminalSafe prevents tool/model-controlled text from injecting terminal
+// control sequences or exposing recognized credentials.
+func terminalSafe(value string) string {
+	return redaction.Mask(redaction.SanitizeURLsInText(value))
+}
+
+// terminalConfigSafe additionally removes secrets explicitly configured by
+// the operator, including opaque values that cannot be recognized by format.
+func terminalConfigSafe(cfg *config.Config, value string) string {
+	if cfg != nil {
+		value = cfg.Redact(value)
+	}
+	return terminalSafe(value)
+}
+
 func ensureToolBinsOnPath() {
-	paths := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
-	seen := make(map[string]bool, len(paths))
-	for _, path := range paths {
-		seen[path] = true
-	}
+	existing := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
+	seen := make(map[string]bool, len(existing)+4)
+	paths := make([]string, 0, len(existing)+4)
 	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(home, "go", "bin"),
-		filepath.Join(home, ".local", "bin"),
-	}
+	candidates := []string{os.Getenv("GOBIN")}
 	if goPath := os.Getenv("GOPATH"); goPath != "" {
 		candidates = append(candidates, filepath.Join(goPath, "bin"))
 	}
+	candidates = append(candidates,
+		filepath.Join(home, "go", "bin"),
+		filepath.Join(home, ".local", "bin"),
+	)
 	for _, candidate := range candidates {
 		if candidate != "" && !seen[candidate] {
-			paths = append(paths, candidate)
 			seen[candidate] = true
+			paths = append(paths, candidate)
 		}
 	}
-	os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator)))
+	for _, path := range existing {
+		if path != "" && !seen[path] {
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	_ = os.Setenv("PATH", strings.Join(paths, string(os.PathListSeparator)))
+}
+
+func targetAuthorizesSubdomains(domains []string) bool {
+	for _, domain := range domains {
+		if strings.HasPrefix(strings.TrimSpace(domain), "*.") {
+			return true
+		}
+	}
+	return false
 }
 
 // checkTools validates that critical external tools are installed before scanning starts.
@@ -630,14 +742,15 @@ func checkTools(cfg *config.Config, log interface{ Infof(string, ...interface{})
 	}
 	runRecon := cfg.Recon.Enabled && !skipRecon
 	runScan := cfg.Scanning.Enabled && !skipScan && !jsOnly
+	discoverSubdomains := targetAuthorizesSubdomains(cfg.Target.Domains)
 	tools := []tool{
-		{"subfinder", runRecon && cfg.Recon.Tools.Subfinder, "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"},
-		{"assetfinder", runRecon && cfg.Recon.Tools.Assetfinder, "go install github.com/tomnomnom/assetfinder@latest"},
-		{"waybackurls", runRecon && cfg.Recon.Tools.Wayback, "go install github.com/tomnomnom/waybackurls@latest"},
-		{"katana", runRecon && cfg.Recon.Tools.Katana, "go install github.com/projectdiscovery/katana/cmd/katana@latest"},
-		{"httpx", runScan && cfg.Scanning.Tools.Httpx.Enabled, "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"},
-		{"nuclei", runScan && cfg.Scanning.Tools.Nuclei.Enabled, "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"},
-		{"dalfox", runScan && cfg.Scanning.Tools.Dalfox.Enabled, "go install github.com/hahwul/dalfox/v2@latest"},
+		{"subfinder", runRecon && discoverSubdomains && cfg.Recon.Tools.Subfinder, "./install.sh"},
+		{"assetfinder", runRecon && discoverSubdomains && cfg.Recon.Tools.Assetfinder, "./install.sh"},
+		{"waybackurls", runRecon && cfg.Recon.Tools.Wayback, "./install.sh"},
+		{"katana", runRecon && cfg.Recon.Tools.Katana, "./install.sh"},
+		{"httpx", runScan && cfg.Scanning.Tools.Httpx.Enabled, "./install.sh"},
+		{"nuclei", runScan && cfg.Scanning.Tools.Nuclei.Enabled, "./install.sh"},
+		{"dalfox", runScan && cfg.Scanning.Tools.Dalfox.Enabled, "./install.sh"},
 		{"nmap", runScan && cfg.Scanning.Tools.Nmap.Enabled, "apt install nmap"},
 	}
 
@@ -693,6 +806,9 @@ func validateDomain(domain string) error {
 		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
 			return fmt.Errorf("domain contains an invalid DNS label")
 		}
+	}
+	if _, err := scope.NewWithMode(config.TargetConfig{Domains: []string{domain}}, scope.ModeExact); err != nil {
+		return err
 	}
 	return nil
 }
@@ -754,10 +870,101 @@ func banner() string {
 `
 }
 
-func printSummary(duration time.Duration, critical, high, medium, low, info int,
-	reportPath string, subdomains, totalFindings, validated int, scanComplete bool) {
+type summaryClassification string
 
-	total := critical + high + medium + low + info
+const (
+	summaryInconclusive summaryClassification = "inconclusive"
+	summaryNoConfirmed  summaryClassification = "no-confirmed"
+	summaryCritical     summaryClassification = "critical"
+	summaryHigh         summaryClassification = "high"
+	summaryMedium       summaryClassification = "medium"
+	summaryLow          summaryClassification = "low"
+)
+
+type confirmedSeverityCounts struct {
+	Critical int
+	High     int
+	Medium   int
+	Low      int
+	Info     int
+}
+
+func countConfirmedFindings(analysis *analyzer.Analysis) int {
+	if analysis == nil {
+		return 0
+	}
+	count := 0
+	for _, finding := range analysis.ValidatedFindings {
+		if finding.IsValid && strings.EqualFold(finding.Decision, "confirmed") {
+			count++
+		}
+	}
+	return count
+}
+
+func (c confirmedSeverityCounts) total() int {
+	return c.Critical + c.High + c.Medium + c.Low + c.Info
+}
+
+// classifySummary only considers findings that passed the analyzer's evidence
+// gates. Raw scanner candidates, manual-review items, and rejected candidates
+// must never drive an urgent final classification.
+func classifySummary(analysis *analyzer.Analysis, supportsNegative bool) (confirmedSeverityCounts, summaryClassification) {
+	var counts confirmedSeverityCounts
+	if analysis != nil {
+		for _, finding := range analysis.ValidatedFindings {
+			if !finding.IsValid || !strings.EqualFold(finding.Decision, "confirmed") {
+				continue
+			}
+			switch strings.ToLower(finding.Severity) {
+			case "critical":
+				counts.Critical++
+			case "high":
+				counts.High++
+			case "medium":
+				counts.Medium++
+			case "low":
+				counts.Low++
+			default:
+				counts.Info++
+			}
+		}
+	}
+
+	switch {
+	case counts.Critical > 0:
+		return counts, summaryCritical
+	case counts.High > 0:
+		return counts, summaryHigh
+	case counts.Medium > 0:
+		return counts, summaryMedium
+	case counts.total() > 0:
+		return counts, summaryLow
+	case !supportsNegative:
+		return counts, summaryInconclusive
+	case counts.total() == 0:
+		return counts, summaryNoConfirmed
+	default:
+		return counts, summaryLow
+	}
+}
+
+// supportsNegativeConclusion delegates to the reporter's coverage assessment so
+// the terminal and saved report can never disagree about whether a clean
+// negative result is justified.
+func supportsNegativeConclusion(reconResults *recon.Results, scanResults *scanner.Results, analysis *analyzer.Analysis) bool {
+	return reporter.SupportsNegativeConclusion(reconResults, scanResults, analysis)
+}
+
+func printSummary(duration time.Duration, reportPath string, subdomains, rawCandidates int,
+	analysis *analyzer.Analysis, supportsNegative bool) {
+	counts, classification := classifySummary(analysis, supportsNegative)
+	manualReview, rejected := 0, 0
+	if analysis != nil {
+		manualReview = len(analysis.ManualReview)
+		rejected = len(analysis.FalsePositives)
+	}
+	totalConfirmed := counts.total()
 
 	bold := color.New(color.FgWhite, color.Bold)
 	cyan := color.New(color.FgCyan, color.Bold)
@@ -776,10 +983,16 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	fmt.Printf("  🌐 Subdomains:        %-26d", subdomains)
 	cyan.Println("║")
 	cyan.Print("  ║")
-	fmt.Printf("  🔎 Vulnerabilities:   %-26d", totalFindings)
+	fmt.Printf("  🔎 Raw candidates:    %-26d", rawCandidates)
 	cyan.Println("║")
 	cyan.Print("  ║")
-	fmt.Printf("  ✓  Pipeline Accepted: %-26d", validated)
+	fmt.Printf("  ✓  Confirmed:         %-26d", totalConfirmed)
+	cyan.Println("║")
+	cyan.Print("  ║")
+	fmt.Printf("  ?  Manual review:     %-26d", manualReview)
+	cyan.Println("║")
+	cyan.Print("  ║")
+	fmt.Printf("  ✗  Rejected:          %-26d", rejected)
 	cyan.Println("║")
 	cyan.Println("  ╠════════════════════════════════════════════════════╣")
 	cyan.Print("  ║")
@@ -793,10 +1006,10 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 		count int
 		c     *color.Color
 	}{
-		{"🔴", "Critical", critical, red},
-		{"🟠", "High", high, color.New(color.FgHiRed)},
-		{"🟡", "Medium", medium, yellow},
-		{"🟢", "Low", low, green},
+		{"🔴", "Critical", counts.Critical, red},
+		{"🟠", "High", counts.High, color.New(color.FgHiRed)},
+		{"🟡", "Medium", counts.Medium, yellow},
+		{"🟢", "Low", counts.Low, green},
 	}
 
 	for _, s := range severities {
@@ -811,9 +1024,9 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	}
 
 	// Show info count separately if exists
-	if info > 0 {
+	if counts.Info > 0 {
 		cyan.Print("  ║")
-		dim.Printf("     ℹ️  Info (hidden) → %-5d", info)
+		dim.Printf("     ℹ️  Info (hidden) → %-5d", counts.Info)
 		fmt.Print("                    ")
 		cyan.Println("║")
 	}
@@ -823,9 +1036,10 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	fmt.Print("  📄 Report Location:                            ")
 	cyan.Println("║")
 	cyan.Print("  ║")
-	bold.Printf("  %s", reportPath)
+	safeReportPath := terminalSafe(reportPath)
+	bold.Printf("  %s", safeReportPath)
 	// Pad to fill the box
-	padding := 50 - len(reportPath)
+	padding := 50 - len(safeReportPath)
 	if padding > 0 {
 		fmt.Print(strings.Repeat(" ", padding))
 	}
@@ -837,18 +1051,22 @@ func printSummary(duration time.Duration, critical, high, medium, low, info int,
 	cyan.Println("  ╚════════════════════════════════════════════════════╝")
 
 	fmt.Println()
-	if !scanComplete {
-		yellow.Println("  ⚠️  PARTIAL: Vulnerability scanning was skipped or disabled")
-	} else if total == 0 {
-		green.Println("  ✅ No vulnerabilities detected by the completed scan")
-	} else if critical > 0 {
-		red.Printf("  🚨 URGENT: Found %d CRITICAL vulnerabilities - Immediate action required!\n", critical)
-	} else if high > 0 {
-		color.New(color.FgHiRed).Printf("  ⚠️  WARNING: Found %d HIGH severity issues - Review report immediately\n", high)
-	} else if medium > 0 {
-		yellow.Printf("  ⚡ ATTENTION: Found %d MEDIUM severity findings - Review recommended\n", medium)
-	} else {
-		green.Printf("  ℹ️  INFO: Found %d low-severity findings - Review when convenient\n", total)
+	switch classification {
+	case summaryInconclusive:
+		yellow.Println("  ⚠️  INCONCLUSIVE: coverage or review status was insufficient; absence of confirmed findings is not a clean bill of health")
+	case summaryNoConfirmed:
+		green.Println("  ✅ No findings passed the deterministic confirmation gates; manual review may still be required")
+	case summaryCritical:
+		red.Printf("  🚨 REVIEW NOW: %d critical candidate(s) passed the confirmation gates\n", counts.Critical)
+	case summaryHigh:
+		color.New(color.FgHiRed).Printf("  ⚠️  REVIEW: %d high-severity candidate(s) passed the confirmation gates\n", counts.High)
+	case summaryMedium:
+		yellow.Printf("  ⚡ REVIEW: %d medium-severity candidate(s) passed the confirmation gates\n", counts.Medium)
+	case summaryLow:
+		green.Printf("  ℹ️  REVIEW: %d low/informational candidate(s) passed the confirmation gates\n", totalConfirmed)
+	}
+	if !supportsNegative && classification != summaryInconclusive {
+		yellow.Println("  ⚠️  Coverage or review status was insufficient; confirmed severity is shown, but no absence claim is valid")
 	}
 	fmt.Println()
 	cyan.Println("  📌 Thank you for using HawkEye - Happy Hunting!")

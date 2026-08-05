@@ -21,13 +21,15 @@ type ClaudeProvider struct {
 	model      string
 	maxTokens  int
 	httpClient *http.Client
+	initErr    error
 }
 
 type claudeRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system,omitempty"`
-	Messages  []message `json:"messages"`
+	Model       string    `json:"model"`
+	MaxTokens   int       `json:"max_tokens"`
+	Temperature *float64  `json:"temperature,omitempty"`
+	System      string    `json:"system,omitempty"`
+	Messages    []message `json:"messages"`
 }
 
 type message struct {
@@ -52,27 +54,19 @@ type claudeResponse struct {
 	} `json:"usage"`
 }
 
-type claudeError struct {
-	Type  string `json:"type"`
-	Error struct {
-		Type    string `json:"type"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 func NewClaudeProvider(apiKey, model string, maxTokens, timeoutSeconds int) *ClaudeProvider {
 	// Matches the OpenAI-compatible provider: large JS-analysis batches can take
 	// minutes to generate. A short timeout trips mid-body; default to 300s.
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 300
 	}
+	client, clientErr := newGuardedAIHTTPClient(claudeAPIURL, timeoutSeconds)
 	return &ClaudeProvider{
-		apiKey:    apiKey,
-		model:     model,
-		maxTokens: maxTokens,
-		httpClient: &http.Client{
-			Timeout: time.Duration(timeoutSeconds) * time.Second,
-		},
+		apiKey:     apiKey,
+		model:      model,
+		maxTokens:  maxTokens,
+		httpClient: client,
+		initErr:    clientErr,
 	}
 }
 
@@ -82,6 +76,9 @@ func (c *ClaudeProvider) ProviderName() string {
 
 // Complete sends a completion request to Claude API
 func (c *ClaudeProvider) Complete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	if c == nil || c.initErr != nil || c.httpClient == nil {
+		return "", errUnsafeAIEndpoint
+	}
 	reqBody := claudeRequest{
 		Model:     c.model,
 		MaxTokens: c.maxTokens,
@@ -110,21 +107,22 @@ func (c *ClaudeProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to send request: %w", err)
+		return "", safeAIRequestFailure(ctx, err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAIResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
+	if len(body) > maxAIResponseBytes {
+		return "", fmt.Errorf("AI response exceeded %d bytes", maxAIResponseBytes)
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp claudeError
-		if err := json.Unmarshal(body, &errResp); err != nil {
-			return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
-		}
-		return "", fmt.Errorf("API error: %s - %s", errResp.Error.Type, errResp.Error.Message)
+		// Never reflect a remote error body: providers may echo prompt content or
+		// credentials in diagnostic messages.
+		return "", fmt.Errorf("API error (status %d)", resp.StatusCode)
 	}
 
 	var claudeResp claudeResponse
@@ -135,12 +133,18 @@ func (c *ClaudeProvider) Complete(ctx context.Context, systemPrompt, userPrompt 
 	if len(claudeResp.Content) == 0 {
 		return "", fmt.Errorf("empty response from Claude")
 	}
+	if claudeResp.StopReason != "end_turn" {
+		return "", fmt.Errorf("incomplete response from Claude (unexpected stop reason)")
+	}
 
 	var fullText string
 	for _, content := range claudeResp.Content {
 		if content.Type == "text" {
 			fullText += content.Text
 		}
+	}
+	if fullText == "" {
+		return "", fmt.Errorf("empty text response from Claude")
 	}
 
 	return fullText, nil
@@ -180,7 +184,12 @@ func (c *ClaudeProvider) CompleteWithRetry(ctx context.Context, systemPrompt, us
 func isNonRetryableError(err error) bool {
 	errStr := err.Error()
 	return bytes.Contains([]byte(errStr), []byte("authentication")) ||
-		bytes.Contains([]byte(errStr), []byte("invalid_request"))
+		bytes.Contains([]byte(errStr), []byte("invalid_request")) ||
+		bytes.Contains([]byte(errStr), []byte("status 400")) ||
+		bytes.Contains([]byte(errStr), []byte("status 401")) ||
+		bytes.Contains([]byte(errStr), []byte("status 403")) ||
+		bytes.Contains([]byte(errStr), []byte("status 404")) ||
+		bytes.Contains([]byte(errStr), []byte("status 422"))
 }
 
 func isRateLimitError(err error) bool {

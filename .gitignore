@@ -45,6 +45,7 @@ vendor/
 .idea/
 .vscode/
 .claude/
+.codex-security/
 *.swp
 *.swo
 .DS_Store
