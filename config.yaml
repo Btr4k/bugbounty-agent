@@ -2,46 +2,32 @@
 
 # ═══════════════════════════════════════════════════════
 # AI Provider Configuration
-# Supported: claude | deepseek | openai | openrouter | custom
+# Supported: auto | claude | deepseek | openai | openrouter | custom
 # ═══════════════════════════════════════════════════════
 ai:
-  provider: "deepseek"              # Forced to DeepSeek (auto would pick Claude while ANTHROPIC_API_KEY is set).
-                                    # Requires DEEPSEEK_API_KEY in .env.
+  provider: "auto"                  # Resolves only when exactly one provider-specific key is configured.
+                                    # Or set claude/deepseek/openai/openrouter explicitly.
   api_key: ""                       # Leave empty — key is read from .env automatically
-  model: "deepseek-v4-flash"        # DeepSeek-V4-Flash-0731. 1M context, tool-calls, thinking mode (default ON).
-  max_tokens: 8000                  # Thinking mode + a 5-finding batch (PoC+impact+remediation) needs headroom;
-                                    # thinking tokens count toward output. 2000 truncated JSON and lost batches.
-  base_url: ""                      # Empty -> https://api.deepseek.com/v1 (set in code). OpenAI-compatible.
+  model: ""                         # Empty selects the resolved provider's reviewed default.
+  max_tokens: 8000                  # Headroom for complete structured validation batches.
+  base_url: ""                      # Hosted-provider endpoints are pinned in code.
   timeout: 300                      # Per-request HTTP timeout (seconds). Raise for slow providers/large JS batches
 
-# Provider presets (just change 'provider' and 'api_key'):
-# ┌─────────────┬──────────────────────────┬────────────────────────────┬──────────────┐
-# │ Provider    │ Model (default)          │ Env Variable               │ Cost/1M tok  │
-# ├─────────────┼──────────────────────────┼────────────────────────────┼──────────────┤
-# │ claude      │ claude-sonnet-4-20250514 │ ANTHROPIC_API_KEY          │ $3/$15       │
-# │ deepseek    │ deepseek-chat            │ DEEPSEEK_API_KEY           │ $0.28/$0.42  │
-# │ openai      │ gpt-4o-mini              │ OPENAI_API_KEY             │ $0.15/$0.60  │
-# │ openrouter  │ deepseek/deepseek-chat   │ OPENROUTER_API_KEY         │ varies       │
-# │ custom      │ (must specify)           │ AI_API_KEY                 │ varies       │
-# └─────────────┴──────────────────────────┴────────────────────────────┴──────────────┘
-#
-# DeepSeek model choices (set ai.model to override the default):
-#   • deepseek-chat      → auto-points to DeepSeek's LATEST chat model (V-series). Fast + cheapest.
-#   • deepseek-reasoner  → reasoning model. STRONGEST for security logic / validation. Slower, pricier,
-#                          and REQUIRES max_tokens >= 8000. Recommended for the analysis/triage phase.
-#   • To pin a specific published version (e.g. a dated V4 snapshot), paste its exact API id here —
-#     no code change needed; any OpenAI-compatible model string works.
+# Provider keys: ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY,
+# OPENROUTER_API_KEY, or AI_API_KEY for a fully configured custom endpoint.
+# Model IDs and pricing change over time; verify them with the provider before
+# overriding the release defaults.
 
 # Legacy Claude config (backward compatibility - used if ai.api_key is empty)
 claude:
   api_key: "${ANTHROPIC_API_KEY}"
-  model: "claude-sonnet-4-20250514"
+  model: "claude-sonnet-5"
   max_tokens: 2000
 
 # C99.nl API Intelligence
 c99:
   api_key: "${C99_API_KEY}"
-  enabled: true
+  enabled: false  # Opt in only after configuring a valid key.
 
 # Target Configuration
 target:
@@ -49,15 +35,17 @@ target:
   excluded_subdomains: []
 
 # Optional authenticated testing. Use only accounts and sessions you own.
-# Values are expanded from environment variables and redacted from AI prompts
-# and reports. Avoid placing literal credentials in this file.
+# Values are expanded from environment variables, redacted from AI prompts,
+# reports, and logs, and omitted from external-tool environments. Avoid literal
+# credentials.
 authentication:
-  # Required when headers or cookies are configured. Credentials are injected
-  # only when every target in a tool invocation matches this allowlist.
+  # Required when headers or cookies are configured. Only explicit HTTPS
+  # origins are accepted. Credentials are used by the guarded internal JS
+  # downloader and are never passed to external scanner processes.
   allowed_hosts: []
   # Example:
-  #   - "app.example.com"
-  #   - "*.api.example.com"
+  #   - "https://app.example.com"
+  #   - "https://*.api.example.com:443"
   headers: {}
   # Example:
   #   Authorization: "Bearer ${TARGET_TOKEN}"
@@ -85,12 +73,11 @@ recon:
 # killer terminates them mid-scan. One scanner at a time finishes reliably.
 scanning:
   enabled: true
-  threads: 40  # Balanced default for reliable scans on modest servers
+  threads: 10  # Conservative default; raise only when the program explicitly permits it
   timeout: 1200  # 20-minute budget for the nuclei high-value scan (runs alone)
-  # Requests/sec ceiling. At 50 a full scan of ~1300 templates × dozens of hosts
-  # could not finish inside the budget (≈57 min of requests). 150 is Nuclei's own
-  # default and completes the scan with margin. Lower it for strict programs.
-  rate_limit: 150
+  # Global requests/sec ceiling used by scanners, Katana, and internal JS downloads.
+  # Keep this at or below the bug-bounty program's published traffic limit.
+  rate_limit: 25
   tools:
     nuclei:
       enabled: true
@@ -129,6 +116,6 @@ reporting:
 # signature scanners cannot find. It NEVER sends a request to the target —
 # every hypothesis is a lead for manual verification.
 hunter:
-  enabled: true
+  enabled: false            # Opt in: outputs are unverified leads, never findings.
   max_hypotheses: 40   # cap on ranked leads returned/saved
   max_endpoints: 120   # cap on surface entries sent to the model (parameterized URLs prioritized)

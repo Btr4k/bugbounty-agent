@@ -8,6 +8,7 @@ import (
 	"github.com/Btr4k/bugbounty-agent/internal/config"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	"github.com/Btr4k/bugbounty-agent/internal/recon"
+	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
 // fakeProvider returns a canned response and records the prompt it received.
@@ -28,7 +29,7 @@ func (f *fakeProvider) ProviderName() string { return "fake" }
 
 func testCfg() *config.Config {
 	return &config.Config{
-		Target: config.TargetConfig{Domains: []string{"example.com"}},
+		Target: config.TargetConfig{Domains: []string{"*.example.com"}},
 		Hunter: config.HunterConfig{Enabled: true, MaxHypotheses: 40, MaxEndpoints: 120},
 	}
 }
@@ -37,7 +38,7 @@ func testRecon() *recon.Results {
 	return &recon.Results{
 		Subdomains: []string{"api.example.com", "evil.com"}, // evil.com is out of scope
 		URLs: []string{
-			"https://api.example.com/orders?order_id=100&token=abc",
+			"https://api.example.com/orders?order_id=QUERY_VALUE_MUST_NOT_LEAK&token=TOKEN_VALUE_MUST_NOT_LEAK",
 			"https://api.example.com/profile", // plain path
 			"https://out-of-scope.test/x?id=1",
 		},
@@ -62,17 +63,85 @@ func TestBuildSurfaceRespectsScope(t *testing.T) {
 	if !strings.Contains(fp.lastPrompt, "order_id") {
 		t.Fatalf("expected parameterized URL params in prompt, got:\n%s", fp.lastPrompt)
 	}
+	for _, secret := range []string{"QUERY_VALUE_MUST_NOT_LEAK", "TOKEN_VALUE_MUST_NOT_LEAK"} {
+		if strings.Contains(fp.lastPrompt, secret) {
+			t.Fatalf("query value leaked into prompt: %q", secret)
+		}
+	}
 	if !strings.Contains(fp.lastPrompt, "api.example.com/admin") {
 		t.Fatalf("expected in-scope endpoint in prompt")
 	}
 }
 
+func TestBuildSurfaceBoundsTechnologyMetadata(t *testing.T) {
+	rec := testRecon()
+	rec.Technologies = make([]recon.Technology, 100)
+	for index := range rec.Technologies {
+		rec.Technologies[index] = recon.Technology{Name: strings.Repeat("x", 500) + string(rune('a'+index%26))}
+	}
+	surface := buildSurface(rec, scopepolicy.New(testCfg().Target), 120)
+	if len(surface.Technologies) > 40 {
+		t.Fatalf("technology surface exceeded cap: %d", len(surface.Technologies))
+	}
+	for _, technology := range surface.Technologies {
+		if len([]rune(technology)) > 200 {
+			t.Fatalf("technology label exceeded field cap: %d", len([]rune(technology)))
+		}
+	}
+}
+
+func TestPromptAllowsZeroHypotheses(t *testing.T) {
+	prompt := hunterSystemPrompt + "\n" + buildPrompt(surface{Subdomains: []string{"api.example.com"}})
+	if !strings.Contains(prompt, `{"hypotheses":[]}`) {
+		t.Fatal("prompt must explicitly permit an empty hypothesis list")
+	}
+	if strings.Contains(prompt, "لا تُرجع قائمة فارغة") {
+		t.Fatal("prompt still forces the model to invent at least one hypothesis")
+	}
+}
+
+func TestPromptRedactsSecretsAndURLQueryValues(t *testing.T) {
+	const configuredSecret = "CONFIGURED_SECRET_MUST_NOT_LEAK"
+	cfg := testCfg()
+	cfg.AI.APIKey = configuredSecret
+	rec := testRecon()
+	rec.Subdomains = append(rec.Subdomains,
+		"https://shadow.example.com/path?token=SUBDOMAIN_QUERY_MUST_NOT_LEAK#fragment",
+	)
+	rec.Technologies = append(rec.Technologies, recon.Technology{Name: configuredSecret})
+	rec.JSFiles = append(rec.JSFiles,
+		recon.JSFile{URL: "https://api.example.com/extra.js?key=JS_QUERY_MUST_NOT_LEAK"},
+	)
+
+	fp := &fakeProvider{response: `{"hypotheses":[]}`}
+	e := NewEngineWithProvider(cfg, logger.New(false), fp)
+	if _, err := e.Generate(context.Background(), rec); err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	for _, secret := range []string{
+		configuredSecret,
+		"SUBDOMAIN_QUERY_MUST_NOT_LEAK",
+		"JS_QUERY_MUST_NOT_LEAK",
+		"QUERY_VALUE_MUST_NOT_LEAK",
+		"TOKEN_VALUE_MUST_NOT_LEAK",
+	} {
+		if strings.Contains(fp.lastPrompt, secret) {
+			t.Fatalf("sensitive value leaked into prompt: %q", secret)
+		}
+	}
+	if !strings.Contains(fp.lastPrompt, "[REDACTED]") {
+		t.Fatal("configured secret was removed without the expected redaction marker")
+	}
+	if !strings.Contains(fp.lastPrompt, "shadow.example.com") {
+		t.Fatal("sanitized in-scope subdomain should remain available to the model")
+	}
+}
+
 func TestGenerateFiltersOffScopeTargetsAndRanks(t *testing.T) {
-	resp := `Here you go:
-{"hypotheses":[
-  {"class":"idor","target":"https://api.example.com/orders?order_id=100","parameter":"order_id","rationale":"sequential id","suggested_test":"swap id","severity":"high","confidence":0.6},
-  {"class":"ssrf","target":"https://evil.com/x","parameter":"url","rationale":"off scope","suggested_test":"n/a","severity":"critical","confidence":0.9},
-  {"class":"access-control","target":"https://api.example.com/admin","parameter":"","rationale":"admin path","suggested_test":"access without auth","severity":"critical","confidence":0.5}
+	resp := `{"hypotheses":[
+	  {"class":"idor","target":"https://api.example.com/orders?order_id=MODEL_VALUE_MUST_NOT_SURVIVE","parameter":"order_id","rationale":"sequential id","suggested_test":"swap id","severity":"high","confidence":0.6,"grounding":"inferred"},
+	  {"class":"ssrf","target":"https://evil.com/x","parameter":"url","rationale":"off scope","suggested_test":"n/a","severity":"critical","confidence":0.9,"grounding":"observed"},
+	  {"class":"access-control","target":"https://api.example.com/admin","parameter":"","rationale":"admin path","suggested_test":"access without auth","severity":"critical","confidence":0.5,"grounding":"inferred"}
 ]}`
 	e := NewEngineWithProvider(testCfg(), logger.New(false), &fakeProvider{response: resp})
 	hyps, err := e.Generate(context.Background(), testRecon())
@@ -90,12 +159,50 @@ func TestGenerateFiltersOffScopeTargetsAndRanks(t *testing.T) {
 		if strings.Contains(h.Target, "evil.com") {
 			t.Fatalf("off-scope target survived filtering: %s", h.Target)
 		}
+		if strings.Contains(h.Target, "MODEL_VALUE_MUST_NOT_SURVIVE") {
+			t.Fatalf("model-supplied query value survived target sanitization: %s", h.Target)
+		}
+		if h.Class == "idor" && h.Target != "https://api.example.com/orders" {
+			t.Fatalf("query should be removed from returned target, got %q", h.Target)
+		}
 	}
 }
 
 func TestParseHypothesesBadJSON(t *testing.T) {
 	if _, err := parseHypotheses("no json here"); err == nil {
 		t.Fatal("expected error on non-JSON response")
+	}
+}
+
+func TestParseHypothesesStrictButPracticalJSON(t *testing.T) {
+	valid := `{"hypotheses":[{"class":"idor","target":"https://api.example.com/orders","parameter":"order_id","rationale":"sequential identifier","suggested_test":"compare two authorized objects","severity":"high","confidence":0.6,"grounding":"observed"}]}`
+	accepted := map[string]string{
+		"plain object": valid,
+		"empty array":  `{"hypotheses":[]}`,
+	}
+	for name, response := range accepted {
+		t.Run("accept_"+name, func(t *testing.T) {
+			if _, err := parseHypotheses(response); err != nil {
+				t.Fatalf("valid response rejected: %v", err)
+			}
+		})
+	}
+
+	rejected := map[string]string{
+		"json fence":             "```json\n" + valid + "\n```",
+		"prose wrapper":          "Here you go:\n" + valid,
+		"unknown envelope field": `{"hypotheses":[],"note":"extra"}`,
+		"unknown item field":     `{"hypotheses":[{"class":"idor","target":"https://api.example.com/orders","parameter":"order_id","rationale":"x","suggested_test":"y","severity":"high","confidence":0.6,"grounding":"observed","extra":true}]}`,
+		"missing required field": `{"hypotheses":[{"class":"idor","target":"https://api.example.com/orders","parameter":"order_id","rationale":"x","suggested_test":"y","severity":"high","confidence":0.6}]}`,
+		"null array":             `{"hypotheses":null}`,
+		"invalid confidence":     `{"hypotheses":[{"class":"idor","target":"https://api.example.com/orders","parameter":"order_id","rationale":"x","suggested_test":"y","severity":"high","confidence":1.1,"grounding":"observed"}]}`,
+	}
+	for name, response := range rejected {
+		t.Run("reject_"+name, func(t *testing.T) {
+			if _, err := parseHypotheses(response); err == nil {
+				t.Fatal("invalid response was accepted")
+			}
+		})
 	}
 }
 
@@ -135,7 +242,7 @@ func TestGroundingObservedVsInferred(t *testing.T) {
 		t.Fatalf("inferred confidence must be capped at %.2f, got %.2f", inferredConfidenceCap, h.Confidence)
 	}
 	if g := byParam[""].Grounding; g != "observed" {
-		t.Fatalf("admin path is an observed endpoint, host-only lead should be observed, got %q", g)
+		t.Fatalf("admin path is an observed endpoint and should be observed, got %q", g)
 	}
 	// Observed leads must rank above the inferred one despite its higher raw confidence.
 	if hyps[0].Grounding != "observed" {
@@ -143,6 +250,35 @@ func TestGroundingObservedVsInferred(t *testing.T) {
 	}
 	if last := hyps[len(hyps)-1]; last.Parameter != "foo_id" {
 		t.Fatalf("inferred (foo_id) should rank last, got %q", last.Parameter)
+	}
+}
+
+func TestGroundingBindsParameterToExactHostAndPath(t *testing.T) {
+	resp := `{"hypotheses":[
+	  {"class":"idor","target":"https://api.example.com/orders","parameter":"order_id","rationale":"exact endpoint","suggested_test":"swap","severity":"high","confidence":0.8,"grounding":"inferred"},
+	  {"class":"idor","target":"https://api.example.com/profile","parameter":"order_id","rationale":"different path","suggested_test":"swap","severity":"high","confidence":0.8,"grounding":"observed"},
+	  {"class":"idor","target":"https://api.example.com/Orders","parameter":"order_id","rationale":"different path case","suggested_test":"swap","severity":"high","confidence":0.8,"grounding":"observed"}
+]}`
+	e := NewEngineWithProvider(testCfg(), logger.New(false), &fakeProvider{response: resp})
+	hyps, err := e.Generate(context.Background(), testRecon())
+	if err != nil {
+		t.Fatalf("Generate error: %v", err)
+	}
+	byRationale := make(map[string]Hypothesis, len(hyps))
+	for _, h := range hyps {
+		byRationale[h.Rationale] = h
+	}
+	if got := byRationale["exact endpoint"].Grounding; got != "observed" {
+		t.Fatalf("parameter on its observed host+path should be observed, got %q", got)
+	}
+	for _, rationale := range []string{"different path", "different path case"} {
+		h := byRationale[rationale]
+		if h.Grounding != "inferred" {
+			t.Fatalf("%s should be inferred, got %q", rationale, h.Grounding)
+		}
+		if h.Confidence != inferredConfidenceCap {
+			t.Fatalf("%s confidence should be capped at %.2f, got %.2f", rationale, inferredConfidenceCap, h.Confidence)
+		}
 	}
 }
 
@@ -204,6 +340,12 @@ func TestBareHostTargetSurvives(t *testing.T) {
 	}
 	if hyps[0].Target != "https://api.example.com" {
 		t.Fatalf("target not normalized with scheme: %q", hyps[0].Target)
+	}
+	if hyps[0].Grounding != "inferred" {
+		t.Fatalf("host-only lead must remain inferred, got %q", hyps[0].Grounding)
+	}
+	if hyps[0].Confidence > inferredConfidenceCap {
+		t.Fatalf("host-only lead confidence must be capped at %.2f, got %.2f", inferredConfidenceCap, hyps[0].Confidence)
 	}
 }
 

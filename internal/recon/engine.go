@@ -1,9 +1,7 @@
 package recon
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,24 +17,241 @@ import (
 	"time"
 
 	"github.com/Btr4k/bugbounty-agent/internal/config"
+	"github.com/Btr4k/bugbounty-agent/internal/jsselection"
 	"github.com/Btr4k/bugbounty-agent/internal/logger"
 	scopepolicy "github.com/Btr4k/bugbounty-agent/internal/scope"
 )
 
 type Engine struct {
-	cfg *config.Config
-	log *logger.Logger
+	cfg                     *config.Config
+	log                     *logger.Logger
+	activeTargetURLValidate func(context.Context, string) error
 }
 
-func (e *Engine) appendHeaderArgs(args []string, flag string, targets ...string) []string {
-	headers := e.cfg.Authentication.HeaderValuesForTargets(targets...)
-	if e.log != nil && e.cfg.Authentication.Configured() && len(headers) == 0 {
-		e.log.Debugf("Authentication not injected: one or more targets are not in authentication.allowed_hosts")
+type urlScope interface {
+	AllowsURL(string) bool
+}
+
+type guardedURLScope interface {
+	urlScope
+	ValidateURL(context.Context, string) error
+	SafeTransport(*http.Transport) *http.Transport
+}
+
+type pacedRoundTripper struct {
+	base  http.RoundTripper
+	ticks <-chan time.Time
+}
+
+func (p pacedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	select {
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	case <-p.ticks:
+		return p.base.RoundTrip(req)
 	}
-	for name, value := range headers {
-		args = append(args, flag, name+": "+value)
+}
+
+// jsRequestPolicy keeps target scope and credential scope separate. Target
+// scope decides where the downloader may go; credential scope is deliberately
+// narrower and requires an explicitly allowed HTTPS origin.
+type jsRequestPolicy struct {
+	scope          urlScope
+	authentication config.AuthenticationConfig
+}
+
+func newJSRequestPolicy(cfg *config.Config) jsRequestPolicy {
+	return jsRequestPolicy{
+		scope:          scopepolicy.New(cfg.Target),
+		authentication: cfg.Authentication,
 	}
-	return args
+}
+
+// headersForURL returns credentials only for an in-scope, explicitly allowed
+// HTTPS URL. AuthenticationConfig intentionally works at host granularity; the
+// redirect policy below binds those credentials to this request's exact origin
+// (scheme + host + effective port) for the lifetime of the redirect chain.
+func (p jsRequestPolicy) headersForURL(raw string) map[string]string {
+	parsed, origin, ok := secureOrigin(raw)
+	if !ok || p.scope == nil || !p.scope.AllowsURL(parsed.String()) || !p.authentication.AllowsTarget(parsed.String()) {
+		return nil
+	}
+	if origin == "" {
+		return nil
+	}
+	return p.authentication.HeaderValuesForTargets(parsed.String())
+}
+
+func (p jsRequestPolicy) headersForURLs(targets ...string) map[string]string {
+	if len(targets) == 0 {
+		return nil
+	}
+	var headers map[string]string
+	for _, target := range targets {
+		candidate := p.headersForURL(target)
+		if len(candidate) == 0 {
+			return nil
+		}
+		if headers == nil {
+			headers = candidate
+		}
+	}
+	return headers
+}
+
+func secureOrigin(raw string) (*url.URL, string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Hostname() == "" {
+		return nil, "", false
+	}
+	host := strings.Trim(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return nil, "", false
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	return parsed, "https://" + net.JoinHostPort(host, port), true
+}
+
+func normalizeJSURL(raw string) (*url.URL, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Hostname() == "" {
+		return nil, false
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return nil, false
+	}
+	return parsed, true
+}
+
+func (p jsRequestPolicy) stripAuthenticationHeaders(headers http.Header) {
+	for name := range p.authentication.Headers {
+		headers.Del(name)
+	}
+	for _, name := range []string{
+		"Authorization", "Proxy-Authorization", "Cookie", "Cookie2",
+	} {
+		headers.Del(name)
+	}
+}
+
+func (p jsRequestPolicy) checkRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil {
+		return fmt.Errorf("invalid redirect request")
+	}
+	if len(via) == 0 {
+		p.stripAuthenticationHeaders(req.Header)
+		return fmt.Errorf("redirect has no originating request")
+	}
+	if len(via) >= 10 {
+		p.stripAuthenticationHeaders(req.Header)
+		return fmt.Errorf("stopped after 10 redirects")
+	}
+
+	// URL userinfo can cause net/http to synthesize a Basic Authorization header
+	// after CheckRedirect. Never follow such a redirect.
+	if req.URL.User != nil || p.scope == nil || !p.scope.AllowsURL(req.URL.String()) {
+		p.stripAuthenticationHeaders(req.Header)
+		return http.ErrUseLastResponse
+	}
+	// Internal downloads are HTTPS-only. This rejects plaintext redirects even
+	// when the originating request was also plaintext.
+	if !strings.EqualFold(req.URL.Scheme, "https") {
+		p.stripAuthenticationHeaders(req.Header)
+		return http.ErrUseLastResponse
+	}
+
+	if guarded, ok := p.scope.(guardedURLScope); ok {
+		if err := guarded.ValidateURL(req.Context(), req.URL.String()); err != nil {
+			p.stripAuthenticationHeaders(req.Header)
+			return http.ErrUseLastResponse
+		}
+	}
+
+	previous := via[len(via)-1].URL
+	if previous == nil || !strings.EqualFold(previous.Scheme, "https") {
+		p.stripAuthenticationHeaders(req.Header)
+		return http.ErrUseLastResponse
+	}
+
+	_, initialOrigin, initialSecure := secureOrigin(via[0].URL.String())
+	_, destinationOrigin, destinationSecure := secureOrigin(req.URL.String())
+	if !initialSecure || !destinationSecure || initialOrigin != destinationOrigin || !p.authentication.AllowsTarget(req.URL.String()) {
+		p.stripAuthenticationHeaders(req.Header)
+	}
+	return nil
+}
+
+func newJSHTTPClient(policy jsRequestPolicy, transport http.RoundTripper) *http.Client {
+	if transport == nil {
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		if guarded, ok := policy.scope.(guardedURLScope); ok {
+			transport = guarded.SafeTransport(base)
+		} else {
+			transport = base
+		}
+	}
+	return &http.Client{
+		Timeout:       15 * time.Second,
+		Transport:     transport,
+		CheckRedirect: policy.checkRedirect,
+	}
+}
+
+func reconRootDomain(raw string) string {
+	return strings.TrimPrefix(strings.TrimSpace(raw), "*.")
+}
+
+func configuredReconRoots(domains []string) []string {
+	seen := make(map[string]bool, len(domains))
+	roots := make([]string, 0, len(domains))
+	for _, raw := range domains {
+		if root := strings.ToLower(reconRootDomain(raw)); root != "" && !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+// configuredSubdomainReconRoots returns only roots whose children were
+// explicitly authorized. A wildcard on one root must never cause passive
+// subdomain enumeration of a different exact-only root in a mixed policy.
+func configuredSubdomainReconRoots(domains []string) []string {
+	seen := make(map[string]bool, len(domains))
+	roots := make([]string, 0, len(domains))
+	for _, raw := range domains {
+		raw = strings.TrimSpace(raw)
+		if !strings.HasPrefix(raw, "*.") {
+			continue
+		}
+		root := strings.ToLower(reconRootDomain(raw))
+		if root != "" && !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func authorizesDiscoveredSubdomains(domains []string) bool {
+	for _, raw := range domains {
+		if strings.HasPrefix(strings.TrimSpace(raw), "*.") {
+			return true
+		}
+	}
+	return false
 }
 
 type Results struct {
@@ -52,10 +267,11 @@ type Results struct {
 }
 
 type JSFile struct {
-	URL     string `json:"url"`
-	Content string `json:"content"`
-	Size    int    `json:"size"`
-	Source  string `json:"source"` // "katana" or "wayback"
+	URL       string `json:"url"`
+	Content   string `json:"content"`
+	Size      int    `json:"size"`
+	Source    string `json:"source"` // "katana" or "wayback"
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 type Technology struct {
@@ -72,15 +288,56 @@ type Secret struct {
 }
 
 func NewEngine(cfg *config.Config, log *logger.Logger) *Engine {
-	return &Engine{
-		cfg: cfg,
-		log: log,
+	engine := &Engine{cfg: cfg, log: log}
+	if cfg != nil {
+		policy := scopepolicy.New(cfg.Target)
+		engine.activeTargetURLValidate = policy.ValidateURL
 	}
+	return engine
+}
+
+func (e *Engine) reconConcurrency(maximum int) int {
+	workers := e.cfg.Scanning.Threads
+	if workers < 1 {
+		workers = 1
+	}
+	rate := e.reconRateLimit()
+	if workers > rate {
+		workers = rate
+	}
+	if maximum > 0 && workers > maximum {
+		workers = maximum
+	}
+	return workers
+}
+
+func (e *Engine) reconRateLimit() int {
+	rate := e.cfg.Scanning.RateLimit
+	if rate < 1 {
+		return 1
+	}
+	return rate
 }
 
 func (e *Engine) Run(ctx context.Context) (*Results, error) {
+	if e == nil || e.cfg == nil {
+		return nil, errors.New("recon configuration is not available")
+	}
+	if e.log == nil {
+		return nil, errors.New("recon logger is not available")
+	}
+	if len(e.cfg.Target.Domains) == 0 {
+		return nil, errors.New("recon requires at least one authorized target")
+	}
+	policy := scopepolicy.New(e.cfg.Target)
+	if policy.ValidationError() != nil {
+		// Keep invalid raw target data out of diagnostics; configuration validation
+		// provides the detailed user-facing error before the engine is constructed.
+		return nil, errors.New("recon target scope is invalid")
+	}
+
 	results := &Results{
-		Subdomains:   append([]string(nil), e.cfg.Target.Domains...),
+		Subdomains:   configuredReconRoots(e.cfg.Target.Domains),
 		URLs:         make([]string, 0),
 		Endpoints:    make([]string, 0),
 		IPs:          make([]string, 0),
@@ -109,47 +366,52 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	}
 
 	e.log.PhaseNote(fmt.Sprintf("Target: %s (timeout: %ds)", e.cfg.Target.Domains[0], e.cfg.Recon.Timeout))
+	discoverSubdomains := authorizesDiscoveredSubdomains(e.cfg.Target.Domains)
 
 	// Subfinder
-	if e.cfg.Recon.Tools.Subfinder {
+	if e.cfg.Recon.Tools.Subfinder && discoverSubdomains {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			e.log.ToolStart("Subfinder", "enumerating subdomains...")
 			start := time.Now()
 			subs, err := e.runSubfinder(passiveCtx)
+			mu.Lock()
+			results.Subdomains = append(results.Subdomains, subs...)
+			mu.Unlock()
 			if err != nil {
 				e.log.ToolFail("Subfinder", err)
 				recordToolError("subfinder", err)
 				return
 			}
 			e.log.ToolDone("Subfinder", len(subs), time.Since(start))
-			mu.Lock()
-			results.Subdomains = append(results.Subdomains, subs...)
-			mu.Unlock()
 		}()
+	} else if !discoverSubdomains {
+		e.log.ToolSkip("Subfinder", "exact-host scope does not authorize discovered subdomains")
 	} else {
 		e.log.ToolSkip("Subfinder", "disabled in config")
 	}
 
 	// Assetfinder
-	if e.cfg.Recon.Tools.Assetfinder {
+	if e.cfg.Recon.Tools.Assetfinder && discoverSubdomains {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			e.log.ToolStart("Assetfinder", "discovering assets...")
 			start := time.Now()
 			subs, err := e.runAssetfinder(passiveCtx)
+			mu.Lock()
+			results.Subdomains = append(results.Subdomains, subs...)
+			mu.Unlock()
 			if err != nil {
 				e.log.ToolFail("Assetfinder", err)
 				recordToolError("assetfinder", err)
 				return
 			}
 			e.log.ToolDone("Assetfinder", len(subs), time.Since(start))
-			mu.Lock()
-			results.Subdomains = append(results.Subdomains, subs...)
-			mu.Unlock()
 		}()
+	} else if !discoverSubdomains {
+		e.log.ToolSkip("Assetfinder", "exact-host scope does not authorize discovered subdomains")
 	} else {
 		e.log.ToolSkip("Assetfinder", "disabled in config")
 	}
@@ -162,6 +424,9 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			e.log.ToolStart("WaybackURLs", "fetching historical URLs...")
 			start := time.Now()
 			urls, err := e.runWaybackURLs(passiveCtx)
+			mu.Lock()
+			results.URLs = append(results.URLs, urls...)
+			mu.Unlock()
 			if err != nil {
 				e.log.ToolFail("WaybackURLs", err)
 				recordToolError("waybackurls", err)
@@ -171,16 +436,13 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			if len(urls) == 0 {
 				e.log.Warnf("WaybackURLs returned no historical URLs; Katana crawl URLs will be used as the active-scan fallback")
 			}
-			mu.Lock()
-			results.URLs = append(results.URLs, urls...)
-			mu.Unlock()
 		}()
 	} else {
 		e.log.ToolSkip("WaybackURLs", "disabled in config")
 	}
 
 	// C99 API Intelligence
-	if e.cfg.C99.Enabled && e.cfg.C99.APIKey != "" {
+	if discoverSubdomains && e.cfg.C99.Enabled && e.cfg.C99.APIKey != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -197,12 +459,14 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			results.Subdomains = append(results.Subdomains, subs...)
 			mu.Unlock()
 		}()
+	} else if !discoverSubdomains {
+		e.log.ToolSkip("C99 API", "exact-host scope does not authorize discovered subdomains")
 	} else {
 		e.log.ToolSkip("C99 API", "disabled or no API key")
 	}
 
 	// Certificate Transparency
-	if e.cfg.Recon.Tools.CertTransparency {
+	if e.cfg.Recon.Tools.CertTransparency && discoverSubdomains {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -219,6 +483,8 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			results.Subdomains = append(results.Subdomains, subs...)
 			mu.Unlock()
 		}()
+	} else if !discoverSubdomains {
+		e.log.ToolSkip("CertTransparency", "exact-host scope does not authorize discovered subdomains")
 	} else {
 		e.log.ToolSkip("CertTransparency", "disabled in config")
 	}
@@ -233,13 +499,20 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 	// Sanitize subdomains: strip wildcards, remove invalid entries
 	results.Subdomains = e.sanitizeSubdomains(results.Subdomains)
-	policy := scopepolicy.New(e.cfg.Target)
 	results.Subdomains = policy.FilterHosts(results.Subdomains)
 	results.URLs = policy.FilterURLs(results.URLs)
+	sort.Slice(results.Subdomains, func(i, j int) bool {
+		return strings.ToLower(results.Subdomains[i]) < strings.ToLower(results.Subdomains[j])
+	})
+	sort.Slice(results.URLs, func(i, j int) bool {
+		return strings.ToLower(results.URLs[i]) < strings.ToLower(results.URLs[j])
+	})
 
 	// Apply limits (guard against MaxSubdomains=0 to avoid wiping results)
 	if e.cfg.Recon.MaxSubdomains > 0 && len(results.Subdomains) > e.cfg.Recon.MaxSubdomains {
+		omitted := len(results.Subdomains) - e.cfg.Recon.MaxSubdomains
 		results.Subdomains = results.Subdomains[:e.cfg.Recon.MaxSubdomains]
+		recordToolError("subdomain-cap", fmt.Errorf("%d authorized subdomain(s) omitted by max_subdomains", omitted))
 	}
 
 	// ═══════════════════════════════════════
@@ -252,13 +525,13 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 		e.log.ToolStart("Katana", "crawling for JS files...")
 		start := time.Now()
 		kURLs, kJSURLs, err := e.runKatana(ctx, results.Subdomains)
+		results.URLs = append(results.URLs, kURLs...)
+		jsURLs = append(jsURLs, kJSURLs...)
 		if err != nil {
 			e.log.ToolFail("Katana", err)
 			recordToolError("katana", err)
 		} else {
 			e.log.ToolDone("Katana", len(kURLs), time.Since(start))
-			results.URLs = append(results.URLs, kURLs...)
-			jsURLs = append(jsURLs, kJSURLs...)
 		}
 	} else {
 		e.log.ToolSkip("Katana", "disabled in config")
@@ -277,17 +550,29 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 	// parameter-based scanners useful when archive providers return no data.
 	results.URLs = e.deduplicate(results.URLs)
 	results.URLs = policy.FilterURLs(results.URLs)
+	sort.Slice(results.URLs, func(i, j int) bool {
+		left, right := strings.ToLower(results.URLs[i]), strings.ToLower(results.URLs[j])
+		if left != right {
+			return left < right
+		}
+		return results.URLs[i] < results.URLs[j]
+	})
 
 	// Deduplicate JS URLs
 	jsURLs = e.deduplicate(jsURLs)
 	jsURLs = policy.FilterURLs(jsURLs)
+	sort.Slice(jsURLs, func(i, j int) bool { return jsselection.Less(jsURLs[i], jsURLs[j]) })
 
 	// Download JS content
 	if len(jsURLs) > 0 {
 		e.log.ToolStart("JS Download", fmt.Sprintf("fetching %d JS files...", len(jsURLs)))
 		start := time.Now()
-		results.JSFiles = e.downloadJSFiles(ctx, jsURLs)
+		var attempted, incomplete, omitted int
+		results.JSFiles, attempted, incomplete, omitted = e.downloadJSFiles(ctx, jsURLs)
 		e.log.ToolDone("JS Download", len(results.JSFiles), time.Since(start))
+		if incomplete > 0 || omitted > 0 {
+			recordToolError("js-download", fmt.Errorf("%d/%d download(s) failed or were truncated and %d URL(s) were omitted by the cap", incomplete, attempted, omitted))
+		}
 
 		// Mine endpoints/parameters out of the downloaded JS. This is what turns a
 		// subdomain-only surface into one with real, observed endpoints — enabling
@@ -302,6 +587,15 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 			}
 		}
 	}
+	results.URLs = e.deduplicate(policy.FilterURLs(results.URLs))
+	sort.Slice(results.URLs, func(i, j int) bool {
+		left, right := strings.ToLower(results.URLs[i]), strings.ToLower(results.URLs[j])
+		if left != right {
+			return left < right
+		}
+		return results.URLs[i] < results.URLs[j]
+	})
+	results.Endpoints = append([]string(nil), results.URLs...)
 
 	if len(toolErrors) > 0 {
 		e.log.Warnf("Reconnaissance completed partially: %d enabled source(s) failed", len(toolErrors))
@@ -314,106 +608,169 @@ func (e *Engine) Run(ctx context.Context) (*Results, error) {
 
 func (e *Engine) runSubfinder(ctx context.Context) ([]string, error) {
 	e.log.Debug("Running subfinder...")
-
-	var results []string
-	for _, domain := range e.cfg.Target.Domains {
-		cmd := exec.CommandContext(ctx, "subfinder",
+	return e.runPassiveHostTool(ctx, "subfinder", func(domain string) *exec.Cmd {
+		return exec.CommandContext(ctx, "subfinder",
 			"-d", domain,
 			"-silent",
 			"-all",
 		)
-
-		output, err := cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("subfinder error: %w", err)
-		}
-
-		scanner := bufio.NewScanner(strings.NewReader(string(output)))
-		for scanner.Scan() {
-			subdomain := strings.TrimSpace(scanner.Text())
-			if subdomain != "" {
-				results = append(results, subdomain)
-			}
-		}
-	}
-
-	return results, nil
+	})
 }
 
 func (e *Engine) runAssetfinder(ctx context.Context) ([]string, error) {
 	e.log.Debug("Running assetfinder...")
-
-	var results []string
-	for _, domain := range e.cfg.Target.Domains {
-		cmd := exec.CommandContext(ctx, "assetfinder",
+	return e.runPassiveHostTool(ctx, "assetfinder", func(domain string) *exec.Cmd {
+		return exec.CommandContext(ctx, "assetfinder",
 			"--subs-only",
 			domain,
 		)
+	})
+}
 
-		output, err := cmd.Output()
-		if err != nil {
-			return nil, fmt.Errorf("assetfinder error: %w", err)
+// runPassiveHostTool applies a static scope policy only. It intentionally does
+// not resolve discovered names: passive enumeration must not become active
+// target traffic. Valid records produced before truncation or process failure
+// are returned alongside the coverage error.
+func (e *Engine) runPassiveHostTool(
+	ctx context.Context,
+	tool string,
+	command func(string) *exec.Cmd,
+) ([]string, error) {
+	policy := scopepolicy.New(e.cfg.Target)
+	var results []string
+	var coverageErrors []error
+	malformed := 0
+
+	for _, domain := range configuredSubdomainReconRoots(e.cfg.Target.Domains) {
+		cmd := command(domain)
+		cmd.Env = config.ExternalToolEnvironment()
+		_, commandErr := executeBoundedLines(
+			ctx,
+			tool,
+			cmd,
+			maxPassiveCommandOutputBytes,
+			maxCommandOutputLineBytes,
+			func(line string) {
+				host, ok := normalizePassiveHostname(line)
+				if !ok {
+					if strings.TrimSpace(line) != "" {
+						malformed++
+					}
+					return
+				}
+				if policy.AllowsHost(host) {
+					results = append(results, host)
+				}
+			},
+		)
+		if commandErr != nil {
+			coverageErrors = append(coverageErrors, commandErr)
 		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if malformed > 0 {
+		coverageErrors = append(coverageErrors, fmt.Errorf("%s discarded %d malformed output record(s)", tool, malformed))
+	}
+	return results, joinDiagnosticErrors(coverageErrors...)
+}
 
-		scanner := bufio.NewScanner(strings.NewReader(string(output)))
-		for scanner.Scan() {
-			subdomain := strings.TrimSpace(scanner.Text())
-			if subdomain != "" {
-				results = append(results, subdomain)
+func normalizePassiveHostname(raw string) (string, bool) {
+	raw = strings.TrimSuffix(raw, "\r")
+	for _, character := range raw {
+		if character < 0x20 || character == 0x7f {
+			return "", false
+		}
+	}
+	host := strings.ToLower(strings.TrimSpace(raw))
+	host = strings.TrimPrefix(host, "*.")
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 253 || strings.ContainsAny(host, "/\\:@?#[]*") {
+		return "", false
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return "", false
 			}
 		}
 	}
-
-	return results, nil
+	return host, true
 }
 
 func (e *Engine) runWaybackURLs(ctx context.Context) ([]string, error) {
+	return e.runWaybackURLsBounded(ctx, maxWaybackCommandOutputBytes, maxWaybackOutputLineBytes)
+}
+
+func (e *Engine) runWaybackURLsBounded(ctx context.Context, maxOutputBytes int64, maxLineBytes int) ([]string, error) {
 	e.log.Debug("Running waybackurls...")
 
-	// Configurable limit to prevent OOM on large domains
+	// Keep both a record cap and one aggregate byte budget. A record-only limit is
+	// insufficient because a malicious archive/tool can emit hundreds of
+	// kilobytes per URL and exhaust memory long before max_wayback_urls is reached.
 	maxURLs := e.cfg.Recon.MaxWaybackURLs
 	if maxURLs <= 0 {
 		maxURLs = 10000
 	}
-
-	var results []string
-	for _, domain := range e.cfg.Target.Domains {
-		cmd := exec.CommandContext(ctx, "waybackurls", domain)
-
-		// Stream stdout instead of buffering all output in memory
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			return nil, fmt.Errorf("waybackurls pipe error: %w", err)
-		}
-
-		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("waybackurls start error: %w", err)
-		}
-
-		sc := bufio.NewScanner(stdout)
-		sc.Buffer(make([]byte, 64*1024), 256*1024) // handle long URLs
-
-		for sc.Scan() {
-			if len(results) >= maxURLs {
-				e.log.Infof("WaybackURLs: reached %d URL limit, stopping", maxURLs)
-				break
-			}
-			url := strings.TrimSpace(sc.Text())
-			if url != "" {
-				results = append(results, url)
-			}
-		}
-
-		// Kill process if limit reached (it may still be producing output)
-		if len(results) >= maxURLs {
-			cmd.Process.Kill()
-		}
-
-		// Wait to reap the process
-		cmd.Wait()
+	if maxOutputBytes < 1 || maxLineBytes < 1 {
+		return nil, errors.New("waybackurls output limits are invalid")
 	}
 
-	return results, nil
+	var results []string
+	remainingBytes := maxOutputBytes
+	var coverageErrors []error
+	for _, domain := range configuredReconRoots(e.cfg.Target.Domains) {
+		if remainingBytes <= 0 {
+			coverageErrors = append(coverageErrors, fmt.Errorf("waybackurls aggregate output exceeded the %d-byte limit", maxOutputBytes))
+			break
+		}
+
+		commandCtx, cancel := context.WithCancel(ctx)
+		cmd := exec.CommandContext(commandCtx, "waybackurls", domain)
+		cmd.Env = config.ExternalToolEnvironment()
+		recordCapReached := false
+		stats, commandErr := executeBoundedLines(
+			commandCtx,
+			"waybackurls",
+			cmd,
+			remainingBytes,
+			maxLineBytes,
+			func(line string) {
+				candidate := strings.TrimSpace(line)
+				if candidate == "" {
+					return
+				}
+				if len(results) >= maxURLs {
+					recordCapReached = true
+					cancel()
+					return
+				}
+				results = append(results, candidate)
+			},
+		)
+		cancel()
+		remainingBytes -= stats.Bytes
+
+		if recordCapReached {
+			e.log.Infof("WaybackURLs: reached %d URL limit, stopping", maxURLs)
+			coverageErrors = append(coverageErrors, fmt.Errorf("waybackurls coverage capped at %d URLs", maxURLs))
+			break
+		}
+		if commandErr != nil {
+			coverageErrors = append(coverageErrors, commandErr)
+			break
+		}
+	}
+
+	return results, joinDiagnosticErrors(coverageErrors...)
 }
 
 func (e *Engine) deduplicate(items []string) []string {
@@ -465,20 +822,19 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 	e.log.Debug("Running C99 subdomain enumeration...")
 
 	var results []string
-	for _, domain := range e.cfg.Target.Domains {
+	for _, domain := range configuredSubdomainReconRoots(e.cfg.Target.Domains) {
 		apiURL := fmt.Sprintf("https://api.c99.nl/subdomainfinder?key=%s&domain=%s&json",
 			url.QueryEscape(e.cfg.C99.APIKey), url.QueryEscape(domain))
 
 		req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("C99 request creation failed: %w", err)
+			return nil, errors.New("C99 request creation failed")
 		}
 
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			sanitized := strings.ReplaceAll(err.Error(), e.cfg.C99.APIKey, "[REDACTED]")
-			return nil, fmt.Errorf("C99 API request failed: %s", sanitized)
+			return nil, safeHTTPFailure(ctx, "C99 API request", err)
 		}
 		defer resp.Body.Close()
 
@@ -486,9 +842,9 @@ func (e *Engine) runC99Subdomains(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("C99 API returned status %d", resp.StatusCode)
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+		body, err := readBoundedResponseBody(resp.Body, 8<<20, "C99 API")
 		if err != nil {
-			return nil, fmt.Errorf("failed to read C99 response: %w", err)
+			return results, err
 		}
 
 		// Parse C99 JSON response
@@ -530,7 +886,6 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 	e.log.Debug("Querying Certificate Transparency logs...")
 
 	var results []string
-	successfulDomains := 0
 	var requestErrors []error
 	ipv4Transport := http.DefaultTransport.(*http.Transport).Clone()
 	ipv4Transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
@@ -540,7 +895,7 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 		Timeout:   30 * time.Second,
 		Transport: ipv4Transport,
 	}
-	for _, domain := range e.cfg.Target.Domains {
+	for _, domain := range configuredSubdomainReconRoots(e.cfg.Target.Domains) {
 		crtURL := fmt.Sprintf("https://crt.sh/?q=%%25.%s&output=json", domain)
 
 		// Retry logic: up to 3 attempts with backoff
@@ -565,14 +920,14 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 
 			req, err := http.NewRequestWithContext(passiveCtx, "GET", crtURL, nil)
 			if err != nil {
-				lastErr = err
+				lastErr = errors.New("crt.sh request creation failed")
 				continue
 			}
 
 			resp, err := client.Do(req)
 			if err != nil {
-				lastErr = err
-				e.log.Warnf("crt.sh attempt %d failed: %v", attempt+1, err)
+				lastErr = safeHTTPFailure(passiveCtx, "crt.sh request", err)
+				e.log.Warnf("crt.sh attempt %d failed: %v", attempt+1, lastErr)
 				continue
 			}
 
@@ -582,7 +937,7 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 				continue
 			}
 
-			body, err = io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+			body, err = readBoundedResponseBody(resp.Body, 32<<20, "crt.sh")
 			resp.Body.Close()
 			if err != nil {
 				lastErr = err
@@ -608,19 +963,16 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 			}
 			e.log.Infof("certspotter fallback found %d names for %s", len(csNames), domain)
 			results = append(results, csNames...)
-			successfulDomains++
 			continue
 		}
-		successfulDomains++
-
 		var crtEntries []struct {
 			NameValue string `json:"name_value"`
 		}
 
 		if err := json.Unmarshal(body, &crtEntries); err != nil {
+			requestErrors = append(requestErrors, fmt.Errorf("%s: crt.sh returned malformed JSON", domain))
 			continue
 		}
-
 		for _, entry := range crtEntries {
 			names := strings.Split(entry.NameValue, "\n")
 			for _, name := range names {
@@ -634,8 +986,8 @@ func (e *Engine) runCertTransparency(rootCtx, passiveCtx context.Context) ([]str
 	}
 
 	e.log.Infof("Certificate Transparency found %d entries", len(results))
-	if successfulDomains == 0 && len(requestErrors) > 0 {
-		return results, errors.Join(requestErrors...)
+	if len(requestErrors) > 0 {
+		return results, joinDiagnosticErrors(requestErrors...)
 	}
 	return results, nil
 }
@@ -647,13 +999,13 @@ func (e *Engine) queryCertSpotter(ctx context.Context, domain string) ([]string,
 	csURL := fmt.Sprintf("https://api.certspotter.com/v1/issuances?domain=%s&include_subdomains=true&expand=dns_names", domain)
 	req, err := http.NewRequestWithContext(ctx, "GET", csURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("certspotter request creation failed")
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, safeHTTPFailure(ctx, "certspotter request", err)
 	}
 	defer resp.Body.Close()
 
@@ -661,7 +1013,7 @@ func (e *Engine) queryCertSpotter(ctx context.Context, domain string) ([]string,
 		return nil, fmt.Errorf("certspotter returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+	body, err := readBoundedResponseBody(resp.Body, 32<<20, "certspotter")
 	if err != nil {
 		return nil, err
 	}
@@ -702,13 +1054,20 @@ func prioritizeKatanaTargets(subdomains []string) []string {
 	highValue := []string{"www.", "api.", "app.", "portal.", "admin.", "dashboard.", "account.", "my.", "secure.", "auth."}
 	out := append([]string(nil), subdomains...)
 	sort.SliceStable(out, func(i, j int) bool {
-		return katanaScore(out[i], highValue) > katanaScore(out[j], highValue)
+		left, right := katanaScore(out[i], highValue), katanaScore(out[j], highValue)
+		if left != right {
+			return left > right
+		}
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
 	})
 	return out
 }
 
 func katanaScore(host string, highValue []string) int {
 	lower := strings.ToLower(host)
+	if parsed, err := url.Parse(lower); err == nil && parsed.Hostname() != "" {
+		lower = parsed.Hostname()
+	}
 	score := 0
 	for _, p := range highValue {
 		if strings.HasPrefix(lower, p) {
@@ -725,35 +1084,99 @@ func katanaScore(host string, highValue []string) int {
 // runKatana crawls subdomains and returns all discovered URLs plus the JS subset.
 func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, []string, error) {
 	if !isToolInstalled("katana") {
-		return nil, nil, fmt.Errorf("katana not installed (run: go install github.com/projectdiscovery/katana/cmd/katana@latest)")
+		return nil, nil, fmt.Errorf("katana not installed (run ./install.sh)")
 	}
 
 	var crawlURLs []string
 	var jsURLs []string
+	var coverageErrors []error
+	policy := scopepolicy.New(e.cfg.Target)
 
 	// Limit subdomains for katana (it crawls each one). Katana is the single
 	// most expensive recon step, so it is capped tightly — its only job here is
 	// to surface JS files and endpoints, which a shallow crawl already covers.
-	targets := subdomains
+	targets := make([]string, 0, len(subdomains))
+	seenTargets := make(map[string]bool, len(subdomains))
+	malformedTargets := 0
+	outOfScopeTargets := 0
+	for _, rawTarget := range subdomains {
+		target, ok := normalizeKatanaTarget(rawTarget)
+		if !ok {
+			malformedTargets++
+			continue
+		}
+		if !policy.AllowsURL(target) {
+			outOfScopeTargets++
+			continue
+		}
+		key := strings.ToLower(target)
+		if !seenTargets[key] {
+			seenTargets[key] = true
+			targets = append(targets, target)
+		}
+	}
+	if malformedTargets > 0 {
+		coverageErrors = append(coverageErrors, fmt.Errorf("katana omitted %d malformed target(s)", malformedTargets))
+	}
+	if outOfScopeTargets > 0 {
+		coverageErrors = append(coverageErrors, fmt.Errorf("katana omitted %d unauthorized target(s)", outOfScopeTargets))
+	}
+
+	omittedTargets := 0
 	if len(targets) > 20 {
+		omittedTargets = len(targets) - 20
 		targets = prioritizeKatanaTargets(targets)[:20]
 	}
+	if omittedTargets > 0 {
+		coverageErrors = append(coverageErrors, fmt.Errorf("katana target cap omitted %d authorized host(s)", omittedTargets))
+	}
+
+	// Perform a fresh public-address check as close as possible to process start.
+	// Katana is an external process and resolves each hostname independently, so
+	// this gate reduces SSRF exposure but cannot eliminate a DNS-rebinding race.
+	validator := e.activeTargetURLValidate
+	if validator == nil {
+		validator = policy.ValidateURL
+	}
+	validatedTargets := make([]string, 0, len(targets))
+	unsafeTargets := 0
+	for _, target := range targets {
+		if err := validator(ctx, target); err != nil {
+			unsafeTargets++
+			continue
+		}
+		validatedTargets = append(validatedTargets, target)
+	}
+	if unsafeTargets > 0 {
+		// Do not include the validator error or raw target: either may contain a
+		// query value, secret, or control characters supplied by an integration.
+		coverageErrors = append(coverageErrors, fmt.Errorf("katana public-address validation rejected %d target(s)", unsafeTargets))
+	}
+	if len(validatedTargets) == 0 {
+		coverageErrors = append(coverageErrors, errors.New("katana has no validated public target to crawl"))
+		return nil, nil, joinDiagnosticErrors(coverageErrors...)
+	}
+	targets = validatedTargets
 
 	// Write targets to temp file
 	tmpFile, err := os.CreateTemp("", "katana-targets-*.txt")
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create temp file: %w", err)
+		coverageErrors = append(coverageErrors, errors.New("katana target file creation failed"))
+		return nil, nil, joinDiagnosticErrors(coverageErrors...)
 	}
 	defer os.Remove(tmpFile.Name())
 
 	for _, target := range targets {
-		// Ensure targets have a scheme — katana requires https:// or http://
-		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-			target = "https://" + target
+		if _, err := fmt.Fprintln(tmpFile, target); err != nil {
+			_ = tmpFile.Close()
+			coverageErrors = append(coverageErrors, errors.New("katana target file write failed"))
+			return nil, nil, joinDiagnosticErrors(coverageErrors...)
 		}
-		fmt.Fprintln(tmpFile, target)
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		coverageErrors = append(coverageErrors, errors.New("katana target file close failed"))
+		return nil, nil, joinDiagnosticErrors(coverageErrors...)
+	}
 
 	// Adaptive timeout: scale based on number of targets, cap at 4 minutes.
 	// A depth-1 crawl over 20 hosts surfaces JS/endpoints quickly; the old
@@ -766,41 +1189,117 @@ func (e *Engine) runKatana(ctx context.Context, subdomains []string) ([]string, 
 	katanaCtx, cancel := context.WithTimeout(ctx, katanaTimeout)
 	defer cancel()
 
+	workers := e.reconConcurrency(10)
 	args := []string{
 		"-list", tmpFile.Name(),
 		"-jsluice", // extract JS file URLs and inline JS endpoints (v1.1+)
 		"-silent",
 		"-d", "1", // shallow crawl depth — enough to surface JS files and endpoints
-		"-c", "15", // concurrency
+		"-c", fmt.Sprintf("%d", workers),
+		"-p", "1", // one input at a time; -rl is the global request ceiling
+		"-rl", fmt.Sprintf("%d", e.reconRateLimit()),
 		"-timeout", "8",
 		"-fs", "fqdn", // never crawl links on a different host
+		"-dr", // do not let an external redirect move the crawler across an authorization boundary
 		// No -em filter: Go-side filter handles .js suffix check,
 		// preserving URLs with query strings like app.js?v=123
 	}
-	args = e.appendHeaderArgs(args, "-H", subdomains...)
+
+	// Katana cannot enforce HawkEye's dial-time public-address validation and its
+	// header flag exposes values in the process argument list. Never give the
+	// external crawler credentials; the guarded internal HTTPS downloader below
+	// is the only authenticated recon client.
+	if e.log != nil && e.cfg.Authentication.Configured() {
+		e.log.Debugf("Authentication intentionally disabled for external Katana; guarded internal HTTPS downloads remain available")
+	}
 
 	cmd := exec.CommandContext(katanaCtx, "katana", args...)
-	output, err := cmd.Output()
-	if err != nil {
-		// Katana might timeout but still produce results
-		if len(output) == 0 {
-			return nil, nil, fmt.Errorf("katana error: %w", err)
-		}
+	cmd.Env = config.ExternalToolEnvironment()
+	malformedRecords := 0
+	_, commandErr := executeBoundedLines(
+		katanaCtx,
+		"katana",
+		cmd,
+		maxKatanaCommandOutputBytes,
+		maxCommandOutputLineBytes,
+		func(line string) {
+			discoveredURL, ok := normalizeKatanaDiscoveredURL(line)
+			if !ok {
+				if strings.TrimSpace(line) != "" {
+					malformedRecords++
+				}
+				return
+			}
+			// Static authorization only: Katana already performed the request. Never
+			// resolve its output merely to decide whether to retain the record.
+			if !policy.AllowsURL(discoveredURL) {
+				return
+			}
+			crawlURLs = append(crawlURLs, discoveredURL)
+			if strings.HasSuffix(strings.ToLower(strings.Split(discoveredURL, "?")[0]), ".js") && !isNoiseJS(discoveredURL) {
+				jsURLs = append(jsURLs, discoveredURL)
+			}
+		},
+	)
+	if commandErr != nil {
+		coverageErrors = append(coverageErrors, commandErr)
+	}
+	if malformedRecords > 0 {
+		coverageErrors = append(coverageErrors, fmt.Errorf("katana discarded %d malformed output record(s)", malformedRecords))
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		discoveredURL := strings.TrimSpace(scanner.Text())
-		if discoveredURL == "" {
-			continue
-		}
-		crawlURLs = append(crawlURLs, discoveredURL)
-		if strings.HasSuffix(strings.ToLower(strings.Split(discoveredURL, "?")[0]), ".js") && !isNoiseJS(discoveredURL) {
-			jsURLs = append(jsURLs, discoveredURL)
+	return crawlURLs, jsURLs, joinDiagnosticErrors(coverageErrors...)
+}
+
+func normalizeKatanaTarget(raw string) (string, bool) {
+	if containsControl(raw) {
+		return "", false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Hostname() == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	authority := host
+	if port := parsed.Port(); port != "" {
+		authority = net.JoinHostPort(host, port)
+	}
+	// Crawl an origin only. Paths, fragments, and especially query values are
+	// never copied into the target file or diagnostic context.
+	return strings.ToLower(parsed.Scheme) + "://" + authority, true
+}
+
+func normalizeKatanaDiscoveredURL(raw string) (string, bool) {
+	if containsControl(raw) {
+		return "", false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil || parsed.Hostname() == "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", false
+	}
+	return raw, true
+}
+
+func containsControl(value string) bool {
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return true
 		}
 	}
-
-	return crawlURLs, jsURLs, nil
+	return false
 }
 
 // extractJSFromURLs filters JavaScript URLs from a list of discovered URLs
@@ -826,15 +1325,11 @@ func isNoiseJS(u string) bool {
 		"/cdn-cgi/",            // Cloudflare challenge & analytics scripts
 		"/challenge-platform/", // Cloudflare bot-management JS
 		"challenges.cloudflare.com",
-		"/wp-includes/js/",     // WordPress core (not app code)
-		"/wp-content/plugins/", // WordPress plugins — noisy, rarely interesting
 		"googletagmanager.com",
 		"google-analytics.com",
 		"/gtag/js",
 		"facebook.net/",
 		"connect.facebook.net/",
-		"analytics.js",
-		"gtm.js",
 	}
 	for _, pattern := range noisePatterns {
 		if strings.Contains(lower, pattern) {
@@ -845,80 +1340,72 @@ func isNoiseJS(u string) bool {
 }
 
 // downloadJSFiles downloads JS file content for AI analysis
-func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile {
-	var jsFiles []JSFile
-	mu := &sync.Mutex{}
-
-	// Prioritize JS files: prefer app bundles over vendor/polyfill files,
-	// and larger files (more code = more secrets/endpoints).
-	// Sort URLs: score down vendor/polyfill/chunk, score up app/main/index/bundle.
-	sort.SliceStable(jsURLs, func(i, j int) bool {
-		score := func(u string) int {
-			lower := strings.ToLower(u)
-			s := 0
-			if strings.Contains(lower, "vendor") || strings.Contains(lower, "polyfill") ||
-				strings.Contains(lower, "chunk") || strings.Contains(lower, "runtime") {
-				s -= 10
-			}
-			if strings.Contains(lower, "app") || strings.Contains(lower, "main") ||
-				strings.Contains(lower, "index") || strings.Contains(lower, "bundle") ||
-				strings.Contains(lower, "config") || strings.Contains(lower, "api") {
-				s += 10
-			}
-			return s
-		}
-		return score(jsURLs[i]) > score(jsURLs[j])
+func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) ([]JSFile, int, int, int) {
+	// Prioritize application bundles, then use a lexical tie-break so network
+	// completion timing never changes which files enter the AI budget.
+	jsURLs = append([]string(nil), jsURLs...)
+	sort.Slice(jsURLs, func(i, j int) bool {
+		return jsselection.Less(jsURLs[i], jsURLs[j])
 	})
-	maxFiles := 30
-	if len(jsURLs) > maxFiles {
-		jsURLs = jsURLs[:maxFiles]
+	omitted := 0
+	if len(jsURLs) > jsselection.MaxFiles {
+		omitted = len(jsURLs) - jsselection.MaxFiles
+		jsURLs = jsURLs[:jsselection.MaxFiles]
 	}
 
-	// Max content size per file (50KB)
-	const maxContentSize = 50 * 1024
+	// Bound memory while retaining enough of modern application bundles for the
+	// local regex pass. Reading one extra byte lets coverage detect truncation.
+	const maxContentSize = 1 << 20
 
-	// HTTP client with TLS skip for self-signed certs
-	client := &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !scopepolicy.New(e.cfg.Target).AllowsURL(req.URL.String()) {
-				return http.ErrUseLastResponse
-			}
-			return nil
-		},
+	interval := time.Second / time.Duration(e.reconRateLimit())
+	if interval <= 0 {
+		interval = time.Nanosecond
 	}
+	pacer := time.NewTicker(interval)
+	defer pacer.Stop()
+	policy := newJSRequestPolicy(e.cfg)
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	if guarded, ok := policy.scope.(guardedURLScope); ok {
+		baseTransport = guarded.SafeTransport(baseTransport)
+	}
+	client := newJSHTTPClient(policy, pacedRoundTripper{base: baseTransport, ticks: pacer.C})
+	defer client.CloseIdleConnections()
 
-	// Download concurrently (semaphore of 5)
-	sem := make(chan struct{}, 5)
+	// Download concurrently; the transport pacer accounts for every outbound
+	// HTTP request, including redirects, under the configured request ceiling.
+	sem := make(chan struct{}, e.reconConcurrency(5))
 	var wg sync.WaitGroup
+	type downloadSlot struct {
+		file    JSFile
+		ok      bool
+		partial bool
+	}
+	slots := make([]downloadSlot, len(jsURLs))
 
-	for _, jsURL := range jsURLs {
+	for index, jsURL := range jsURLs {
 		wg.Add(1)
-		go func(url string) {
+		go func(slotIndex int, rawURL string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			// Determine source
 			source := "katana"
-			if strings.Contains(url, "web.archive.org") {
+			if strings.Contains(rawURL, "web.archive.org") {
 				source = "wayback"
 			}
 
-			// Ensure URL has scheme
-			if !strings.HasPrefix(url, "http") {
-				url = "https://" + url
+			parsed, ok := normalizeJSURL(rawURL)
+			if !ok || policy.scope == nil || !policy.scope.AllowsURL(parsed.String()) {
+				return
 			}
 
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", parsed.String(), nil)
 			if err != nil {
 				return
 			}
 			req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; BugBountyAgent/1.0)")
-			for name, value := range e.cfg.Authentication.HeaderValuesForTargets(url) {
+			for name, value := range policy.headersForURL(parsed.String()) {
 				req.Header.Set(name, value)
 			}
 
@@ -933,9 +1420,13 @@ func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile 
 			}
 
 			// Read limited content
-			body, err := io.ReadAll(io.LimitReader(resp.Body, maxContentSize))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxContentSize+1))
 			if err != nil {
 				return
+			}
+			truncated := len(body) > maxContentSize
+			if truncated {
+				body = body[:maxContentSize]
 			}
 
 			content := string(body)
@@ -944,19 +1435,35 @@ func (e *Engine) downloadJSFiles(ctx context.Context, jsURLs []string) []JSFile 
 				return
 			}
 
-			mu.Lock()
-			jsFiles = append(jsFiles, JSFile{
-				URL:     url,
-				Content: content,
-				Size:    len(content),
-				Source:  source,
-			})
-			mu.Unlock()
-		}(jsURL)
+			finalURL := parsed.String()
+			if resp.Request != nil && resp.Request.URL != nil {
+				finalURL = resp.Request.URL.String()
+			}
+
+			slots[slotIndex] = downloadSlot{ok: true, partial: truncated, file: JSFile{
+				URL:       finalURL,
+				Content:   content,
+				Size:      len(content),
+				Source:    source,
+				Truncated: truncated,
+			}}
+		}(index, jsURL)
 	}
 
 	wg.Wait()
-	return jsFiles
+	jsFiles := make([]JSFile, 0, len(slots))
+	incomplete := 0
+	for _, slot := range slots {
+		if slot.ok {
+			jsFiles = append(jsFiles, slot.file)
+			if slot.partial {
+				incomplete++
+			}
+		} else {
+			incomplete++
+		}
+	}
+	return jsFiles, len(jsURLs), incomplete, omitted
 }
 
 func min(a, b int) int {

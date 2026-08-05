@@ -21,14 +21,15 @@
 ## What is HawkEye?
 
 HawkEye is a full-pipeline bug bounty automation agent written in Go.  
-It chains recon tools, vulnerability scanners, and an AI validator into a single workflow —  
-producing a scoped report that contains only grounded, AI-reviewed findings.
+It chains recon tools, vulnerability scanners, and an AI-assisted validator into a single workflow,
+producing a scoped report that separates confirmed, manual-review, and rejected candidates.
 
 ```
-./hawkeye -d hackerone-target.com
+./hawkeye -d your-authorized-host.example
 ```
 
-That's it. HawkEye handles the rest.
+Run it only after validating the configuration, traffic limits, and written
+authorization for that exact host.
 
 ---
 
@@ -65,8 +66,8 @@ That's it. HawkEye handles the rest.
   ┌─────────────────────────────────────────────────────────────────┐
   │  PHASE 2.5 — JS ANALYSIS                                        │
   │                                                                 │
-  │  Regex engine  → high-confidence credentials and tokens        │
-  │  AI (LLM)      → deep analysis of app bundles (12KB/file)      │
+  │  Regex engine  → grounded credential/token candidates          │
+  │  AI (LLM)      → bounded analysis of app bundles (12KB/file)   │
   │                                                                 │
   │  Detects: AWS/GitHub/Stripe keys · JWT tokens                  │
   │           hardcoded passwords · database credentials           │
@@ -78,7 +79,7 @@ That's it. HawkEye handles the rest.
   │                                                                 │
   │  Every finding passes deterministic checks and AI review:      │
   │  · Rejects unsupported and likely false-positive results       │
-  │  · Assigns CVSS-informed severity                              │
+  │  · Requires type-specific references to captured evidence      │
   │  · Preserves tool-captured reproduction commands               │
   │  · Writes impact assessment + remediation                      │
   └─────────────────────────────┬───────────────────────────────────┘
@@ -105,7 +106,7 @@ That's it. HawkEye handles the rest.
 | Vulnerability Scan | nuclei (high-value templates) | CVEs, misconfigs, exposures, takeovers, SQLi/injection templates |
 | XSS | dalfox | Reflected XSS with PoC |
 | Port Scan (opt-in) | nmap | Recon observations only |
-| JS Analysis | Regex + grounded LLM output | Credentials, keys, and tokens |
+| JS Analysis | Regex + prompt-visible LLM grounding | Credential, key, and token candidates requiring manual verification |
 | Validation Pipeline | Deterministic rules + DeepSeek / Claude / GPT-4 | False-positive filtering + evidence review |
 
 ---
@@ -120,12 +121,16 @@ cd bugbounty-agent
 # 2. Install all dependencies
 chmod +x install.sh && ./install.sh
 
-# 3. Set one AI key (the provider is auto-detected)
+# 3. With the sample provider:auto, set exactly one real provider key
 cp .env.example .env
-# Edit .env and replace one placeholder with a real key
+chmod 600 .env
+# Edit .env and replace the matching placeholder with a real key
 
-# 4. Scan
-./hawkeye -d target.com
+# 4. Scan the exact host only (safe default)
+./hawkeye -d your-authorized-host.example
+
+# Add this only when the program explicitly authorizes all subdomains
+./hawkeye -d your-authorized-host.example --include-subdomains
 ```
 
 ---
@@ -136,7 +141,7 @@ cp .env.example .env
 ./hawkeye [flags]
 
 Required (either flag works):
-  -d, --domain      string   Target domain (e.g. example.com)
+  -d, --domain      string   Authorized target domain
   -t, --target      string   Target domain (alias for -d/--domain)
 
 Options:
@@ -146,7 +151,8 @@ Options:
       --skip-recon           Skip recon phase (subdomains already known)
       --skip-scan            Skip vulnerability scanning phase
       --js-only              Run JS analysis only (skips vulnerability scanning)
-      --ai-provider string   Override AI provider: claude | deepseek | openai | openrouter | custom
+      --include-subdomains   Explicitly authorize the target and its discovered subdomains
+      --ai-provider string   Override AI provider: auto | claude | deepseek | openai | openrouter
       --ai-model    string   Override AI model name
       --check-config        Validate the config file and exit
       --version              Show HawkEye version
@@ -156,26 +162,29 @@ Options:
 ### Examples
 
 ```bash
-# Standard full scan
-./hawkeye -d target.com
+# Exact-host scan (safe default)
+./hawkeye -d your-authorized-host.example
+
+# Wildcard-scope scan, only when *.your-authorized-host.example is explicitly authorized
+./hawkeye -d your-authorized-host.example --include-subdomains
 
 # Full scan with live progress output
-./hawkeye -d target.com --verbose
+./hawkeye -d your-authorized-host.example --verbose
 
 # JS credential and token analysis only (fast, no vulnerability scanning)
-./hawkeye -d target.com --js-only
+./hawkeye -d your-authorized-host.example --js-only
 
 # Skip subdomain enumeration
-./hawkeye -d target.com --skip-recon
+./hawkeye -d your-authorized-host.example --skip-recon
 
 # Skip scanning, run AI analysis on recon output only
-./hawkeye -d target.com --skip-scan
+./hawkeye -d your-authorized-host.example --skip-scan
 
 # Use a specific AI provider for this run
-./hawkeye -d target.com --ai-provider claude --ai-model claude-sonnet-4-20250514
+./hawkeye -d your-authorized-host.example --ai-provider claude --ai-model claude-sonnet-5
 
 # Use short flags
-./hawkeye -t target.com -v
+./hawkeye -t your-authorized-host.example -v
 ```
 
 ---
@@ -194,24 +203,27 @@ Options:
 chmod +x install.sh && ./install.sh
 ```
 
-The installer handles Go tools, system packages, and nuclei templates.
+The installer pins the Go tools and installs the optional system packages.
+It uses the Nuclei templates already present on the machine; set
+`HAWKEYE_UPDATE_TEMPLATES=1` only when you intentionally want to update that
+mutable template set during installation.
 
 ### Manual
 
 ```bash
 # Core Go tools
-go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/tomnomnom/assetfinder@latest
-go install github.com/tomnomnom/waybackurls@latest
-go install github.com/hahwul/dalfox/v2@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.12.0
+go install github.com/projectdiscovery/httpx/cmd/httpx@v1.9.0
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.7.0
+go install github.com/projectdiscovery/katana/cmd/katana@v1.4.0
+go install github.com/tomnomnom/assetfinder@v0.1.1
+go install github.com/tomnomnom/waybackurls@v0.1.0
+go install github.com/hahwul/dalfox/v2@v2.12.0
 
 # System tools (optional — nmap port scanning is opt-in)
 sudo apt install -y nmap
 
-# Nuclei templates
+# Optional mutable template update; review template changes before production use
 nuclei -update-templates
 
 # Build HawkEye
@@ -224,16 +236,25 @@ go build -o hawkeye ./cmd/main.go
 
 ### AI Provider
 
-Copy `.env.example` to `.env`, then set exactly one provider key. HawkEye
-auto-detects the provider in this priority order: Claude, DeepSeek, OpenAI,
-then OpenRouter. System environment variables take precedence over `.env`.
+Copy `.env.example` to `.env` and fill exactly one provider key when using the
+sample `provider: "auto"`. Auto-detection fails closed when zero or multiple
+real provider keys are present. Alternatively, select a provider explicitly in
+`config.yaml`; HawkEye never switches it because another provider's key exists.
 
 | Provider | Environment Variable | Default Model |
 |---|---|---|
-| Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
-| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+| Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-5` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-v4-flash` |
 | OpenAI | `OPENAI_API_KEY` | `gpt-4o-mini` |
-| OpenRouter | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat` |
+| OpenRouter | `OPENROUTER_API_KEY` | `deepseek/deepseek-v4-flash` |
+
+These reviewed defaults were checked against the providers' official model
+catalogs on 2026-08-05. Model availability is external state; re-check the
+[Claude model lifecycle](https://platform.claude.com/docs/en/about-claude/model-deprecations),
+[DeepSeek model list](https://api-docs.deepseek.com/api/list-models), and
+[OpenAI model API](https://platform.openai.com/docs/api-reference/models), and
+[OpenRouter model page](https://openrouter.ai/deepseek/deepseek-v4-flash/api)
+before a later release.
 
 To select a provider explicitly, edit `config.yaml`:
 
@@ -241,9 +262,13 @@ To select a provider explicitly, edit `config.yaml`:
 ai:
   provider: "deepseek"            # deepseek | claude | openai | openrouter | custom
   api_key: "${DEEPSEEK_API_KEY}"  # loaded from .env automatically
-  model: "deepseek-chat"
-  max_tokens: 2000
+  model: "deepseek-v4-flash"
+  max_tokens: 8000
 ```
+
+The `--ai-provider` flag can select `auto`, `claude`, `deepseek`, `openai`, or
+`openrouter` for one run. A `custom` provider cannot be selected safely with
+that flag alone: configure its key, model, and endpoint together in YAML.
 
 For an OpenAI-compatible custom endpoint, both `model` and `base_url` are
 required:
@@ -256,11 +281,16 @@ ai:
   base_url: "https://your-endpoint.example/v1"
 ```
 
+A custom endpoint receives the API credential and the redacted finding
+context. Use only an endpoint you operate or explicitly trust, and review its
+data-retention policy before sending any authorized target data.
+
 ### Scope and Rate Limits
 
-The domain supplied with `--domain` or `--target` becomes the authorized root
-scope. HawkEye permits that domain and its subdomains, rejects discovered
-out-of-scope hosts, and filters IP addresses out of active scanning.
+The domain supplied with `--domain` or `--target` authorizes that exact host by
+default. Subdomains are authorized only with `--include-subdomains`. HawkEye
+rejects public suffixes, single-label targets, IP spellings, out-of-scope hosts,
+and private/loopback/link-local DNS destinations in its guarded HTTP client.
 
 Use `excluded_subdomains` for assets that the program explicitly excludes, and
 set `rate_limit` to match the program's rules:
@@ -279,8 +309,9 @@ Always review the target program's written scope before starting a scan.
 
 ### Authenticated Testing
 
-HawkEye can attach authorized test-account headers and cookies to supported
-scanners and its internal HTTP requests:
+HawkEye can attach authorized test-account headers and cookies to its guarded
+internal HTTPS downloader. Credentials are intentionally never placed in
+external scanner command lines.
 
 ```env
 TARGET_TOKEN=replace-with-a-limited-test-token
@@ -290,38 +321,63 @@ TARGET_SESSION=replace-with-a-limited-test-session
 ```yaml
 authentication:
   allowed_hosts:
-    - "app.example.com"
-    - "*.api.example.com"
+    - "https://app.example.com"
+    - "https://*.api.example.com:443"
   headers:
     Authorization: "Bearer ${TARGET_TOKEN}"
   cookies:
     session: "${TARGET_SESSION}"
 ```
 
-Authentication values are expanded from environment variables and redacted
-before findings are sent to the AI provider or written to reports. They may
-still be visible to local system administrators while external tools are
-running.
+Authentication values are expanded from environment variables, restricted to
+the exact HTTPS scheme/host/port rule on every redirect, and redacted before
+AI/report/log output. External tools currently run unauthenticated because their
+header flags expose secrets through process arguments.
 
 Use only a dedicated, low-privilege test account. `allowed_hosts` is required
-and prevents credentials from being sent when any target in a tool invocation
-is not explicitly permitted. Never use personal, production, or administrator
-sessions.
+and prevents credentials from being sent to an origin that is not explicitly
+permitted. Never use personal, production, or administrator sessions.
 
 ### Safety and Limitations
 
 - Automated and AI-reviewed findings still require manual verification before
   submission.
+- Regex and AI-only credential detections remain `manual-review`; pattern
+  presence alone never proves that a credential is active or reportable.
+- Discovered credentials are masked before AI, reports, and terminal output;
+  replacement markers retain only the detector type, never secret characters.
+- URL query values are removed from AI/report-safe URLs while parameter names
+  are retained for analysis. Redaction is defense in depth, not a formal DLP
+  guarantee: novel encodings, secrets embedded in paths or bodies, and unknown
+  credential formats may evade pattern-based detection. Never put credentials
+  in a target URL, and review report artifacts before sharing them.
 - Validation decisions are separated into `confirmed`, `manual-review`, and
   `rejected`; only confirmed findings appear as reportable vulnerabilities.
 - A partial scan or failed external tool is reported as incomplete; it does not
   mean the target is secure.
 - Active scanners can generate substantial traffic. Set `rate_limit`, disable
   prohibited modules, and follow the program's rules.
+- The guarded internal HTTP client blocks private and special-use destinations,
+  but external scanners perform their own DNS resolution. Use a restrictive
+  egress policy when scanning domains whose DNS you do not control; DNS changes
+  or rebinding can otherwise invalidate the pre-scan address check.
+- External scanner binaries are trusted local dependencies, not sandboxed
+  plugins. The agent minimizes their environment, bounds output, and terminates
+  their process groups, but a malicious binary may still read files available
+  to the current OS user or deliberately detach. Run scans as a dedicated
+  low-privilege user or container with a dedicated home directory, read-only
+  inputs, and restrictive egress.
+- Deterministic behavioral evals guard against known false-confirmation,
+  post-model adversarial-output, scope, and grounding regressions, but they are
+  not a claim of real-world precision/recall, zero hallucinations, or zero bias.
+- The optional `hunter` is disabled by default. When enabled, it writes
+  explicitly unverified attack hypotheses; even an "observed" lead means only
+  that its path/parameter appeared in recon, not that a vulnerability exists.
 
-### C99.nl API (Subdomain Intelligence)
+### C99.nl API (Optional Subdomain Intelligence)
 
-C99.nl significantly improves subdomain discovery. Without it, HawkEye still works but misses subdomains that only C99's database covers.
+C99.nl can add another source of subdomain candidates. It is disabled by
+default; HawkEye continues with its other enabled sources when C99 is not used.
 
 **Get a key:** Register at [c99.nl](https://c99.nl) → Dashboard → API Key
 
@@ -331,7 +387,7 @@ Add it to `.env`:
 C99_API_KEY=your-api-key-here
 ```
 
-It is automatically picked up via `config.yaml`:
+Then explicitly opt in through `config.yaml`:
 
 ```yaml
 c99:
@@ -350,6 +406,11 @@ c99:
 
 ### Blind XSS
 
+Blind-XSS callbacks send requests from the tested application to an external
+service. Configure one only when the program rules explicitly permit
+out-of-band testing and you control or trust the callback service; otherwise
+leave `blind_url` empty.
+
 ```yaml
 scanning:
   tools:
@@ -363,6 +424,11 @@ scanning:
 
 Reports are saved to `./reports/` in Markdown:
 
+The report directory must be private. The installer creates it with mode
+`0700`; for a manually created or custom output directory, run
+`mkdir -p reports && chmod 700 reports` before scanning. HawkEye refuses a
+pre-existing shared directory and never changes its permissions implicitly.
+
 ```
 reports/
 └── bug_bounty_report_2026-04-04_16-41-25.md
@@ -372,16 +438,19 @@ reports/
 
 ```
 Executive Summary
-  └── Risk score · Finding counts · Subdomains discovered
+  └── Coverage grade · measured work · confirmed/manual/rejected counts
 
-Critical Findings
-  └── Title · URL · Captured Evidence · Analysis · Tool Command
+Submission Ready / Low Value
+  └── Confirmed findings with captured evidence and confidence
 
-High / Medium / Low Findings
-  └── Same structure
+Manual Review Required
+  └── Candidates plus the exact missing evidence
+
+Rejected / Not Reportable
+  └── Candidate and rejection reason
 
 Subdomain List
-  └── All discovered subdomains
+  └── In-scope discovered subdomains
 ```
 
 ---
@@ -422,6 +491,9 @@ it is intentionally ignored by Git.
 ```bash
 # Run the test suite
 go test ./...
+
+# Run the deterministic behavior evaluation suite
+go test ./evals/...
 
 # Run static analysis
 go vet ./...

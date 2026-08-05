@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Btr4k/bugbounty-agent/internal/redaction"
 	"github.com/Btr4k/bugbounty-agent/internal/scanner"
 )
 
@@ -167,6 +168,7 @@ func ScanJSWithRegex(jsFiles []struct {
 	seenSecrets := make(map[string]bool) // Cross-pattern dedup: core secret value
 
 	for _, js := range jsFiles {
+		safeURL := redaction.SanitizeURL(js.URL)
 		for _, pattern := range jsPatterns {
 			if !isStrongJSFindingType(pattern.Type) {
 				continue
@@ -201,20 +203,21 @@ func ScanJSWithRegex(jsFiles []struct {
 					continue
 				}
 
+				safeEvidence := redaction.MaskDetectorEvidence(value, pattern.Type).Text
 				findings = append(findings, scanner.Finding{
 					ID:          fmt.Sprintf("js-regex-%s", pattern.Type),
 					Title:       fmt.Sprintf("JS: %s", pattern.Name),
-					Description: fmt.Sprintf("Regex scanner found %s in %s", pattern.Name, js.URL),
+					Description: fmt.Sprintf("Regex scanner found %s in %s", pattern.Name, safeURL),
 					Severity:    pattern.Severity,
 					Type:        "js-analysis",
-					URL:         js.URL,
-					Evidence:    value,
+					URL:         safeURL,
+					Evidence:    safeEvidence,
 					Tags:        []string{"js", "regex-scan", pattern.Type},
 					Metadata: map[string]string{
 						"source":    "regex-js-scanner",
 						"tool":      "regex",
 						"pattern":   pattern.Type,
-						"file_url":  js.URL,
+						"file_url":  safeURL,
 						"file_size": fmt.Sprintf("%d", js.Size),
 					},
 				})

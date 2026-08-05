@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -22,7 +23,7 @@ func TestScanJSWithRegex(t *testing.T) {
 		Source  string
 	}{
 		{
-			URL: "https://example.com/app.js",
+			URL: "https://example.com/app.js?signature=opaque-query-secret#private",
 			Content: fmt.Sprintf(`
 				// AWS key leak
 				var awsKey = "%s";
@@ -83,6 +84,10 @@ func TestScanJSWithRegex(t *testing.T) {
 			foundTypes[meta] = true
 		}
 		t.Logf("  Found: [%s] %s — %s", f.Severity, f.Title, f.Evidence[:min(60, len(f.Evidence))])
+		if strings.Contains(f.URL, "opaque-query-secret") || strings.Contains(f.Description, "opaque-query-secret") ||
+			strings.Contains(f.Metadata["file_url"], "opaque-query-secret") || strings.Contains(f.URL, "#private") {
+			t.Fatalf("JS URL secret survived scanner-boundary sanitization: %#v", f)
+		}
 	}
 
 	expectedTypes := []string{"aws_key", "jwt", "hardcoded_password", "database_url"}

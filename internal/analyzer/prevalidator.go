@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -35,9 +36,6 @@ func PreValidateFinding(f scanner.Finding) PreValidResult {
 	if result := preValidProtectedDiagnostic(f); result.Outcome != PreValidKeep {
 		return result
 	}
-	if result := preValidSensitiveDebugExposure(f); result.Outcome != PreValidKeep {
-		return result
-	}
 
 	switch f.Type {
 	case "directory-bruteforce":
@@ -65,7 +63,7 @@ func preValidProtectedDiagnostic(f scanner.Finding) PreValidResult {
 		return PreValidResult{Outcome: PreValidKeep}
 	}
 
-	combined := findingText(f)
+	combined := findingEndpointIdentity(f)
 	for _, p := range diagnosticPaths {
 		if strings.Contains(combined, p) {
 			return PreValidResult{
@@ -80,20 +78,37 @@ func preValidProtectedDiagnostic(f scanner.Finding) PreValidResult {
 }
 
 func preValidSensitiveDebugExposure(f scanner.Finding) PreValidResult {
-	if !isHTTPStatus(f, 200) {
+	if !isTrustedSensitiveDebugExposure(f) {
 		return PreValidResult{Outcome: PreValidKeep}
 	}
+	return PreValidResult{
+		Outcome: PreValidKeep,
+		Reason:  "Trusted scanner exchange captured a debug/profiling endpoint with sensitive runtime details.",
+	}
+}
 
-	combined := findingText(f)
-	debugEndpoint := containsAny(combined,
+func isTrustedSensitiveDebugExposure(f scanner.Finding) bool {
+	if !isHTTPStatus(f, 200) {
+		return false
+	}
+	if !hasTrustedNucleiExchange(f) {
+		return false
+	}
+	if findingType := strings.ToLower(strings.TrimSpace(f.Type)); findingType != "http" && findingType != "directory-bruteforce" {
+		return false
+	}
+
+	endpointText := findingEndpointIdentity(f)
+	debugEndpoint := containsAny(endpointText,
 		"mini-profiler", "miniprofiler", "_profiler", "_debugbar", "debugbar",
-		"phpinfo", "phpinfo()", "error_log", "stack trace", "profiling results",
+		"phpinfo", "phpinfo()", "error_log",
 	)
 	if !debugEndpoint {
-		return PreValidResult{Outcome: PreValidKeep}
+		return false
 	}
 
-	sensitiveProof := containsAny(combined,
+	proofText := strings.ToLower(strings.Join([]string{f.Evidence, f.Response}, " "))
+	sensitiveProof := containsAny(proofText,
 		"sql", "select ", "insert ", "update ", "delete ",
 		"stack trace", "exception", "internal server error",
 		"server variables", "environment", "document_root", "script_filename",
@@ -101,30 +116,18 @@ func preValidSensitiveDebugExposure(f scanner.Finding) PreValidResult {
 		"x-powered-by", "asp.net", "php version",
 	)
 	if !sensitiveProof {
-		return PreValidResult{Outcome: PreValidKeep}
+		return false
 	}
-
-	return PreValidResult{
-		Outcome:     PreValidDowngrade,
-		NewSeverity: "medium",
-		Reason: "HTTP 200 debug/profiling exposure contains sensitive runtime evidence. " +
-			"Treat as Medium-value bug bounty material when the response exposes profiling data, framework internals, SQL context, stack traces, or server runtime details.",
-	}
+	return true
 }
 
 func preValidDirectory(f scanner.Finding) PreValidResult {
 	evidence := strings.ToLower(f.Evidence)
 	url := strings.ToLower(f.URL)
-	title := strings.ToLower(f.Title)
 
-	// Determine HTTP status from evidence field.
-	is403or401 := strings.Contains(evidence, "http 403") ||
-		strings.Contains(evidence, "| 403") ||
-		strings.Contains(evidence, "403 |") ||
-		strings.Contains(evidence, "http 401") ||
-		strings.Contains(evidence, "| 401") ||
-		strings.Contains(evidence, "401 |") ||
-		strings.Contains(title, "protected")
+	// Only a captured/structured status may drive a deterministic rejection.
+	// Titles and descriptions are tool/model-controlled prose, not proof.
+	is403or401 := isHTTPStatus(f, 401, 403)
 
 	if !is403or401 {
 		return PreValidResult{Outcome: PreValidKeep}
@@ -170,6 +173,9 @@ func preValidDirectory(f scanner.Finding) PreValidResult {
 // ─── SSL / TLS ───────────────────────────────────────────────────────────────
 
 func preValidSSL(f scanner.Finding) PreValidResult {
+	if !hasTrustedTLSEvidence(f) {
+		return PreValidResult{Outcome: PreValidKeep}
+	}
 	evidence := strings.ToLower(f.Evidence)
 	title := strings.ToLower(f.Title)
 	combined := evidence + " " + title
@@ -240,22 +246,73 @@ func findingText(f scanner.Finding) string {
 	}, " "))
 }
 
+func findingEndpointIdentity(f scanner.Finding) string {
+	return strings.ToLower(strings.Join([]string{
+		f.ID,
+		f.Title,
+		f.Type,
+		f.Target,
+		f.URL,
+		strings.Join(f.Tags, " "),
+	}, " "))
+}
+
 func isHTTPStatus(f scanner.Finding, statuses ...int) bool {
-	combined := findingText(f)
-	for _, status := range statuses {
-		code := strconv.Itoa(status)
-		if strings.Contains(combined, "http/1.1 "+code) ||
-			strings.Contains(combined, "http/2 "+code) ||
-			strings.Contains(combined, "http "+code) ||
-			strings.Contains(combined, "| "+code) ||
-			strings.Contains(combined, code+" |") ||
-			strings.Contains(combined, "status: "+code) ||
-			strings.Contains(combined, "status_code:"+code) ||
-			strings.Contains(combined, "status-code: "+code) {
+	captured, ok := capturedHTTPStatus(f)
+	if !ok {
+		return false
+	}
+	for _, expected := range statuses {
+		if captured == expected {
 			return true
 		}
 	}
 	return false
+}
+
+var directoryStatusPattern = regexp.MustCompile(`(?i)(?:^|[\s|])(?:http|status(?:_code|-code)?)\s*[:=]?\s*([1-5][0-9]{2})(?:$|[\s|])`)
+
+func capturedHTTPStatus(f scanner.Finding) (int, bool) {
+	for _, line := range strings.Split(strings.ReplaceAll(f.Response, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.HasPrefix(strings.ToUpper(fields[0]), "HTTP/") {
+			status, err := strconv.Atoi(fields[1])
+			if err == nil && status >= 100 && status <= 599 {
+				return status, true
+			}
+		}
+		break // only the captured response status line is authoritative
+	}
+
+	for _, key := range []string{"status", "status_code", "status-code"} {
+		if raw := strings.TrimSpace(f.Metadata[key]); raw != "" {
+			status, err := strconv.Atoi(raw)
+			if err == nil && status >= 100 && status <= 599 {
+				return status, true
+			}
+		}
+	}
+
+	if strings.EqualFold(strings.TrimSpace(f.Type), "directory-bruteforce") {
+		if match := directoryStatusPattern.FindStringSubmatch(f.Evidence); len(match) == 2 {
+			status, err := strconv.Atoi(match[1])
+			if err == nil {
+				return status, true
+			}
+		}
+		for _, field := range strings.FieldsFunc(f.Evidence, func(r rune) bool { return r == '|' }) {
+			status, err := strconv.Atoi(strings.TrimSpace(field))
+			if err == nil && status >= 100 && status <= 599 {
+				return status, true
+			}
+		}
+	}
+
+	return 0, false
 }
 
 func containsAny(s string, needles ...string) bool {
