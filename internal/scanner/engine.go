@@ -1202,11 +1202,17 @@ func isProjectDiscoveryHttpx(path string) bool {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "-version")
 	cmd.Env = config.ExternalToolEnvironment()
+	// ProjectDiscovery httpx prints its banner (including "projectdiscovery.io")
+	// and version line to STDERR, not stdout. Capture both and check the combined
+	// output — reading stdout alone made this detector always fail, so a correctly
+	// installed httpx was reported "missing" and every scan aborted at preflight.
 	stdout := newBoundedCapture(toolStderrLimit)
+	stderr := newBoundedCapture(toolStderrLimit)
 	cmd.Stdout = stdout
-	cmd.Stderr = io.Discard
+	cmd.Stderr = stderr
 	err = runExternalCommand(cmd)
-	return err == nil && !stdout.Truncated() && strings.Contains(strings.ToLower(stdout.String()), "projectdiscovery")
+	combined := strings.ToLower(stdout.String() + "\n" + stderr.String())
+	return err == nil && strings.Contains(combined, "projectdiscovery")
 }
 
 func (e *Engine) runHttpx(ctx context.Context, targets []string) ([]Finding, []string, error) {
